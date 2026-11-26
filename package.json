@@ -1,10 +1,10 @@
 {
   "name": "@uknowpro/xcode",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A terminal coding assistant for your own model endpoint",
   "type": "module",
   "bin": { "xcode": "./src/cli.mjs" },
   "files": ["src", "README.md", "README.ko.md"],
   "engines": { "node": ">=22.5" },
-  "scripts": { "test": "node test/xcode.test.mjs" }
+  "scripts": { "test": "node test/xcode.test.mjs", "test:install": "node test/install.mjs" }
 }

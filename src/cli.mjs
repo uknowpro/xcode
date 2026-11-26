@@ -1,16 +1,20 @@
 #!/usr/bin/env node
 import { readFile } from 'node:fs/promises';
 import { stdin, stdout, stderr } from 'node:process';
-import { createInterface, clearLine, cursorTo } from 'node:readline';
+import { createInterface, clearLine, clearScreenDown, cursorTo } from 'node:readline';
 import { createInterface as questions } from 'node:readline/promises';
 import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { attach, explicitReferences, splitArgs } from './attachments.mjs';
 import { harnessFor, presets, roles, skillsAt } from './harness.mjs';
-import { completionUrl, complete } from './model.mjs';
+import { completionUrl } from './model.mjs';
+import { diagnose } from './diagnostic.mjs';
+import { defineCheck, projectChecks, runCheck } from './checks.mjs';
+import { reviewDiff } from './changes.mjs';
+import { completeReference, pageKey } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { settings, setToken, tokenFor, updateSettings } from './store.mjs';
+import { settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { projectRoot } from './workspace.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
@@ -40,10 +44,15 @@ const help = [
   '  xcode ask "prompt"             Run a single prompt, or pipe text to xcode ask',
   '  xcode sessions                 List sessions for this project',
   '  xcode resume <id|latest>       Resume a project session',
+  '  xcode continue [id|latest]    Run the pending message once',
   '  xcode profile list|use|set|test [name]',
   '  xcode harness list|show|import [name] [file]',
+  '  xcode check add <name> -- <command> [args...]',
+  '  xcode check list|run|remove [name]',
+  '  xcode review show|apply|reject [session]',
+  '  xcode settings                 Show active defaults and project checks',
   '',
-  '  --cwd <directory>   --profile <name>   --harness <name>   --write',
+  '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
   '  --attach <path>     --endpoint <url>   --model <id>      --token-stdin',
   '  --help             --version',
 ].join('\n');
@@ -58,7 +67,13 @@ const chatHelp = [
   '/queue, /stop, /next            Show pending messages, pause, or stop and send the next',
   '/continue, /skip                Resume an interrupted request or remove it from the queue',
   '/retry off|<seconds>            Retry transient failures while the session is running',
-  '/write on|off                   Enable or disable exact replacements in existing files',
+  '/write on|off                  Allow model change proposals. Applying still requires approval',
+  '/diff [path], /apply, /reject  Review, approve or reject the pending change set',
+  '/checks [on|off]               Show or toggle the configured project checks',
+  '/check <name>                  Run a named project check manually',
+  '/settings                      View model, harness and permissions for this session',
+  '/paste, /send, /cancel         Compose or paste a multi-line message',
+  'Tab after @                    Complete a workspace path',
   '/history, /tools                Show recent conversation or inspected paths',
   '/exit                          Save and exit',
 ].join('\n');
@@ -140,10 +155,11 @@ async function profileCommand(action, name, options) {
     await updateSettings(value => { value.defaultProfile = name; });
     print('Default profile: ' + name);
   } else if (action === 'test') {
-    const answer = await complete(profileFor(config, name), await tokenFor(name), [
-      { role: 'user', content: 'Reply with OK.' },
-    ], { signal: AbortSignal.timeout(20000) });
-    print('Model responded: ' + answer.content.trim().slice(0, 120));
+    const results = await diagnose(profileFor(config, name), await tokenFor(name), {
+      only: options.only,
+      onResult: item => print(item.name.toUpperCase() + ' ' + item.status.toUpperCase() + ' · ' + item.detail),
+    });
+    if (results.some(item => item.status === 'fail')) process.exitCode = 1;
   } else {
     throw new Error('Use profile list, set, use or test.');
   }
@@ -191,12 +207,101 @@ async function harnessCommand(action, name, file) {
   }
 }
 
+function sessionStatus(session, live) {
+  const pending = session.queue[0];
+  if (live?.active) return 'running';
+  if (pending?.review?.state === 'applying') return 'apply interrupted';
+  if (pending?.review) return 'review needed';
+  if (pending?.failure) return 'failed';
+  if (pending) return 'paused';
+  if (session.turns.at(-1)?.status === 'complete') return 'complete';
+  return 'idle';
+}
+
 function describeSessions(sessions, selected, statuses = new Map()) {
   if (!sessions.length) print('No sessions for this project.');
   for (const session of sessions) {
-    const state = statuses.get(session.id);
-    print((selected === session.id ? '* ' : '  ') + session.id.slice(0, 8) + ' · ' +
-      (state?.active ? 'running · ' : '') + (session.queue.length ? session.queue.length + ' pending · ' : '') + session.title);
+    const live = statuses.get(session.id);
+    const row = live?.session ?? session;
+    print((selected === row.id ? '* ' : '  ') + row.id.slice(0, 8) + ' · ' + sessionStatus(row, live) + ' · ' +
+      (row.queue.length ? row.queue.length + ' pending · ' : '') + row.title);
+  }
+}
+
+function checkList(checks) {
+  const lines = Object.entries(checks).map(([name, check]) =>
+    name + ' · ' + check.argv.map(arg => JSON.stringify(arg)).join(' ') + ' · ' + check.timeout + 's');
+  return lines.join('\n') || 'No project checks. Add one with xcode check add <name> -- <command> [args].';
+}
+
+function checkSummary(result) {
+  return result.name + ' · ' + result.status + (result.exitCode === null ? '' : ' · exit ' + result.exitCode) +
+    ' · ' + (result.durationMs / 1000).toFixed(1) + 's';
+}
+
+async function checkCommand(root, action, name, argv, options) {
+  if (!action || action === 'list') return print(checkList(projectChecks(await settings(), root)));
+  if (action === 'run') {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    process.once('SIGINT', abort);
+    try {
+      const result = await runCheck(root, projectChecks(await settings(), root), name, controller.signal);
+      if (result.stdout) print(result.stdout.trimEnd());
+      if (result.stderr) info(result.stderr.trimEnd());
+      info(checkSummary(result));
+      process.exitCode = result.exitCode === 0 && result.status === 'passed' ? 0 : result.exitCode || 1;
+    } finally {
+      process.off('SIGINT', abort);
+    }
+    return;
+  }
+  if (!['add', 'remove'].includes(action)) throw new Error('Use check add, list, run or remove.');
+  validName(name);
+  await updateSettings(config => {
+    const checks = { ...projectChecks(config, root) };
+    if (action === 'add') checks[name] = defineCheck(argv, options.timeout === undefined ? undefined : Number(options.timeout));
+    else {
+      if (!Object.hasOwn(checks, name)) throw new Error('Unknown project check: ' + name);
+      delete checks[name];
+    }
+    config.projectChecks = { ...config.projectChecks, [root]: checks };
+  });
+  print((action === 'add' ? 'Saved' : 'Removed') + ' project check ' + name + '.');
+}
+
+async function describeSettings(root, session) {
+  const config = await settings();
+  const profileName = session?.profile ?? config.defaultProfile ?? 'default';
+  const profile = own(config.profiles, profileName);
+  const url = profile ? new URL(profile.endpoint) : null;
+  return [
+    'Workspace · ' + root,
+    'Model profile · ' + profileName + (profile ? ' · ' + profile.model : ' · setup required'),
+    url ? 'Endpoint · ' + url.origin + url.pathname : '',
+    profile ? 'Model inputs · tools ' + (profile.tools === false ? 'off' : 'on') +
+      ' · image ' + (profile.imageInput ? 'on' : 'off') + ' · PDF ' + (profile.pdfInput ? 'on' : 'off') : '',
+    'Harness · ' + (session?.harness ?? 'default'),
+    'Change proposals · ' + (session?.write ? 'on' : 'off') + ' · applies require approval',
+    'Agent checks · ' + (session?.checks ? 'on' : 'off'),
+    checkList(projectChecks(config, root)),
+    'Configuration · ' + resolve(storage, 'settings.json'),
+  ].filter(Boolean).join('\n');
+}
+
+async function reviewCommand(root, action, prefix) {
+  if (!['show', 'apply', 'reject'].includes(action)) throw new Error('Use review show, apply or reject [session].');
+  const sessions = new Sessions(root);
+  try {
+    const live = await sessions.select(prefix || 'latest', {});
+    const review = live.session.queue[0]?.review;
+    if (!review) throw new Error('There is no pending change set.');
+    if (action === 'show') return print(reviewDiff(review).join('\n'));
+    const files = await sessions.review(live, action);
+    print(action === 'apply' ? 'Applied ' + files.length + ' files.' : 'Rejected the change set.');
+    print('Continue with xcode continue ' + live.session.id.slice(0, 8) + '.');
+  } finally {
+    await sessions.close();
   }
 }
 
@@ -208,27 +313,60 @@ async function collectAttachments(root, base, profile, prompt, paths) {
   return results;
 }
 
+function streamSession(root) {
+  return new Sessions(root, (_live, event) => {
+    if (event.type === 'text' && !event.intermediate) stdout.write(clean(event.text));
+    else if (event.type === 'stage' && event.total > 1) info('[' + (event.index + 1) + '/' + event.total + '] ' + event.stage);
+    else if (event.type === 'note') info(event.text);
+    else if (event.type === 'tool' && event.check)
+      info(event.check + ' · ' + event.summary + (event.exitCode === null ? '' : ' · exit ' + event.exitCode));
+  });
+}
+
+async function oneMessage(sessions, live, start) {
+  live.holdAfterCurrent = true;
+  const interrupt = () => sessions.stop(live);
+  process.on('SIGINT', interrupt);
+  try {
+    const { run } = await start();
+    const result = await run;
+    if (result?.error) throw result.error;
+    if (result?.answer) stdout.write('\n');
+    if (result?.review) {
+      const id = live.session.id.slice(0, 8);
+      info('Change set awaiting approval. Run xcode review show ' + id + ' or xcode resume ' + id + '.');
+      process.exitCode = 3;
+    }
+  } finally {
+    process.off('SIGINT', interrupt);
+  }
+}
+
 async function ask(root, base, defaults, options, prompt) {
   const config = await settings();
   const profile = profileFor(config, defaults.profile || config.defaultProfile || 'default');
   harnessFor(config, defaults.harness || 'default');
   const attachments = await collectAttachments(root, base, profile, prompt, options.attach ?? []);
-  const sessions = new Sessions(root, (_live, event) => {
-    if (event.type === 'text' && !event.intermediate) stdout.write(clean(event.text));
-    else if (event.type === 'stage' && event.total > 1) info('\n[' + (event.index + 1) + '/' + event.total + '] ' + event.stage);
-    else if (event.type === 'note') info('\n' + event.text);
-  });
-  const live = await sessions.select(undefined, defaults);
-  live.session.write = Boolean(options.write);
-  const interrupt = () => sessions.stop(live);
-  process.on('SIGINT', interrupt);
+  const sessions = streamSession(root);
   try {
-    const { run } = await sessions.enqueue(live, prompt, attachments);
-    const result = await run;
-    stdout.write('\n');
-    if (result?.error) throw result.error;
+    const live = await sessions.select(undefined, defaults);
+    live.session.write = Boolean(options.write);
+    live.session.checks = Boolean(options.checks);
+    await oneMessage(sessions, live, () => sessions.enqueue(live, prompt, attachments));
   } finally {
-    process.off('SIGINT', interrupt);
+    await sessions.close();
+  }
+}
+
+async function continueMessage(root, prefix) {
+  const sessions = streamSession(root);
+  try {
+    const live = await sessions.select(prefix || 'latest', {});
+    if (!live.session.queue.length) throw new Error('Queue is empty.');
+    if (live.session.queue[0].review) throw new Error('Show and decide the pending change set first with xcode review.');
+    live.held = false;
+    await oneMessage(sessions, live, () => ({ run: sessions.pump(live) }));
+  } finally {
     await sessions.close();
   }
 }
@@ -239,7 +377,14 @@ async function chat(root, base, defaults, options, prefix) {
   let closed = false;
   let streamOpen = false;
   let chain = Promise.resolve();
-  const rl = createInterface({ input: stdin, output: stdout, terminal: true });
+  let paste = null;
+  let pasteLength = 0;
+  let pager = null;
+  const notices = [];
+  const rl = createInterface({
+    input: stdin, output: stdout, terminal: true,
+    completer: (line, callback) => completeReference(root, base, line).then(result => callback(null, result), callback),
+  });
   const staged = new Map();
   function endStream() {
     if (!streamOpen) return;
@@ -253,22 +398,71 @@ async function chat(root, base, defaults, options, prefix) {
     }
   }
   function prompt() {
-    if (closed || streamOpen || rendering) return;
-    rl.setPrompt(selected?.active ? '… › ' : '› ');
+    if (closed || streamOpen || rendering || pager) return;
+    rl.setPrompt(paste ? '│ ' : selected?.active ? '… › ' : '› ');
     rl.prompt(true);
   }
   function show(text) {
     if (closed) return;
+    if (pager) {
+      if (notices.length === 20) notices.shift();
+      notices.push(text);
+      return;
+    }
     clearPrompt();
     endStream();
     print(text);
     prompt();
   }
+  function drawReview(move = 0) {
+    const rows = Math.max(6, (stdout.rows || 24) - 4);
+    const last = Math.max(0, pager.lines.length - rows);
+    pager.offset = Math.max(0, Math.min(last, pager.offset + move));
+    cursorTo(stdout, 0, 0);
+    clearScreenDown(stdout);
+    print('Review ' + pager.id + ' · ' + (pager.offset + 1) + '–' +
+      Math.min(pager.offset + rows, pager.lines.length) + '/' + pager.lines.length);
+    for (const line of pager.lines.slice(pager.offset, pager.offset + rows)) {
+      const width = Math.max(16, (stdout.columns || 80) - 1);
+      // Avoid wrapping and keep the pager usable when patches contain very long lines.
+      const prefix = pager.column ? '…' : '';
+      const available = width - prefix.length;
+      const visible = line.slice(pager.column, pager.column + available);
+      print(prefix + (pager.column + visible.length < line.length ? visible.slice(0, -1) + '…' : visible));
+    }
+    print('↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Esc/q Close');
+  }
+
+  function closeReview() {
+    if (!pager) return;
+    pager = null;
+    stdout.write('\x1b[?1049l');
+    for (const notice of notices.splice(0)) print(notice);
+    prompt();
+  }
+
+  function reviewKey(_text, key) {
+    if (!pager || !key) return;
+    if (key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c')) {
+      closeReview();
+      rl.write(null, { ctrl: true, name: 'u' });
+      return;
+    }
+    if (key.name === 'left' || key.name === 'right') {
+      pager.column = Math.max(0, Math.min(pager.maxColumn, pager.column + (key.name === 'left' ? -40 : 40)));
+      drawReview();
+      return;
+    }
+    const move = pageKey(key.name, Math.max(6, (stdout.rows || 24) - 4), pager.lines.length);
+    if (move !== undefined) drawReview(move);
+  }
+
   const sessions = new Sessions(root, (live, event) => {
     if (closed) return;
     if (live !== selected) {
-      if (event.type === 'complete' || event.type === 'error')
-        show('[' + live.session.id.slice(0, 8) + '] ' + (event.type === 'complete' ? 'Response ready' : event.error.message));
+      if (['complete', 'error', 'review'].includes(event.type))
+        show('[' + live.session.id.slice(0, 8) + '] ' + (event.type === 'complete' ? 'Response ready' :
+          event.type === 'review' ? 'Change set needs review' : event.error.message));
       return;
     }
     if (event.type === 'text') {
@@ -282,6 +476,8 @@ async function chat(root, base, defaults, options, prefix) {
         (event.error ? ' · ' + event.error : ''));
     } else if (event.type === 'queue') {
       show(event.count + ' queued' + (live.held ? ' · /continue to send' : ''));
+    } else if (event.type === 'review') {
+      show('Change set ' + event.id + ' · ' + event.files.length + ' files · /diff to review, /apply or /reject.');
     } else if (event.type === 'error' || event.type === 'note') {
       show(event.error?.message ?? event.text);
     } else if (event.type === 'complete') {
@@ -301,37 +497,117 @@ async function chat(root, base, defaults, options, prefix) {
       }
     }
     if (options.write) live.session.write = true;
+    if (options.checks) live.session.checks = true;
     await sessions.persist(live);
     selected = live;
   };
-  const banner = () => show('xcode · ' + selected.session.title + ' · ' + selected.session.profile + ' · ' + selected.session.id.slice(0, 8));
+  const banner = () => {
+    show('xcode · ' + selected.session.title + ' · ' + selected.session.profile + ' · ' + selected.session.id.slice(0, 8));
+    if (selected.session.queue[0]?.review) show('Review pending · /diff, /apply or /reject.');
+    else if (selected.held) show('Messages are paused. /continue resumes the pending request.');
+  };
   const files = () => staged.get(selected.session.id) ?? [];
   const editable = () => {
     if (selected.active) throw new Error('Pause the session before changing its settings.');
   };
+  const terminalSignal = new AbortController();
+  let manualCheck = null;
   const closeTerminal = () => rl.close();
   const interrupt = () => {
-    if (!sessions.stop(selected)) rl.close();
+    if (pager) closeReview();
+    else if (paste) {
+      paste = null;
+      show('Draft discarded.');
+    } else if (manualCheck) manualCheck.abort();
+    else if (!sessions.stop(selected)) rl.close();
     else show('Stopping…');
   };
+  async function send(message) {
+    if (!message.trim()) throw new Error('Enter a message.');
+    if (message.length > maxPrompt) throw new Error('Prompt exceeds 32,000 characters.');
+    const profile = profileFor(await settings(), selected.session.profile);
+    const attachments = await collectAttachments(root, base, profile, message, files());
+    const { run } = await sessions.enqueue(selected, message, attachments);
+    run?.catch(error => show(error.message));
+    staged.delete(selected.session.id);
+  }
+
   async function input(raw) {
-    const line = raw.trim();
-    if (!line) return;
-    if (!line.startsWith('/')) {
-      if (line.length > maxPrompt) throw new Error('Prompt exceeds 32,000 characters.');
-      const profile = profileFor(await settings(), selected.session.profile);
-      const attachments = await collectAttachments(root, base, profile, line, files());
-      const { run } = await sessions.enqueue(selected, line, attachments);
-      run?.catch(error => show(error.message));
-      staged.delete(selected.session.id);
+    if (pager) {
+      drawReview();
       return;
     }
+    const line = raw.trim();
+    if (paste) {
+      if (line === '/cancel') {
+        paste = null;
+        show('Draft discarded.');
+      } else if (line === '/send') {
+        await send(paste.join('\n'));
+        paste = null;
+      } else {
+        if (pasteLength + raw.length + 1 > maxPrompt)
+          throw new Error('Draft exceeds 32,000 characters. Use /send or /cancel.');
+        pasteLength += raw.length + 1;
+        paste.push(raw);
+      }
+      return;
+    }
+    if (!line) return;
+    if (!line.startsWith('/')) return send(line);
     const command = /^\/[^\s]+/.exec(line)[0];
     const args = splitArgs(line.slice(command.length));
     const [arg, value] = args;
     const session = selected.session;
     switch (command) {
       case '/help': show(chatHelp); break;
+      case '/paste': paste = []; pasteLength = 0; show('Paste or type multiple lines. /send submits, /cancel discards.'); break;
+      case '/settings': show(await describeSettings(root, session)); break;
+      case '/diff': {
+        const review = session.queue[0]?.review;
+        if (!review) throw new Error('There is no pending change set.');
+        const lines = reviewDiff(review, arg);
+        if (process.env.TERM === 'dumb') { show(lines.join('\n')); break; }
+        endStream();
+        pager = { id: review.id, lines, offset: 0, column: 0,
+          maxColumn: lines.reduce((max, line) => Math.max(max, line.length - 1), 0) };
+        stdout.write('\x1b[?1049h');
+        drawReview();
+        break;
+      }
+      case '/apply':
+      case '/reject': {
+        editable();
+        if (!session.queue[0]?.review) throw new Error('There is no pending change set.');
+        const changed = await sessions.review(selected, command.slice(1));
+        show(command === '/apply' ? 'Applied ' + changed.length + ' files.' : 'Rejected the change set.');
+        selected.held = false;
+        sessions.pump(selected)?.catch(error => show(error.message));
+        break;
+      }
+      case '/checks':
+        if (!arg) {
+          show('Agent checks · ' + (session.checks ? 'on' : 'off') + '\n' + checkList(projectChecks(await settings(), root)));
+          break;
+        }
+        editable();
+        if (!['on', 'off'].includes(arg)) throw new Error('Use /checks on or /checks off.');
+        session.checks = arg === 'on';
+        await sessions.persist(selected);
+        show('Agent checks ' + arg + '.');
+        break;
+      case '/check': {
+        editable();
+        manualCheck = new AbortController();
+        try {
+          const signal = AbortSignal.any([terminalSignal.signal, manualCheck.signal]);
+          const result = await runCheck(root, projectChecks(await settings(), root), arg, signal);
+          show([checkSummary(result), result.stdout.trimEnd(), result.stderr.trimEnd()].filter(Boolean).join('\n'));
+        } finally {
+          manualCheck = null;
+        }
+        break;
+      }
       case '/exit': rl.close(); break;
       case '/new': await select(); banner(); break;
       case '/resume':
@@ -351,6 +627,7 @@ async function chat(root, base, defaults, options, prefix) {
       case '/continue':
         if (selected.active) throw new Error('A request is still running or stopping.');
         if (!session.queue.length) throw new Error('Queue is empty.');
+        if (session.queue[0].review) throw new Error('Review the pending change set with /diff, /apply or /reject.');
         selected.held = false;
         sessions.pump(selected)?.catch(error => show(error.message));
         break;
@@ -390,7 +667,7 @@ async function chat(root, base, defaults, options, prefix) {
         if (!['on', 'off'].includes(arg)) throw new Error('Use /write on or /write off.');
         session.write = arg === 'on';
         await sessions.persist(selected);
-        show('Workspace editing ' + arg + '.');
+        show('Change proposals ' + arg + '. Applying still requires approval.');
         break;
       case '/retry': {
         const retry = Number(arg);
@@ -412,7 +689,9 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       case '/tools':
         show((session.queue[0]?.tools ?? session.turns.at(-1)?.tools ?? [])
-          .map(tool => tool.stage + ' · ' + tool.name + ' ' + (tool.path || '') + (tool.error ? ' · ' + tool.error : '')).join('\n') || 'No tools called.');
+          .map(tool => tool.stage + ' · ' + tool.name + (tool.path ? ' ' + tool.path : '') +
+            (tool.check ? ' ' + tool.check + ' · exit ' + (tool.exitCode ?? 'unavailable') : '') +
+            (tool.error ? ' · ' + tool.error : '')).join('\n') || 'No tools called.');
         break;
       default: throw new Error('Unknown command. Use /help.');
     }
@@ -422,9 +701,10 @@ async function chat(root, base, defaults, options, prefix) {
     if (options.attach?.length) staged.set(selected.session.id, options.attach);
     const hasProfile = own((await settings()).profiles, selected.session.profile);
     rl.on('SIGINT', interrupt);
+    stdin.on('keypress', reviewKey);
     process.once('SIGTERM', closeTerminal);
     const finished = new Promise(resolve => {
-      rl.on('close', () => { closed = true; resolve(); });
+      rl.on('close', () => { closed = true; terminalSignal.abort(); resolve(); });
       rl.on('line', line => {
         streamOpen = false;
         chain = chain.then(async () => {
@@ -445,7 +725,6 @@ async function chat(root, base, defaults, options, prefix) {
     banner();
     print('Type a request or /help.');
     if (!hasProfile) print('Set up a model profile in another terminal with xcode setup.');
-    if (selected.held) print('Messages are paused. /continue resumes the pending request.');
     rendering = false;
     prompt();
     await finished;
@@ -453,6 +732,8 @@ async function chat(root, base, defaults, options, prefix) {
   } finally {
     closed = true;
     process.off('SIGTERM', closeTerminal);
+    stdin.off('keypress', reviewKey);
+    closeReview();
     rl.close();
     await sessions.close();
   }
@@ -464,7 +745,7 @@ async function main() {
     options: {
       cwd: { type: 'string' }, profile: { type: 'string' }, harness: { type: 'string' },
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
-      write: { type: 'boolean' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
+      write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' },
     },
   });
@@ -477,6 +758,10 @@ async function main() {
   const base = resolve(values.cwd || process.cwd());
   const root = await projectRoot(base);
   const defaults = { profile: values.profile, harness: values.harness };
+  if (command === 'check') return checkCommand(root, rest[0], rest[1], rest.slice(2), values);
+  if (command === 'review') return reviewCommand(root, ...rest);
+  if (command === 'settings') return print(await describeSettings(root));
+  if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'sessions') {
     const sessions = new Sessions(root);
     return describeSessions(await sessions.list());

@@ -17,6 +17,7 @@ export const roles = {
 };
 
 export const readTools = ['glob', 'grep', 'read', 'project_guides', 'repo_map', 'skill_read'];
+const changeTools = ['propose_changes', 'edit'];
 const step = (name, instruction, tools = readTools, done = 'Report the evidence and unresolved items.') => ({
   name, instruction, tools, done,
 });
@@ -24,7 +25,7 @@ const step = (name, instruction, tools = readTools, done = 'Report the evidence 
 export const presets = {
   default: {
     description: 'A single stage for general local work',
-    stages: [step('Work', 'Follow the user request and reference files you used.', [...readTools, 'edit'])],
+    stages: [step('Work', 'Follow the user request and reference files you used.', [...readTools, ...changeTools])],
   },
   'deepseek-flash': {
     description: 'Focused search and a short evidence-based response',
@@ -42,12 +43,12 @@ export const presets = {
     ],
   },
   implement: {
-    description: 'Investigate, edit existing files and verify',
+    description: 'Investigate, propose a reviewable change set, and verify',
     role: 'full-stack',
     stages: [
       step('Investigate', 'Read instructions and identify the smallest viable change.'),
-      step('Implement', 'Apply targeted edits to affected files.', [...readTools, 'edit'], 'Report the paths affected.'),
-      step('Verify', 'Read back changes, check whitespace and review behavior against the original request.', [...readTools, 'verify_edits'], 'Report verified results and remaining checks.'),
+      step('Implement', 'Propose targeted edits or new files as one change set. Wait for the review decision.', [...readTools, ...changeTools], 'Report the paths affected.'),
+      step('Verify', 'Read back changes, check whitespace and run an enabled project check when applicable.', [...readTools, 'verify_edits', 'run_check'], 'Report verified results and remaining checks.'),
     ],
   },
   infrastructure: {
@@ -63,7 +64,7 @@ export const presets = {
     role: 'writer',
     stages: [
       step('Collect', 'Locate relevant files, instructions and examples.'),
-      step('Draft', 'Write task-oriented documentation and cite the source material.', [...readTools, 'edit']),
+      step('Draft', 'Write task-oriented documentation and cite the source material.', [...readTools, ...changeTools]),
     ],
   },
 };
@@ -80,7 +81,7 @@ export function harnessFor(config, name) {
     if (typeof stage?.name !== 'string' || !stage.name.trim() || typeof stage.instruction !== 'string' ||
       (stage.done !== undefined && typeof stage.done !== 'string') ||
       (stage.tools !== undefined && (!Array.isArray(stage.tools) ||
-        stage.tools.some(tool => ![...readTools, 'edit', 'verify_edits'].includes(tool)))))
+        stage.tools.some(tool => ![...readTools, ...changeTools, 'verify_edits', 'run_check'].includes(tool)))))
       throw new Error('Each stage needs a name and instruction. Tools must use supported names.');
   }
   if (harness.skills !== undefined && (!Array.isArray(harness.skills) ||

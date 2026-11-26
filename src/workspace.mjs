@@ -1,7 +1,6 @@
 import { execFile } from 'node:child_process';
-import { lstat, open, readdir, realpath, rename, rm } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
-import { basename, dirname, isAbsolute, join, matchesGlob, relative, resolve, sep } from 'node:path';
+import { lstat, open, readdir, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, matchesGlob, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
@@ -59,6 +58,31 @@ export function decodeText(bytes) {
   } catch {
     throw new Error('Only UTF-8 text can be read as source.');
   }
+}
+
+export function replaceText(bytes, oldText, newText, max) {
+  if (typeof oldText !== 'string' || !oldText || typeof newText !== 'string' || oldText === newText)
+    throw new Error('Provide exact original and replacement text.');
+  const original = decodeText(bytes);
+  const normal = original.replace(/\r\n/g, '\n');
+  const expected = oldText.replace(/\r\n/g, '\n');
+  const index = normal.indexOf(expected);
+  if (index < 0 || normal.indexOf(expected, index + 1) >= 0) throw new Error('Original text must match exactly once.');
+  const line = normal.slice(0, index).split('\n').length;
+  function sourceOffset(target) {
+    let actual = 0;
+    for (let normalized = 0; normalized < target; normalized++, actual++) {
+      if (original[actual] === '\r' && original[actual + 1] === '\n') actual++;
+    }
+    return actual;
+  }
+  const offset = sourceOffset(index);
+  const end = sourceOffset(index + expected.length);
+  const replacement = original.includes('\r\n') ? newText.replace(/\r?\n/g, '\r\n') : newText;
+  const bom = bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? '\uFEFF' : '';
+  const output = bom + original.slice(0, offset) + replacement + original.slice(end);
+  if (Buffer.byteLength(output) > max || output.includes('\0') || !output.isWellFormed()) throw new Error('Edited file exceeds the supported UTF-8 text limits.');
+  return { output, line };
 }
 
 export async function readText(root, path, signal, max = 1024 * 1024) {
@@ -208,49 +232,6 @@ export class Workspace {
     const file = await verifiedFile(this.root, path, signal);
     const text = decodeText(await loadBytes(file.path, 1024 * 1024, signal));
     return { path: slash(relative(this.root, file.path)), ...excerpt(text, start, count) };
-  }
-
-  async edit({ path, oldText, newText }, signal) {
-    if (typeof oldText !== 'string' || !oldText || typeof newText !== 'string' || oldText === newText)
-      throw new Error('Provide exact original and replacement text.');
-    const file = await verifiedFile(this.root, path, signal);
-    const bytes = await loadBytes(file.path, 1024 * 1024, signal);
-    const original = decodeText(bytes);
-    const normal = original.replace(/\r\n/g, '\n');
-    const expected = oldText.replace(/\r\n/g, '\n');
-    const index = normal.indexOf(expected);
-    if (index < 0 || normal.indexOf(expected, index + 1) >= 0) throw new Error('Original text must match exactly once.');
-    const line = normal.slice(0, index).split('\n').length;
-    function sourceOffset(target) {
-      let actual = 0;
-      for (let normalized = 0; normalized < target; normalized++, actual++) {
-        if (original[actual] === '\r' && original[actual + 1] === '\n') actual++;
-      }
-      return actual;
-    }
-    const offset = sourceOffset(index);
-    const originalEnd = sourceOffset(index + expected.length);
-    const replacement = original.includes('\r\n') ? newText.replace(/\r?\n/g, '\r\n') : newText;
-    const bom = bytes.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) ? '\uFEFF' : '';
-    const output = bom + original.slice(0, offset) + replacement + original.slice(originalEnd);
-    if (Buffer.byteLength(output) > 1024 * 1024) throw new Error('Edited file exceeds the supported size.');
-    const temporary = join(dirname(file.path), '.' + basename(file.path) + '.xcode-' + randomUUID());
-    const handle = await open(temporary, 'wx', file.info.mode & 0o777);
-    try {
-      try {
-        await handle.writeFile(output);
-        await handle.chmod(file.info.mode & 0o777);
-      } finally {
-        await handle.close();
-      }
-      const latest = await verifiedFile(this.root, path, signal);
-      if (latest.info.ino !== file.info.ino || !(await loadBytes(latest.path, 1024 * 1024, signal)).equals(bytes))
-        throw new Error('File changed while preparing the edit. Read it again.');
-      await rename(temporary, file.path);
-    } finally {
-      await rm(temporary, { force: true });
-    }
-    return { path: slash(relative(this.root, file.path)), line };
   }
 
   async guides(path = '.', signal) {

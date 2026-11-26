@@ -10,7 +10,8 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 import { complete, completionUrl } from '../src/model.mjs';
 import { attach, explicitReferences, splitArgs } from '../src/attachments.mjs';
-import { Workspace } from '../src/workspace.mjs';
+import { Workspace, replaceText } from '../src/workspace.mjs';
+import { completeReference } from '../src/terminal.mjs';
 
 const exec = promisify(execFile);
 const cliPath = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
@@ -99,8 +100,9 @@ test('workspace respects ignores, includes scoped instructions and preserves BOM
   await assert.rejects(ws.read({ path: '.env' }), /excluded/);
   await assert.rejects(ws.read({ path: join(outside, 'outside.js') }), /excluded/);
   if (process.platform !== 'win32') await assert.rejects(ws.read({ path: 'src/linked.js' }), /Symbolic links/);
-  await ws.edit({ path: 'src/a.js', oldText: 'const retryOption = 3;\nend', newText: 'const retryOption = 4;\nend' });
-  assert.equal(await readFile(join(root, 'src', 'a.js'), 'utf8'), '\uFEFFstart\r\nconst retryOption = 4;\r\nend\r\n');
+  const source = await readFile(join(root, 'src', 'a.js'));
+  const modified = replaceText(source, 'const retryOption = 3;\nend', 'const retryOption = 4;\nend', 4096);
+  assert.equal(modified.output, '\uFEFFstart\r\nconst retryOption = 4;\r\nend\r\n');
 });
 
 test('repo map ranks symbols and resolves relative imports', async t => {
@@ -144,25 +146,120 @@ test('CLI retains token on endpoint changes and finds a local file from a natura
   assert.match((await cli('sessions')).stdout, /결제 재시도/);
 });
 
-test('stages use separate tools and apply a bounded opt-in edit', async t => {
+test('CLI reviews a multi-file change before applying it and runs the authorized verification check', async t => {
   const api = await server(t, (body, res, request) => {
-    if (request <= 2) assert.ok(body.tools.every(tool => tool.function.name !== 'edit'));
+    const names = body.tools.map(tool => tool.function.name);
+    if (request <= 2) assert.ok(!names.includes('propose_changes'));
     if (request === 1) return tool(res, 'read', '{"path":"a.txt"}');
     if (request === 2) return reply(res, 'Change a.txt.');
     if (request === 3) {
-      assert.ok(body.tools.some(tool => tool.function.name === 'edit'));
-      return tool(res, 'edit', '{"path":"a.txt","oldText":"before","newText":"after"}');
+      assert.ok(names.includes('propose_changes'));
+      assert.ok(!names.includes('run_check'));
+      return tool(res, 'propose_changes', JSON.stringify({
+        changes: [
+          { path: 'a.txt', action: 'replace', oldText: 'before', newText: 'after' },
+          { path: 'new/path/b.txt', action: 'create', newText: 'created\n' },
+        ],
+      }));
     }
-    if (request === 4) return reply(res, 'Edited a.txt.');
-    assert.ok(body.tools.some(tool => tool.function.name === 'verify_edits'));
-    assert.ok(body.tools.every(tool => tool.function.name !== 'edit'));
-    return reply(res, 'Updated a.txt.');
+    if (request === 4) {
+      assert.equal(JSON.parse(body.messages.at(-1).content).status, 'applied');
+      return reply(res, 'Edited a.txt and created a file.');
+    }
+    assert.ok(names.includes('verify_edits'));
+    assert.ok(names.includes('run_check'));
+    assert.ok(!names.includes('propose_changes'));
+    if (request === 5) return tool(res, 'run_check', '{"name":"validate"}');
+    const check = JSON.parse(body.messages.at(-1).content);
+    assert.equal(check.exitCode, 0);
+    assert.match(check.stdout, /both changes present/);
+    return reply(res, 'Updated a.txt and verified both changes.');
   });
   const { work, cli } = await profile(t, api);
   await writeFile(join(work, 'a.txt'), 'before\n');
-  const result = await cli('ask', 'Rename test contents', '--harness', 'implement', '--write');
-  assert.match(result.stdout, /Updated a\.txt/);
+  await cli('check', 'add', 'validate', '--', 'node', '-e',
+    'if(!require("fs").existsSync("new/path/b.txt")) process.exit(7); console.log("both changes present");');
+  await assert.rejects(cli('ask', 'Rename test contents', '--harness', 'implement', '--write', '--checks'),
+    error => error.code === 3 && /awaiting approval/.test(error.stderr));
+  assert.equal(await readFile(join(work, 'a.txt'), 'utf8'), 'before\n');
+  assert.match((await cli('sessions')).stdout, /review needed/);
+  const diff = (await cli('review', 'show')).stdout;
+  assert.match(diff, /-before/);
+  assert.match(diff, /\+after/);
+  assert.match(diff, /new\/path\/b\.txt/);
+  await cli('review', 'apply');
   assert.equal(await readFile(join(work, 'a.txt'), 'utf8'), 'after\n');
+  assert.equal(await readFile(join(work, 'new', 'path', 'b.txt'), 'utf8'), 'created\n');
+  const result = await cli('continue');
+  assert.match(result.stdout, /Updated a\.txt/);
+  assert.match(result.stderr, /validate · passed · exit 0/);
+});
+
+test('a late file conflict rolls back earlier replacements and respects existing user changes', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const module = new URL('../src/changes.mjs', import.meta.url).href;
+  const wsModule = new URL('../src/workspace.mjs', import.meta.url).href;
+  const store = new URL('../src/store.mjs', import.meta.url).href;
+  await writeFile(join(root, 'a.txt'), 'original');
+  await writeFile(join(root, 'b.txt'), 'original');
+  const program = [
+    'import assert from "node:assert/strict";',
+    'import { mkdir, readFile, writeFile } from "node:fs/promises";',
+    'const { prepareReview, applyReview } = await import(' + JSON.stringify(module) + ');',
+    'const { Workspace } = await import(' + JSON.stringify(wsModule) + ');',
+    'const { sessionsDir } = await import(' + JSON.stringify(store) + ');',
+    'await mkdir(sessionsDir);',
+    'const project = new Workspace(process.cwd());',
+    'const changes = ["a.txt","b.txt"].map(path => ({ path, action:"replace",oldText:"original",newText:"proposed" }));',
+    'await assert.rejects(prepareReview(project,[{path:"../escape",action:"create",newText:"x"}]), /canonical/);',
+    'const review = await prepareReview(project, changes, ["a.txt","b.txt"]);',
+    'let writes = 0;',
+    'await assert.rejects(applyReview(project, review, async () => { if (writes++ === 0) await writeFile("b.txt","user edit"); }), /changed while/);',
+    'assert.equal(review.state, "pending");',
+    'assert.equal(await readFile("a.txt", "utf8"), "original");',
+    'assert.equal(await readFile("b.txt", "utf8"), "user edit");',
+    'await writeFile("b.txt", "original");',
+    'await applyReview(project, review, async () => {});',
+    'await applyReview(project, review, async () => {});',
+    'assert.equal(await readFile("a.txt", "utf8"), "proposed");',
+    'assert.equal(await readFile("b.txt", "utf8"), "proposed");',
+  ].join('\n');
+  await exec(process.execPath, ['--input-type=module', '--eval', program], {
+    cwd: root, env: { ...process.env, XCODE_HOME: state }, timeout: 12000,
+  });
+  assert.equal(await readFile(join(root, 'a.txt'), 'utf8'), 'proposed');
+  assert.equal(await readFile(join(root, 'b.txt'), 'utf8'), 'proposed');
+});
+
+test('profile diagnostics distinguish plain chat, SSE and supported tool calls', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (body.tools) return tool(res, 'xcode_probe', '{}');
+    if (request === 2) {
+      assert.equal(body.stream, true);
+      res.setHeader('Content-Type', 'text/event-stream');
+      return res.end('data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n');
+    }
+    if (request === 1) assert.equal(body.stream, false);
+    return reply(res, 'OK');
+  });
+  const { cli } = await profile(t, api);
+  const { stdout } = await cli('profile', 'test');
+  assert.match(stdout, /CHAT PASS/);
+  assert.match(stdout, /SSE PASS/);
+  assert.match(stdout, /TOOLS PASS/);
+  await assert.rejects(cli('profile', 'test', '--only', 'sse'), error =>
+    error.code === 1 && /SSE FAIL.*JSON/.test(error.stdout));
+});
+
+test('path completion quotes spaces and excludes paths outside the project', async t => {
+  const root = await temp(t);
+  await mkdir(join(root, 'src'));
+  await writeFile(join(root, 'src', 'some notes.txt'), 'text');
+  await writeFile(join(root, 'src', '.env'), 'secret');
+  assert.deepEqual(await completeReference(root, root, 'look at @src/so'), [['@"src/some notes.txt"'], '@src/so']);
+  assert.deepEqual(await completeReference(root, root, 'look at @src/.e'), [[], '@src/.e']);
+  assert.deepEqual(await completeReference(root, root, 'look at @../'), [[], '@../']);
 });
 
 test('rate or usage limits are terminal errors and SSE handles split UTF-8', async t => {
@@ -223,4 +320,22 @@ test('concurrent sessions preserve their queues and stop-and-advance sends the n
     cwd: work, env: { ...process.env, XCODE_HOME: state }, timeout: 10000,
   });
   assert.ok(api.requests.some(request => request.body.messages.at(-1).content === 'next'));
+});
+
+test('rejecting a proposal preserves files and reports the decision to the model', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) {
+      assert.ok(!body.tools.some(item => item.function.name === 'run_check'));
+      return tool(res, 'propose_changes', JSON.stringify({
+        changes: [{ path: 'unsaved.txt', action: 'create', newText: 'Do not create this.' }],
+      }));
+    }
+    assert.equal(JSON.parse(body.messages.at(-1).content).status, 'rejected_by_user');
+    return reply(res, 'The proposal was rejected.');
+  });
+  const { work, cli } = await profile(t, api);
+  await assert.rejects(cli('ask', 'Create a file', '--write'), error => error.code === 3);
+  await cli('review', 'reject');
+  assert.match((await cli('continue')).stdout, /proposal was rejected/);
+  await assert.rejects(readFile(join(work, 'unsaved.txt')), { code: 'ENOENT' });
 });

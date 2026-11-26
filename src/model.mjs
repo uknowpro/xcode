@@ -141,11 +141,11 @@ async function streamResponse(body, result, onText, signal) {
   if (!completed && !result.finished) throw new ModelError('The model stream ended early.', { retryable: true });
 }
 
-export async function complete(profile, token, messages, { tools = [], signal, onText = () => {} } = {}) {
+export async function complete(profile, token, messages, { tools = [], stream = true, signal, onText = () => {}, onFormat = () => {} } = {}) {
   const body = JSON.stringify({
     model: profile.model,
     messages,
-    stream: true,
+    stream,
     ...(tools.length ? { tools } : {}),
   });
   if (Buffer.byteLength(body) > 24 * 1024 * 1024) throw new ModelError('Model request exceeds 24 MiB.');
@@ -167,8 +167,10 @@ export async function complete(profile, token, messages, { tools = [], signal, o
   }
   const result = { role: 'assistant', content: '', tool_calls: new Map() };
   if (response.headers.get('content-type')?.includes('text/event-stream')) {
+    onFormat('sse');
     await streamResponse(response.body, result, onText, signal);
   } else {
+    onFormat('json');
     let part;
     try {
       part = JSON.parse(await responseText(response, maxResponse));

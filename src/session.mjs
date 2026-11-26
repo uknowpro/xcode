@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { lock, saveJson, sessionsDir, sessionPath, listSessions, settings, tokenFor } from './store.mjs';
 import { runJob } from './agent.mjs';
+import { applyReview, ReviewRequired } from './changes.mjs';
+import { Workspace } from './workspace.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -78,12 +80,13 @@ export class Sessions {
   }
 
   pump(live) {
-    if (this.closing || live.active || live.held || !live.session.queue.length) return live.active?.promise;
+    if (this.closing || live.active || live.held || live.reviewing || live.session.queue[0]?.review || !live.session.queue.length) return live.active?.promise;
     const controller = new AbortController();
     const active = { controller, advance: false };
     live.active = active;
     active.promise = this.execute(live, active).finally(() => {
       live.active = null;
+      if (live.holdAfterCurrent) live.held = true;
       const next = this.pump(live);
       next?.catch(error => this.notify(live, { type: 'error', error }));
     });
@@ -100,17 +103,25 @@ export class Sessions {
         throw new Error('Set up a model profile first with xcode setup.');
       const profile = config.profiles[session.profile];
       const token = await tokenFor(session.profile);
+      delete job.failure;
       const answer = await runJob({ session, job, config, profile, token, signal,
         emit: event => this.notify(live, event), save: () => this.persist(live) });
       await this.finish(live, job, answer, 'complete');
       this.notify(live, { type: 'complete', answer });
       return { answer };
     } catch (error) {
+      if (error instanceof ReviewRequired || (job.review && !active.advance)) {
+        live.held = true;
+        this.notify(live, { type: 'review', id: job.review.id, files: job.review.files.map(file => file.path) });
+        return { review: job.review };
+      }
       if (signal.aborted && active.advance) {
         await this.finish(live, job, '', 'stopped');
         this.notify(live, { type: 'note', text: 'Stopped current message. Sending the next queued message.' });
       } else {
         live.held = true;
+        if (!signal.aborted) job.failure = error.message;
+        await this.persist(live);
         this.notify(live, { type: 'error', error: signal.aborted ? new Error('Stopped. /continue resumes, /skip removes this message.') : error });
       }
       return { error };
@@ -122,7 +133,7 @@ export class Sessions {
     const turns = live.session.turns;
     const item = {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
-      attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
+      checks: job.checks ?? [], attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
     };
     turns.push(item);
     queue.shift();
@@ -142,9 +153,44 @@ export class Sessions {
     return true;
   }
 
+  async review(live, decision) {
+    const job = live.session.queue[0];
+    const review = job?.review;
+    if (!review) throw new Error('There is no pending change set.');
+    if (live.active || live.reviewing) throw new Error('Wait for this session to finish its current action.');
+    if (decision === 'reject' && review.state === 'applying') throw new Error('An interrupted apply must be reconciled before it can be discarded.');
+    live.reviewing = true;
+    try {
+      const tool = job.stageHistory?.find(message => message.role === 'tool' && message.tool_call_id === review.callId);
+      if (!tool) throw new Error('Missing the tool result for this review.');
+      const files = decision === 'apply'
+        ? await applyReview(new Workspace(this.root), review, () => this.persist(live))
+        : [];
+      const previous = tool.content;
+      const oldChanged = job.changed;
+      job.changed = [...new Set([...oldChanged, ...files])];
+      tool.content = JSON.stringify(decision === 'apply'
+        ? { status: 'applied', reviewId: review.id, files }
+        : { status: 'rejected_by_user', reviewId: review.id, instruction: 'Do not repeat the rejected proposal. Continue with an explanation.' });
+      delete job.review;
+      try {
+        await this.persist(live);
+      } catch (error) {
+        job.review = review;
+        job.changed = oldChanged;
+        tool.content = previous;
+        throw error;
+      }
+      return files;
+    } finally {
+      live.reviewing = false;
+    }
+  }
+
   async skip(live) {
     if (live.active) throw new Error('Stop the active request first, or use /next.');
     if (!live.session.queue.length) return;
+    if (live.session.queue[0].review?.state === 'applying') throw new Error('Reconcile the interrupted apply before discarding this message.');
     await this.finish(live, live.session.queue[0], '', 'stopped');
     live.held = false;
     this.pump(live)?.catch(error => this.notify(live, { type: 'error', error }));

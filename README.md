@@ -2,65 +2,43 @@
 
 [한국어](README.ko.md)
 
-A terminal coding assistant that works with your local project and an OpenAI-compatible Chat Completions endpoint. xcode can find and read relevant source files from a question, stream the answer, and show the paths and line numbers it used.
+A terminal coding assistant for your local project and an OpenAI-compatible Chat Completions endpoint. Ask it to find code, propose changes, and verify approved edits.
 
-## Install
+## Setup
 
-Requires Node.js 22.5 or later. Run from a checkout on Linux, macOS, or Windows.
+Requires Node.js 22.5 or later on Linux, macOS, or Windows. From the checkout, run
 
     npm install -g .
     xcode setup
     xcode profile test
 
-Setup asks for an API URL, model ID, and token. Both local and remote HTTP or HTTPS addresses work. Use a base URL ending in /v1 or the full /v1/chat/completions URL. Choose HTTPS when the token or project contents need encryption in transit. The saved default profile applies to new sessions. Editing a URL keeps its token unless you change or clear it.
+Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS address ending in /v1 or /chat/completions. The saved default profile applies to new sessions. Changing the URL keeps the token. The connection test reports plain chat, SSE, and tool calling separately.
+
+## Work in a project
 
     cd my-project
     xcode
-    xcode ask "Where is the invoice retry policy configured?"
+    xcode ask "Where is the retry policy configured?"
     xcode sessions
-    xcode resume latest
 
-## Work in a session
+xcode searches the current worktree and returns paths and line numbers. Tool calling must be supported by the model endpoint. Type @ and press Tab to complete a file path. Use /paste followed by /send for multi-line input.
 
-- The current Git worktree or starting directory serves as the project scope. xcode can locate filenames, search their contents, read bounded line ranges, and apply AGENTS.md instructions. Use @src/config.ts to point to a known file.
-- Use /new and /sessions for parallel sessions, /resume to switch, and /queue to see pending messages. /stop pauses the active message, /continue resumes it, and /next stops it and sends the next queued message. Automatic retry can be enabled with /retry 60 for transient failures. Usage and rate limits pause the queue.
-- Use /attach "notes.txt" for UTF-8 text or /inputs image on for a model with image input. /inputs pdf on enables native PDF input. When native PDF is disabled, xcode can extract text locally with pdftotext when installed.
-- Read-only is the initial session mode. Use --write or /write on to allow exact replacements in existing source files. /tools shows the tools used in the last or current message.
-- The local tool loop needs Chat Completions function calling support. For an endpoint with chat only, set /inputs tools off and attach the context explicitly.
+To propose edits and run project verification, use
 
-## Harnesses
+    xcode check add unit -- npm test
+    xcode --harness implement --write --checks
 
-A harness combines a role, skills, and one or more stages. Stages have separate instructions, tool lists, and completion criteria. xcode saves stage results in the session, so an interrupted turn can continue from the stored stage.
+1. Describe the change. xcode prepares a change set for existing or new text files.
+2. Open /diff, scroll with the arrow or page keys, and close it with Esc. Use /apply or /reject to decide.
+3. After approval, the verify stage can run the registered check and show its exit code. /check unit runs it manually.
 
-    xcode harness list
-    xcode harness roles
-    xcode harness show code-review
-    xcode --harness deepseek-flash
-    xcode harness import my-review harness.json
+Read-only mode is the default. /write on allows proposals, and /checks on allows a compatible harness to run only registered commands for the current project. For one-off requests, use xcode review show, xcode review apply, and xcode continue after xcode ask pauses for review.
 
-Predefined harnesses cover general work, focused DeepSeek Flash tasks, review, implementation, infrastructure, and documentation. Use /harness <name> to switch in a session. The project and user skill directories at .claude/skills and .xcode/skills are scanned for compatible SKILL.md files.
+## Settings and sessions
 
-A custom harness example
+- **Global** · xcode setup saves the default model, xcode profile use <name> changes it, and xcode settings shows your profile and project checks. settings.json and a separate token file live under ~/.xcode or XCODE_HOME. XCODE_API_TOKEN overrides a stored token.
+- **Session** · /settings shows the active profile, harness, and permissions. Use /model or /harness to switch, and /new, /sessions, or /resume for parallel or saved conversations.
+- **Input** · /attach accepts text, images and PDFs. Use /inputs image on or /inputs pdf on for supported models. For a text-only PDF workflow, xcode can use the optional pdftotext tool.
+- **Harness** · xcode harness list and xcode harness show implement show the presets and their steps. Use xcode harness import <name> <file> for custom JSON. Compatible SKILL.md files can be loaded from .claude/skills and .xcode/skills.
 
-    {
-      "role": "backend",
-      "stages": [
-        {
-          "name": "Review",
-          "instruction": "Find the relevant callers and trace error handling.",
-          "tools": ["glob", "grep", "read"],
-          "done": "Summarize findings with file paths and line numbers."
-        }
-      ]
-    }
-
-## Configuration and data
-
-Configuration and sessions live under ~/.xcode by default. Set XCODE_HOME to choose another directory. settings.json contains profiles and custom harnesses. The CLI stores saved tokens separately in tokens.json with user-only permissions where supported. XCODE_API_TOKEN overrides the saved token for the current process.
-
-    xcode profile set work --endpoint https://model.example/v1 --model model-id
-    xcode profile use work
-
-File search runs locally. Selected source snippets, active skill context, and attachments are sent to the endpoint configured for the session. ripgrep is used to list search candidates when available, with a built-in fallback. The optional source map summarizes declarations and resolvable relative JavaScript and TypeScript imports.
-
-Run npm test to check file discovery, sessions, token retention, and model streaming against a loopback fixture.
+File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.

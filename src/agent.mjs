@@ -5,6 +5,8 @@ import { complete } from './model.mjs';
 import { harnessFor, readTools, roleText, skillRead, skillsAt } from './harness.mjs';
 import { userMessage } from './attachments.mjs';
 import { Workspace } from './workspace.mjs';
+import { prepareReview, ReviewRequired } from './changes.mjs';
+import { projectChecks, runCheck } from './checks.mjs';
 
 const exec = promisify(execFile);
 const schema = (description, properties, required = []) => ({
@@ -23,9 +25,21 @@ const definitions = {
   project_guides: schema('Read AGENTS.md files for a workspace file or directory, root first.', { path: string }),
   repo_map: schema('Summarize source declarations and resolvable relative JavaScript and TypeScript imports.', { query: string }),
   skill_read: schema('Read SKILL.md or a resource from a discovered local skill. Scripts are returned as text.', { name: string, path: string }, ['name']),
-  edit: schema('Replace one exact occurrence in an existing workspace file. Read it and its instructions first.', {
+  propose_changes: schema('Propose up to 20 files in one review. Read existing files and scoped guides before using replace. Use create for a new UTF-8 file. Wait for user approval.', {
+    changes: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { path: string, action: { type: 'string', enum: ['create', 'replace'] }, oldText: string, newText: string },
+        required: ['path', 'action', 'newText'],
+        additionalProperties: false,
+      },
+    },
+  }, ['changes']),
+  edit: schema('Propose one exact replacement for review. Prefer propose_changes for multiple lines or files.', {
     path: string, oldText: string, newText: string,
   }, ['path', 'oldText', 'newText']),
+  run_check: schema('Run one exact, user-configured project check by name.', { name: string }, ['name']),
   verify_edits: schema('Check session-edited files for Git whitespace errors.', {}),
 };
 
@@ -54,7 +68,7 @@ function previousTurns(turns) {
   ]);
 }
 
-async function stageMessages(session, job, harness, stage, project, skills, signal) {
+async function stageMessages(session, job, harness, stage, project, skills, allowed, checks, signal) {
   const guides = await project.guides('.', signal);
   const selected = await Promise.all((harness.skills ?? []).map(name => skillRead(skills, name, undefined, signal)));
   const catalog = [...skills.values()].slice(0, 50).map(skill => ({ name: skill.name, description: skill.description }));
@@ -65,6 +79,11 @@ async function stageMessages(session, job, harness, stage, project, skills, sign
     'Workspace: ' + session.root,
     'Stage ' + (job.completed.length + 1) + '/' + harness.stages.length + ': ' + stage.name,
     stage.instruction,
+    allowed.includes('propose_changes') || allowed.includes('edit')
+      ? 'Group related edits in one proposal and wait for the user review before describing any file as modified.'
+      : 'File changes are unavailable in this stage.',
+    allowed.includes('run_check') ? 'Enabled project checks: ' + Object.keys(checks).join(', ') : '',
+    'Never claim that a project check ran unless its tool result includes an exit code or timeout.',
     stage.done ? 'Completion condition: ' + stage.done : '',
     harness.role ? 'Role: ' + roleText(harness.role) : '',
     guides.length ? 'Project instructions:\n' + clipped(JSON.stringify(guides), 16000) : '',
@@ -79,7 +98,7 @@ async function stageMessages(session, job, harness, stage, project, skills, sign
   return [...context, userMessage(job.prompt, job.attachments)];
 }
 
-async function execute(project, skills, job, call, allowed, signal) {
+async function execute(project, skills, job, call, allowed, checks, signal) {
   const name = call.function.name;
   if (!allowed.includes(name)) throw new Error('Tool is unavailable in this stage: ' + name);
   const args = JSON.parse(call.function.arguments || '{}');
@@ -104,11 +123,20 @@ async function execute(project, skills, job, call, allowed, signal) {
     case 'project_guides': return project.guides(args.path, signal);
     case 'repo_map': return project.map(args, signal);
     case 'skill_read': return skillRead(skills, args.name, args.path, signal);
-    case 'edit': {
-      if (!job.readPaths?.includes(args.path)) throw new Error('Read this workspace-relative path before editing it.');
-      const result = await project.edit(args, signal);
-      if (!job.changed.includes(result.path)) job.changed.push(result.path);
-      return result;
+    case 'edit':
+    case 'propose_changes': {
+      if (job.review) throw new Error('There is already a change set awaiting user review.');
+      const operations = name === 'edit' ? [{ ...args, action: 'replace' }] : args.changes;
+      job.review = await prepareReview(project, operations, job.readPaths, signal);
+      job.review.callId = call.id;
+      return { status: 'awaiting_approval', reviewId: job.review.id, files: job.review.files.map(file => file.path) };
+    }
+    case 'run_check': {
+      if (job.review) throw new Error('Check execution waits until the proposed changes are reviewed.');
+      const result = await runCheck(project.root, checks, args.name, signal);
+      job.checks ??= [];
+      job.checks.push(result);
+      return { ...result, stdout: clipped(result.stdout, 5000), stderr: clipped(result.stderr, 5000) };
     }
     case 'verify_edits': return verify(project.root, job.changed, signal);
   }
@@ -137,16 +165,22 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   const harness = job.harness;
   const project = new Workspace(session.root);
   const skills = await skillsAt(session.root, signal);
+  const checks = projectChecks(config, session.root);
   for (let index = job.completed.length; index < harness.stages.length; index++) {
     signal.throwIfAborted();
     const stage = harness.stages[index];
-    const allowed = (stage.tools ?? readTools).filter(name => (name !== 'edit' || session.write) && profile.tools !== false);
+    const allowed = [...new Set(stage.tools ?? readTools)].filter(name => {
+      if (profile.tools === false) return false;
+      if (name === 'edit' || name === 'propose_changes') return session.write;
+      if (name === 'run_check') return session.checks && Object.keys(checks).length;
+      return true;
+    });
     const tools = allowed.map(name => {
       const tool = definitions[name];
       return { ...tool, function: { ...tool.function, name } };
     });
     emit({ type: 'stage', stage: stage.name, index, total: harness.stages.length });
-    const messages = await stageMessages(session, job, harness, stage, project, skills, signal);
+    const messages = await stageMessages(session, job, harness, stage, project, skills, allowed, checks, signal);
     // Keep complete assistant/tool pairs for an interrupted stage.
     messages.push(...(job.stageHistory ?? []));
     for (let round = (job.stageHistory?.filter(message => message.role === 'assistant').length ?? 0); round < 16; round++) {
@@ -168,7 +202,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         let result;
         try {
           signal.throwIfAborted();
-          result = await execute(project, skills, job, call, allowed, signal);
+          result = await execute(project, skills, job, call, allowed, checks, signal);
         } catch (error) {
           result = { error: signal.aborted ? 'Stopped before this tool finished.' : error.message };
         }
@@ -180,7 +214,11 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         if (!path) {
           try { path = JSON.parse(call.function.arguments || '{}')?.path; } catch { /* invalid args */ }
         }
-        const record = { stage: stage.name, name: call.function.name, path, error: result?.error };
+        const record = {
+          stage: stage.name, name: call.function.name, path,
+          ...(call.function.name === 'run_check' && result?.name ? { check: result.name, exitCode: result.exitCode } : {}),
+          error: result?.error,
+        };
         job.tools.push(record);
         emit({ type: 'tool', ...record, summary: Array.isArray(result?.matches) ? result.matches.length + ' matches' :
           Array.isArray(result?.paths) ? result.paths.length + ' files' : result?.status });
@@ -189,6 +227,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       messages.push(...results);
       await save();
       signal.throwIfAborted();
+      if (job.review) throw new ReviewRequired(job.review.id);
     }
   }
   return job.completed.at(-1)?.answer;
