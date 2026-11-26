@@ -6,11 +6,13 @@
 
 ## 설정
 
-Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. 저장소에서 실행하세요.
+Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Releases](https://github.com/uknowpro/xcode/releases)에서 .tgz를 내려받아 실행하세요.
 
-    npm install -g .
+    npm install -g ./uknowpro-xcode-0.1.2.tgz
     xcode setup
     xcode profile test
+
+업데이트는 새 .tgz로 같은 설치 명령을 실행하면 됩니다. 기존 모델 프로필, 토큰, 세션을 이어서 사용합니다. 소스에서 설치할 때는 npm install -g .을 사용합니다.
 
 **API 주소, 모델 ID, 토큰**을 입력합니다. 로컬과 원격의 HTTP·HTTPS 주소를 쓸 수 있습니다. /v1 또는 /chat/completions 주소를 사용하세요. 기본 프로필은 새 세션에 적용되며 주소 변경 시 토큰은 유지됩니다. 연결 진단은 일반 채팅, SSE, 함수 호출을 구분해서 표시합니다.
 
@@ -26,19 +28,21 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. 저장소에
 코드 변경과 테스트를 함께 하려면
 
     xcode check add unit -- npm test
+    xcode harness checks implement unit
     xcode --harness implement --write --checks
 
-1. 변경 요청을 입력하면 여러 파일의 수정·생성안을 준비합니다.
-2. /diff에서 방향키나 페이지 키로 검토하고 Esc로 닫습니다. /apply로 적용하거나 /reject로 거절합니다.
-3. 적용 후 검증 단계에서 등록한 테스트와 종료 코드를 확인합니다. 필요하면 /check unit으로 직접 실행합니다.
+1. 변경 요청을 입력하면 파일 수정·생성·이동·삭제안을 준비합니다.
+2. /diff에서 검토합니다. /apply는 전체 적용, /apply 경로1 경로2는 선택한 파일만 적용, /reject는 전체 거절입니다. 이동은 원래 경로와 새 경로를 함께 적용합니다.
+3. 적용 후 검증 단계에서 연결한 테스트와 종료 코드를 확인합니다. /check unit으로 직접 실행할 수도 있습니다.
+4. /changes에서 이력을 확인하고 /undo <ID>로 0.1.2부터 적용한 변경을 되돌립니다. 적용 이후의 수정이 감지되면 충돌을 표시합니다.
 
 기본은 읽기 전용입니다. 세션에서 /write on은 변경안 작성을, /checks on은 해당 프로젝트에 직접 등록한 명령의 실행을 허용합니다. xcode ask가 검토에서 멈추면 xcode review show, xcode review apply, xcode continue로 이어갈 수 있습니다.
 
 ## 설정과 세션 확인
 
 - **전역** · xcode setup에서 기본 모델을 저장하고 xcode profile use <이름>으로 기본값을 바꿉니다. xcode settings에서 모델과 프로젝트 테스트를 확인합니다. 기본 경로는 ~/.xcode입니다. XCODE_HOME으로 경로를 바꾸거나 XCODE_API_TOKEN으로 현재 실행의 토큰을 지정할 수 있습니다.
-- **세션** · /settings에서 현재 모델·하네스·권한을 확인합니다. /model이나 /harness로 변경하고, /new, /sessions, /resume으로 세션을 전환합니다.
+- **세션** · /settings에서 현재 모델·하네스·권한을 확인합니다. /new, /sessions, /resume으로 세션을 전환합니다. 오래된 결정·참조 파일·변경·검증은 요약해 이어가며 /context에서 확인할 수 있습니다.
 - **입력** · /attach로 텍스트·이미지·PDF를 첨부합니다. 지원 모델에서 /inputs image on과 /inputs pdf on을 사용하세요. PDF 텍스트는 pdftotext가 설치된 경우 로컬에서 추출할 수 있습니다.
-- **하네스** · xcode harness list와 xcode harness show implement로 프리셋을 확인합니다. xcode harness import <이름> <파일>로 커스텀 JSON을 추가하며 .claude/skills와 .xcode/skills의 호환 스킬도 사용할 수 있습니다.
+- **하네스** · xcode harness list에서 버그 수정, 리팩터링, API 리뷰, Terraform, Helm, Kubernetes 프리셋을 확인합니다. /harness preview <이름>은 미리보기, /harness <이름>은 전환입니다. 커스텀 JSON과 .claude/skills, .xcode/skills의 호환 스킬도 사용할 수 있습니다.
 
 파일 검색은 로컬에서 실행합니다. 선택된 파일 구간, 첨부, 허용된 테스트의 출력은 설정한 모델 주소로 전송됩니다. npm test와 npm run test:install로 검증합니다.

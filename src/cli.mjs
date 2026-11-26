@@ -7,11 +7,12 @@ import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { attach, explicitReferences, splitArgs } from './attachments.mjs';
-import { harnessFor, presets, roles, skillsAt } from './harness.mjs';
+import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
 import { completionUrl } from './model.mjs';
 import { diagnose } from './diagnostic.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
 import { reviewDiff } from './changes.mjs';
+import { remember } from './memory.mjs';
 import { completeReference, pageKey } from './terminal.mjs';
 import { Sessions } from './session.mjs';
 import { settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
@@ -47,9 +48,12 @@ const help = [
   '  xcode continue [id|latest]    Run the pending message once',
   '  xcode profile list|use|set|test [name]',
   '  xcode harness list|show|import [name] [file]',
+  '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|run|remove [name]',
-  '  xcode review show|apply|reject [session]',
+  '  xcode review show|apply|reject [session] [paths...]',
+  '  xcode changes [session]       List applied and undone changes',
+  '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
@@ -68,7 +72,10 @@ const chatHelp = [
   '/continue, /skip                Resume an interrupted request or remove it from the queue',
   '/retry off|<seconds>            Retry transient failures while the session is running',
   '/write on|off                  Allow model change proposals. Applying still requires approval',
-  '/diff [path], /apply, /reject  Review, approve or reject the pending change set',
+  '/diff [path], /apply [paths]    Review or approve all or selected files',
+  '/reject, /changes, /undo [id]  Reject a proposal, see history, or undo',
+  '/context [query]               Inspect the compacted session context',
+  '/harness preview <name>        View an available harness without switching',
   '/checks [on|off]               Show or toggle the configured project checks',
   '/check <name>                  Run a named project check manually',
   '/settings                      View model, harness and permissions for this session',
@@ -172,11 +179,15 @@ function harnessList(config) {
   }
 }
 
-function showHarness(config, name) {
+function showHarness(config, name, root) {
   const harness = harnessFor(config, name);
   print(name + ' · ' + (harness.description ?? 'Custom harness'));
   if (harness.role) print('Role: ' + harness.role);
   if (harness.skills?.length) print('Skills: ' + harness.skills.join(', '));
+  const binding = checksForHarness(config, root, name);
+  if (harness.stages.some(stage => stage.tools?.includes('run_check'))) {
+    print('Project checks: ' + checkBinding(binding));
+  }
   harness.stages.forEach((stage, index) => {
     print('  ' + (index + 1) + '. ' + stage.name + ' — ' + stage.instruction);
     if (stage.tools) print('     Tools: ' + (stage.tools.join(', ') || 'none'));
@@ -184,32 +195,55 @@ function showHarness(config, name) {
   });
 }
 
-async function harnessCommand(action, name, file) {
+function checkBinding({ names, checks }) {
+  if (!names) return Object.keys(checks).join(', ') || 'none registered';
+  return names.map(name => Object.hasOwn(checks, name) ? name : name + ' (missing)').join(', ') || 'none';
+}
+
+async function harnessCommand(root, action, name, args, options) {
   const config = await settings();
   if (action === 'roles') {
     Object.entries(roles).forEach(([role, instruction]) => print(role + ' · ' + instruction));
   } else if (action === 'list' || !action) {
     harnessList(config);
   } else if (action === 'show') {
-    showHarness(config, name || 'default');
-  } else if (action === 'import' && file) {
+    showHarness(config, name || 'default', root);
+  } else if (action === 'checks' && name) {
     validName(name);
-    const source = await readFile(file, 'utf8');
+    const harness = harnessFor(config, name);
+    if (!harness.stages.some(stage => stage.tools?.includes('run_check')))
+      throw new Error('This harness has no stage with the run_check tool.');
+    if (args.length || options.clear) {
+      if (args.length && options.clear) throw new Error('Use check names or --clear.');
+      await updateSettings(value => {
+        const registered = projectChecks(value, root);
+        for (const check of args) if (!Object.hasOwn(registered, check)) throw new Error('Unknown project check: ' + check);
+        const project = { ...value.harnessChecks?.[root] };
+        if (options.clear) delete project[name];
+        else project[name] = [...new Set(args)];
+        value.harnessChecks = { ...value.harnessChecks, [root]: project };
+      });
+    }
+    print(name + ' · ' + checkBinding(checksForHarness(await settings(), root, name)));
+  } else if (action === 'import' && args[0]) {
+    validName(name);
+    const source = await readFile(args[0], 'utf8');
     if (source.length > 64000) throw new Error('Harness JSON exceeds 64,000 characters.');
     const harness = JSON.parse(source);
     await updateSettings(config => {
       config.harnesses[name] = harness;
       harnessFor(config, name);
     });
-    showHarness(await settings(), name);
+    showHarness(await settings(), name, root);
   } else {
-    throw new Error('Use harness list, roles, show <name> or import <name> <json>.');
+    throw new Error('Use harness list, roles, show <name>, checks <name> or import <name> <json>.');
   }
 }
 
 function sessionStatus(session, live) {
   const pending = session.queue[0];
   if (live?.active) return 'running';
+  if (session.undoInProgress) return 'undo interrupted';
   if (pending?.review?.state === 'applying') return 'apply interrupted';
   if (pending?.review) return 'review needed';
   if (pending?.failure) return 'failed';
@@ -289,17 +323,41 @@ async function describeSettings(root, session) {
   ].filter(Boolean).join('\n');
 }
 
-async function reviewCommand(root, action, prefix) {
+async function reviewCommand(root, action, prefix, paths) {
   if (!['show', 'apply', 'reject'].includes(action)) throw new Error('Use review show, apply or reject [session].');
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     const review = live.session.queue[0]?.review;
     if (!review) throw new Error('There is no pending change set.');
-    if (action === 'show') return print(reviewDiff(review).join('\n'));
-    const files = await sessions.review(live, action);
-    print(action === 'apply' ? 'Applied ' + files.length + ' files.' : 'Rejected the change set.');
+    if (action === 'show') return print(reviewDiff(review, paths[0]).join('\n'));
+    if (action === 'reject' && paths.length) throw new Error('Reject the entire proposal, or apply only the paths you approve.');
+    const files = await sessions.review(live, action, paths);
+    print(action === 'apply' ? reviewDecision(files, review) : 'Rejected the change set.');
     print('Continue with xcode continue ' + live.session.id.slice(0, 8) + '.');
+  } finally {
+    await sessions.close();
+  }
+}
+
+function reviewDecision(files, review) {
+  const excluded = review.files.length - files.length;
+  return 'Applied ' + files.length + ' files' + (excluded ? ', declined ' + excluded : '') + '.';
+}
+
+function changeHistory(session) {
+  const history = (session.changes ?? []).slice().reverse();
+  return history.map(change => change.id + ' · ' + (change.undoneAt ? 'undone' : 'applied') + ' · ' + change.appliedAt +
+    '\n  ' + change.files.map(file => file.path).join(', ')).join('\n') || 'No undoable changes recorded in this session.';
+}
+
+async function historyCommand(root, action, prefix, id) {
+  const sessions = new Sessions(root);
+  try {
+    const live = await sessions.select(prefix || 'latest', {});
+    if (action === 'changes') return print(changeHistory(live.session));
+    const result = await sessions.undo(live, id);
+    print('Undid change ' + result.id + ' (' + result.files.length + ' files).');
   } finally {
     await sessions.close();
   }
@@ -362,6 +420,7 @@ async function continueMessage(root, prefix) {
   const sessions = streamSession(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
+    if (live.session.undoInProgress) throw new Error('Run xcode undo to finish the interrupted undo first.');
     if (!live.session.queue.length) throw new Error('Queue is empty.');
     if (live.session.queue[0].review) throw new Error('Show and decide the pending change set first with xcode review.');
     live.held = false;
@@ -503,7 +562,8 @@ async function chat(root, base, defaults, options, prefix) {
   };
   const banner = () => {
     show('xcode · ' + selected.session.title + ' · ' + selected.session.profile + ' · ' + selected.session.id.slice(0, 8));
-    if (selected.session.queue[0]?.review) show('Review pending · /diff, /apply or /reject.');
+    if (selected.session.undoInProgress) show('Undo interrupted · /undo to resume.');
+    else if (selected.session.queue[0]?.review) show('Review pending · /diff, /apply [paths] or /reject.');
     else if (selected.held) show('Messages are paused. /continue resumes the pending request.');
   };
   const files = () => staged.get(selected.session.id) ?? [];
@@ -563,6 +623,26 @@ async function chat(root, base, defaults, options, prefix) {
       case '/help': show(chatHelp); break;
       case '/paste': paste = []; pasteLength = 0; show('Paste or type multiple lines. /send submits, /cancel discards.'); break;
       case '/settings': show(await describeSettings(root, session)); break;
+      case '/changes': show(changeHistory(session)); break;
+      case '/undo': {
+        const result = await sessions.undo(selected, arg);
+        show('Undid change ' + result.id + ' (' + result.files.length + ' files).');
+        break;
+      }
+      case '/context': {
+        const memory = remember(session, args.join(' '), 8000);
+        const notes = memory.notes.map(note => {
+          const entry = JSON.parse(note);
+          return entry.request + (entry.result ? '\n  ' + entry.result : '') +
+            (entry.decisions ? '\n  Decisions · ' + entry.decisions.join(' • ') : '') +
+            (entry.references ? '\n  Files · ' + entry.references.join(', ') : '') +
+            (entry.appliedPaths ? '\n  Applied paths · ' + entry.appliedPaths.join(', ') : '') +
+            (entry.checks ? '\n  Checks · ' + entry.checks.map(check => check.name + ' ' + check.status + ' (' + (check.exitCode ?? 'no exit code') + ')').join(', ') : '');
+        });
+        show('Compacted history · ' + notes.length + '/' + memory.covered + ' earlier turns' +
+          (notes.length ? '\n\n' + notes.join('\n\n') : ''));
+        break;
+      }
       case '/diff': {
         const review = session.queue[0]?.review;
         if (!review) throw new Error('There is no pending change set.');
@@ -578,9 +658,11 @@ async function chat(root, base, defaults, options, prefix) {
       case '/apply':
       case '/reject': {
         editable();
-        if (!session.queue[0]?.review) throw new Error('There is no pending change set.');
-        const changed = await sessions.review(selected, command.slice(1));
-        show(command === '/apply' ? 'Applied ' + changed.length + ' files.' : 'Rejected the change set.');
+        const review = session.queue[0]?.review;
+        if (!review) throw new Error('There is no pending change set.');
+        if (command === '/reject' && args.length) throw new Error('Reject the entire proposal, or apply only the paths you approve.');
+        const changed = await sessions.review(selected, command.slice(1), args);
+        show(command === '/apply' ? reviewDecision(changed, review) : 'Rejected the change set.');
         selected.held = false;
         sessions.pump(selected)?.catch(error => show(error.message));
         break;
@@ -626,6 +708,7 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       case '/continue':
         if (selected.active) throw new Error('A request is still running or stopping.');
+        if (session.undoInProgress) throw new Error('Use /undo to finish the interrupted undo first.');
         if (!session.queue.length) throw new Error('Queue is empty.');
         if (session.queue[0].review) throw new Error('Review the pending change set with /diff, /apply or /reject.');
         selected.held = false;
@@ -647,10 +730,10 @@ async function chat(root, base, defaults, options, prefix) {
         banner();
         break;
       case '/harness':
-        if (!arg) return showHarness(await settings(), session.harness);
+        if (!arg || arg === 'preview') return showHarness(await settings(), value || session.harness, root);
         if (arg === 'list') return harnessList(await settings());
         editable();
-        showHarness(await settings(), arg);
+        showHarness(await settings(), arg, root);
         session.harness = arg;
         await sessions.persist(selected);
         break;
@@ -746,7 +829,7 @@ async function main() {
       cwd: { type: 'string' }, profile: { type: 'string' }, harness: { type: 'string' },
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
-      'token-stdin': { type: 'boolean' },
+      'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' },
     },
   });
   const [command, ...rest] = positionals;
@@ -754,12 +837,13 @@ async function main() {
   if (values.version) return print(JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
   if (command === 'setup') return setup(rest[0] || (await settings()).defaultProfile || 'default');
   if (command === 'profile') return profileCommand(rest[0], rest[1] || (await settings()).defaultProfile || 'default', values);
-  if (command === 'harness') return harnessCommand(...rest);
   const base = resolve(values.cwd || process.cwd());
   const root = await projectRoot(base);
   const defaults = { profile: values.profile, harness: values.harness };
   if (command === 'check') return checkCommand(root, rest[0], rest[1], rest.slice(2), values);
-  if (command === 'review') return reviewCommand(root, ...rest);
+  if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
+  if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1]);
+  if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
   if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'sessions') {

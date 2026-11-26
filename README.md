@@ -6,11 +6,13 @@ A terminal coding assistant for your local project and an OpenAI-compatible Chat
 
 ## Setup
 
-Requires Node.js 22.5 or later on Linux, macOS, or Windows. From the checkout, run
+Requires Node.js 22.5 or later on Linux, macOS, or Windows. Download the .tgz from [GitHub Releases](https://github.com/uknowpro/xcode/releases), then run
 
-    npm install -g .
+    npm install -g ./uknowpro-xcode-0.1.2.tgz
     xcode setup
     xcode profile test
+
+Use the same install command with a newer tarball to update. The default profile, token, and sessions stay in the existing data directory. Run npm install -g . to install from a checkout.
 
 Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS address ending in /v1 or /chat/completions. The saved default profile applies to new sessions. Changing the URL keeps the token. The connection test reports plain chat, SSE, and tool calling separately.
 
@@ -26,19 +28,21 @@ xcode searches the current worktree and returns paths and line numbers. Tool cal
 To propose edits and run project verification, use
 
     xcode check add unit -- npm test
+    xcode harness checks implement unit
     xcode --harness implement --write --checks
 
-1. Describe the change. xcode prepares a change set for existing or new text files.
-2. Open /diff, scroll with the arrow or page keys, and close it with Esc. Use /apply or /reject to decide.
-3. After approval, the verify stage can run the registered check and show its exit code. /check unit runs it manually.
+1. Describe the change. xcode can propose edits, new files, moves, or deletions.
+2. Open /diff and scroll using the arrow or page keys. Close with Esc. Use /apply for the full proposal, /apply path1 path2 to accept selected paths and decline the rest, or /reject to decline everything. Either path of a move selects both.
+3. The verify stage can run a linked check and show its exit code. /check unit runs it manually.
+4. Use /changes and /undo <id> to inspect or reverse changes applied with version 0.1.2 or later. Undo stops if a file was changed after approval.
 
 Read-only mode is the default. /write on allows proposals, and /checks on allows a compatible harness to run only registered commands for the current project. For one-off requests, use xcode review show, xcode review apply, and xcode continue after xcode ask pauses for review.
 
 ## Settings and sessions
 
 - **Global** · xcode setup saves the default model, xcode profile use <name> changes it, and xcode settings shows your profile and project checks. settings.json and a separate token file live under ~/.xcode or XCODE_HOME. XCODE_API_TOKEN overrides a stored token.
-- **Session** · /settings shows the active profile, harness, and permissions. Use /model or /harness to switch, and /new, /sessions, or /resume for parallel or saved conversations.
+- **Session** · /settings shows the active profile, harness, and permissions. Use /new, /sessions, or /resume for parallel or saved conversations. Earlier decisions, file references, changes, and check results are summarized for continuing work. Use /context to inspect the summary.
 - **Input** · /attach accepts text, images and PDFs. Use /inputs image on or /inputs pdf on for supported models. For a text-only PDF workflow, xcode can use the optional pdftotext tool.
-- **Harness** · xcode harness list and xcode harness show implement show the presets and their steps. Use xcode harness import <name> <file> for custom JSON. Compatible SKILL.md files can be loaded from .claude/skills and .xcode/skills.
+- **Harness** · xcode harness list shows presets for bug fixes, refactoring, API review, Terraform, Helm, and Kubernetes. Use /harness preview <name> to inspect steps or /harness <name> to switch. xcode harness import <name> <file> accepts custom JSON. Compatible SKILL.md files can be loaded from .claude/skills and .xcode/skills.
 
 File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.

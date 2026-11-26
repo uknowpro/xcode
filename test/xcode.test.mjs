@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -338,4 +338,105 @@ test('rejecting a proposal preserves files and reports the decision to the model
   await cli('review', 'reject');
   assert.match((await cli('continue')).stdout, /proposal was rejected/);
   await assert.rejects(readFile(join(work, 'unsaved.txt')), { code: 'ENOENT' });
+});
+
+test('partial approval preserves paired moves, and undo refuses to overwrite subsequent edits', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return tool(res, 'read', '{"path":"old.txt"}');
+    if (request === 2) return tool(res, 'read', '{"path":"retired.txt"}');
+    if (request === 3) return tool(res, 'propose_changes', JSON.stringify({
+      changes: [
+        { path: 'old.txt', action: 'move', to: 'docs/renamed.txt' },
+        { path: 'retired.txt', action: 'delete' },
+        { path: 'extra.txt', action: 'create', newText: 'Excluded' },
+      ],
+    }));
+    const received = JSON.parse(body.messages.at(-1).content);
+    assert.deepEqual(received.files, ['old.txt', 'docs/renamed.txt', 'retired.txt']);
+    assert.deepEqual(received.excluded, ['extra.txt']);
+    return reply(res, 'Applied the approved paths.');
+  });
+  const { work, cli } = await profile(t, api);
+  await writeFile(join(work, 'old.txt'), 'Moved text\n');
+  await writeFile(join(work, 'retired.txt'), 'Restore me\n');
+  await assert.rejects(cli('ask', 'Move and delete files', '--write'), error => error.code === 3);
+  const { stdout: diff } = await cli('review', 'show', 'latest');
+  assert.match(diff, /rename old\.txt → docs\/renamed\.txt/);
+  assert.match(diff, /--- retired\.txt\n\+\+\+ \/dev\/null/);
+  assert.equal(await readFile(join(work, 'retired.txt'), 'utf8'), 'Restore me\n');
+  await cli('review', 'apply', 'latest', 'old.txt', 'retired.txt');
+  await cli('continue');
+  const history = (await cli('changes')).stdout;
+  const id = history.match(/^([a-f0-9]{8}) · applied/)?.[1];
+  assert.ok(id);
+  assert.doesNotMatch(history, /extra\.txt/);
+  await assert.rejects(readFile(join(work, 'extra.txt')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(work, 'old.txt')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(work, 'retired.txt')), { code: 'ENOENT' });
+  await writeFile(join(work, 'docs', 'renamed.txt'), 'User edit');
+  await assert.rejects(cli('undo', 'latest', id), error => error.code === 1 && /File changed/.test(error.stderr));
+  await assert.rejects(readFile(join(work, 'retired.txt')), { code: 'ENOENT' });
+  assert.equal(await readFile(join(work, 'docs', 'renamed.txt'), 'utf8'), 'User edit');
+  await writeFile(join(work, 'docs', 'renamed.txt'), 'Moved text\n');
+  await cli('undo', 'latest', id);
+  assert.equal(await readFile(join(work, 'old.txt'), 'utf8'), 'Moved text\n');
+  assert.equal(await readFile(join(work, 'retired.txt'), 'utf8'), 'Restore me\n');
+  await assert.rejects(readFile(join(work, 'docs', 'renamed.txt')), { code: 'ENOENT' });
+  assert.match((await cli('changes')).stdout, new RegExp(id + ' · undone'));
+});
+
+test('resuming older sessions restores decisions, file references, applied paths and check results', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return reply(res, 'First message.');
+    const context = body.messages[0].content;
+    assert.match(context, /Keep the retry budget at five/);
+    assert.match(context, /src\/api.mjs:17/);
+    assert.match(context, /appliedPaths.*src\/api.mjs/);
+    assert.match(context, /"name":"regression","status":"failed","exitCode":7/);
+    assert.ok(body.messages.length < 23);
+    return reply(res, 'The earlier decision is in context.');
+  });
+  const { state, cli } = await profile(t, api);
+  await cli('ask', 'Start a session.');
+  const saved = join(state, 'sessions');
+  const [name] = (await readdir(saved)).filter(file => file.endsWith('.json'));
+  const path = join(saved, name);
+  const session = JSON.parse(await readFile(path, 'utf8'));
+  session.turns.unshift({
+    prompt: 'Decide the retry budget.',
+    answer: 'Decision: Keep the retry budget at five. See src/api.mjs:17.',
+    changed: ['src/api.mjs'],
+    tools: [{ name: 'read', path: 'src/api.mjs', line: 17 }],
+    checks: [{ name: 'regression', status: 'failed', exitCode: 7, stderr: 'Budget mismatch.' }],
+  });
+  for (let index = 0; index < 10; index++) session.turns.push({ prompt: 'Follow-up ' + index, answer: 'Still tracking.' });
+  session.queue.push({ prompt: 'Review the retry budget.', attachments: [], completed: [], changed: [], tools: [] });
+  await writeFile(path, JSON.stringify(session));
+  assert.match((await cli('continue')).stdout, /earlier decision/);
+  const resumed = JSON.parse(await readFile(path, 'utf8'));
+  assert.equal(resumed.turns[0].answer, session.turns[0].answer);
+  assert.ok(resumed.memory.through >= 5);
+  assert.match(resumed.memory.entries[0].result, /retry budget at five/);
+});
+
+test('harness checks restrict the model to the registered binding for this project', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return reply(res, 'Inspect the module.');
+    if (request === 2) {
+      assert.match(body.messages[0].content, /Enabled project checks: validate\n/);
+      assert.doesNotMatch(body.messages[0].content, /Enabled project checks:.*other/);
+      return tool(res, 'run_check', '{"name":"other"}');
+    }
+    assert.match(body.messages.at(-1).content, /Unknown project check/);
+    return reply(res, 'Only the bound validation check is allowed.');
+  });
+  const { cli } = await profile(t, api);
+  await cli('check', 'add', 'validate', '--', 'node', '-e', 'process.exit(0)');
+  await cli('check', 'add', 'other', '--', 'node', '-e', 'process.exit(8)');
+  await cli('harness', 'checks', 'terraform-review', 'validate');
+  assert.match((await cli('harness', 'show', 'terraform-review')).stdout, /Project checks: validate/);
+  const { stdout } = await cli('ask', 'Check the module', '--harness', 'terraform-review', '--checks');
+  assert.match(stdout, /Only the bound validation check/);
+  await cli('harness', 'checks', 'terraform-review', '--clear');
+  assert.match((await cli('harness', 'checks', 'terraform-review')).stdout, /other/);
 });

@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { lock, saveJson, sessionsDir, sessionPath, listSessions, settings, tokenFor } from './store.mjs';
 import { runJob } from './agent.mjs';
-import { applyReview, ReviewRequired } from './changes.mjs';
+import { applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
+import { refreshMemory } from './memory.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -40,6 +41,7 @@ export class Sessions {
     const unlock = await lock(sessionsDir, session.id);
     try {
       if (found) session = (await this.list()).find(item => item.id === found.id) ?? found;
+      session.memory = refreshMemory(session);
       const live = { session, unlock, active: null, held: Boolean(session.queue.length), writes: Promise.resolve() };
       this.open.set(session.id, live);
       await this.persist(live);
@@ -80,7 +82,7 @@ export class Sessions {
   }
 
   pump(live) {
-    if (this.closing || live.active || live.held || live.reviewing || live.session.queue[0]?.review || !live.session.queue.length) return live.active?.promise;
+    if (this.closing || live.active || live.held || live.reviewing || live.session.queue[0]?.review || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
     const controller = new AbortController();
     const active = { controller, advance: false };
     live.active = active;
@@ -135,13 +137,16 @@ export class Sessions {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
       checks: job.checks ?? [], attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
     };
+    const previousMemory = live.session.memory;
     turns.push(item);
     queue.shift();
+    live.session.memory = refreshMemory(live.session);
     try {
       await this.persist(live);
     } catch (error) {
       queue.unshift(job);
       turns.pop();
+      live.session.memory = previousMemory;
       throw error;
     }
   }
@@ -153,24 +158,42 @@ export class Sessions {
     return true;
   }
 
-  async review(live, decision) {
+  async review(live, decision, paths = []) {
     const job = live.session.queue[0];
     const review = job?.review;
     if (!review) throw new Error('There is no pending change set.');
     if (live.active || live.reviewing) throw new Error('Wait for this session to finish its current action.');
+    if (live.session.undoInProgress?.state === 'applying')
+      throw new Error('Finish the interrupted undo before reviewing another change.');
     if (decision === 'reject' && review.state === 'applying') throw new Error('An interrupted apply must be reconciled before it can be discarded.');
     live.reviewing = true;
     try {
-      const tool = job.stageHistory?.find(message => message.role === 'tool' && message.tool_call_id === review.callId);
+      const tool = job.stageHistory?.findLast(message => {
+        if (message.role !== 'tool' || message.tool_call_id !== review.callId) return false;
+        try {
+          return JSON.parse(message.content).reviewId === review.id;
+        } catch {
+          return false;
+        }
+      });
       if (!tool) throw new Error('Missing the tool result for this review.');
       const files = decision === 'apply'
-        ? await applyReview(new Workspace(this.root), review, () => this.persist(live))
+        ? await applyReview(new Workspace(this.root), review, () => this.persist(live), paths)
         : [];
       const previous = tool.content;
       const oldChanged = job.changed;
+      const oldHistory = live.session.changes;
       job.changed = [...new Set([...oldChanged, ...files])];
+      const excluded = review.files.map(file => file.path).filter(path => !files.includes(path));
+      if (decision === 'apply') {
+        live.session.changes = [...(oldHistory ?? []), {
+          id: review.id, prompt: job.prompt.slice(0, 160), appliedAt: new Date().toISOString(),
+          files: review.files.filter(file => files.includes(file.path)),
+        }];
+      }
       tool.content = JSON.stringify(decision === 'apply'
-        ? { status: 'applied', reviewId: review.id, files }
+        ? { status: 'applied', reviewId: review.id, files, excluded,
+          ...(excluded.length ? { instruction: 'The excluded paths were declined. Do not propose them again without a new user request.' } : {}) }
         : { status: 'rejected_by_user', reviewId: review.id, instruction: 'Do not repeat the rejected proposal. Continue with an explanation.' });
       delete job.review;
       try {
@@ -178,10 +201,53 @@ export class Sessions {
       } catch (error) {
         job.review = review;
         job.changed = oldChanged;
+        live.session.changes = oldHistory;
         tool.content = previous;
         throw error;
       }
       return files;
+    } finally {
+      live.reviewing = false;
+    }
+  }
+
+  async undo(live, id) {
+    const session = live.session;
+    if (live.active || live.reviewing) throw new Error('Pause the session before undoing an applied change.');
+    if (session.queue[0]?.review?.state === 'applying') throw new Error('Finish the interrupted apply before undoing a change.');
+    const journal = session.undoInProgress;
+    if (journal && id && journal.id !== id) throw new Error('First finish undoing ' + journal.id + '.');
+    const history = session.changes ?? [];
+    const change = id || journal
+      ? history.find(item => item.id === (id || journal.id))
+      : history.findLast(item => !item.undoneAt);
+    if (!change) throw new Error('No applied change to undo in this session.');
+    if (change.undoneAt) throw new Error('Change ' + change.id + ' was already undone.');
+
+    live.reviewing = true;
+    const undo = journal ?? inverseReview(change);
+    session.undoInProgress = undo;
+    try {
+      let files;
+      try {
+        files = await applyReview(new Workspace(this.root), undo, () => this.persist(live));
+      } catch (error) {
+        if (undo.state !== 'applying') {
+          delete session.undoInProgress;
+          await this.persist(live);
+        }
+        throw error;
+      }
+      change.undoneAt = new Date().toISOString();
+      delete session.undoInProgress;
+      try {
+        await this.persist(live);
+      } catch (error) {
+        delete change.undoneAt;
+        session.undoInProgress = undo;
+        throw error;
+      }
+      return { id: change.id, files };
     } finally {
       live.reviewing = false;
     }

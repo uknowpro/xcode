@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { readdir, realpath } from 'node:fs/promises';
 import { blocked, readText, within } from './workspace.mjs';
 import { storage } from './store.mjs';
+import { projectChecks } from './checks.mjs';
 
 export const roles = {
   cloud: 'Trace account, identity, network and availability boundaries. Identify failure domains and rollout risks.',
@@ -21,6 +22,8 @@ const changeTools = ['propose_changes', 'edit'];
 const step = (name, instruction, tools = readTools, done = 'Report the evidence and unresolved items.') => ({
   name, instruction, tools, done,
 });
+
+const verification = [...readTools, 'verify_edits', 'run_check'];
 
 export const presets = {
   default: {
@@ -59,6 +62,67 @@ export const presets = {
       step('Analyze', 'Trace dependencies and boundaries. Cite the declarations and list validation steps.'),
     ],
   },
+  'bug-fix': {
+    description: 'Trace a defect, fix its cause, and run a targeted regression check',
+    role: 'backend',
+    stages: [
+      step('Reproduce', 'Trace the failing path from evidence. Use an enabled check when its scope covers the defect.', verification),
+      step('Fix', 'Propose the smallest source and regression-test changes that address the root cause.', [...readTools, ...changeTools]),
+      step('Retest', 'Run the registered regression check if enabled and report what it verifies.', verification),
+    ],
+  },
+  refactor: {
+    description: 'Preserve public contracts while simplifying an implementation',
+    role: 'full-stack',
+    stages: [
+      step('Baseline', 'Inventory callers, behavior and invariants. Use an enabled baseline check if relevant.', verification),
+      step('Refactor', 'Propose a coherent change set. Preserve public interfaces and migration behavior.', [...readTools, ...changeTools]),
+      step('Compare', 'Compare the approved diff to the baseline and run enabled verification.', verification),
+    ],
+  },
+  'api-review': {
+    description: 'Review API behavior, compatibility and error handling',
+    role: 'backend',
+    stages: [
+      step('Trace contracts', 'Inspect routes and schemas. Trace callers, authorization boundaries and persistence.'),
+      step('Review gaps', 'Report compatibility, idempotency, and failure-handling findings with references.', verification),
+    ],
+  },
+  'terraform-review': {
+    description: 'Review Terraform or OpenTofu changes, dependencies and blast radius',
+    role: 'cloud',
+    stages: [
+      step('Inventory', 'Read module calls, providers, variables and outputs. Trace identities and network boundaries.'),
+      step('Assess', 'Identify replacement, state or migration risks tied to declarations. Use only configured local validation checks.', verification),
+    ],
+  },
+  'terraform-change': {
+    description: 'Propose and verify Terraform or OpenTofu module changes',
+    role: 'devops',
+    stages: [
+      step('Plan changes', 'Map module inputs, defaults, state addresses and dependants. Establish rollback conditions.'),
+      step('Propose', 'Prepare changes that preserve resource identity where possible. Use the review workflow.', [...readTools, ...changeTools]),
+      step('Validate', 'Run relevant enabled formatting or validation checks and report their actual exit status.', verification),
+    ],
+  },
+  'kubernetes-upgrade': {
+    description: 'Review Helm and Kubernetes manifests for a version upgrade',
+    role: 'sre',
+    stages: [
+      step('Inventory APIs', 'Identify the source/target versions and trace manifests, Helm templates, CRDs and admission rules.'),
+      step('Assess compatibility', 'Separate removed APIs, behavior changes, dependencies, and rollout risks. Report missing cluster context.'),
+      step('Verify', 'Use configured manifest checks and report what remains to verify in the target cluster.', verification),
+    ],
+  },
+  'kubernetes-rollout': {
+    description: 'Review and propose safer Kubernetes workload changes',
+    role: 'devops',
+    stages: [
+      step('Trace rollout', 'Review selectors, availability budgets, probes, permissions, and Helm values.'),
+      step('Propose', 'Prepare manifest or Helm changes for approval and describe rollback.', [...readTools, ...changeTools]),
+      step('Validate', 'Run enabled rendering or validation checks and describe the tested scope.', verification),
+    ],
+  },
   documentation: {
     description: 'Read source material and draft documentation',
     role: 'writer',
@@ -88,6 +152,17 @@ export function harnessFor(config, name) {
     harness.skills.some(name => typeof name !== 'string')))
     throw new Error('Harness skills must be a list of skill names.');
   return harness;
+}
+
+export function checksForHarness(config, root, name) {
+  const configured = projectChecks(config, root);
+  const project = config.harnessChecks?.[root];
+  const names = project && Object.hasOwn(project, name) ? project[name] : null;
+  if (!Array.isArray(names)) return { names: null, checks: configured };
+  return {
+    names,
+    checks: Object.fromEntries(names.filter(check => Object.hasOwn(configured, check)).map(check => [check, configured[check]])),
+  };
 }
 
 export function roleText(role) {
