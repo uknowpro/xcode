@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -7,7 +8,8 @@ const outputLimit = 12000;
 export const checkName = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/;
 
 export function projectChecks(config, root) {
-  return Object.hasOwn(config.projectChecks ?? {}, root) ? config.projectChecks[root] : {};
+  const checks = config.projectChecks?.[root];
+  return checks && typeof checks === 'object' && !Array.isArray(checks) ? checks : {};
 }
 
 export function defineCheck(argv, timeout = defaultTimeout) {
@@ -43,10 +45,23 @@ function resolveCommand(argv) {
   return argv;
 }
 
-export async function runCheck(root, checks, name, signal) {
+export function checkKey(argv, timeout) {
+  return createHash('sha256').update(JSON.stringify([argv, timeout])).digest('hex');
+}
+
+function scrub(value, secrets) {
+  let safe = value;
+  for (const secret of secrets) {
+    if (typeof secret === 'string' && secret) safe = safe.replaceAll(secret, '[redacted]');
+  }
+  return safe.replace(/\b(?:sk-(?:proj-|ant-api\d+-)?[A-Za-z0-9_-]{24,}|gh[pousr]_[A-Za-z0-9]{25,}|github_pat_[A-Za-z0-9_]{35,})\b/g,
+    '[redacted]');
+}
+
+export async function runCheck(root, checks, name, signal, { secrets = [] } = {}) {
   if (typeof name !== 'string' || !checkName.test(name) || !Object.hasOwn(checks, name))
     throw new Error('Unknown project check. Configure it with xcode check add.');
-  const { argv, timeout } = defineCheck(checks[name].argv, checks[name].timeout);
+  const { argv, timeout } = defineCheck(checks[name]?.argv, checks[name]?.timeout);
   signal?.throwIfAborted();
   const [file, ...args] = resolveCommand(argv);
   const started = Date.now();
@@ -58,6 +73,11 @@ export async function runCheck(root, checks, name, signal) {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const output = { stdout: '', stderr: '' };
+    const cut = { stdout: false, stderr: false };
+    const protectedValues = [...secrets, process.env.XCODE_API_TOKEN];
+    // Keep extra trailing bytes so a token split at the retention boundary can still be erased.
+    const maxSecretLength = Math.max(256, ...protectedValues.map(value => value?.length ?? 0));
+    const captureLimit = outputLimit + maxSecretLength;
     let stopReason;
     let force;
     function stop(reason) {
@@ -77,7 +97,11 @@ export async function runCheck(root, checks, name, signal) {
     if (signal?.aborted) abort();
     for (const key of ['stdout', 'stderr']) {
       child[key].setEncoding('utf8');
-      child[key].on('data', text => { output[key] = (output[key] + text).slice(-outputLimit); });
+      child[key].on('data', text => {
+        const combined = output[key] + text;
+        cut[key] ||= combined.length > outputLimit;
+        output[key] = combined.slice(-captureLimit);
+      });
     }
     child.on('error', error => {
       cleanup();
@@ -87,8 +111,12 @@ export async function runCheck(root, checks, name, signal) {
       cleanup();
       if (signal?.aborted) return reject(signal.reason);
       resolve({
-        name, command: argv, timeout, durationMs: Date.now() - started, exitCode, exitSignal,
-        status: stopReason ?? (exitCode === 0 ? 'passed' : 'failed'), ...output,
+        name, command: argv.map(arg => scrub(arg, protectedValues)), commandKey: checkKey(argv, timeout),
+        timeout, durationMs: Date.now() - started, exitCode, exitSignal,
+        status: stopReason ?? (exitCode === 0 ? 'passed' : 'failed'),
+        stdout: scrub(output.stdout, protectedValues).slice(-outputLimit),
+        stderr: scrub(output.stderr, protectedValues).slice(-outputLimit),
+        ...(cut.stdout || cut.stderr ? { truncated: cut } : {}),
       });
     });
   });

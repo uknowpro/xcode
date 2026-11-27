@@ -105,7 +105,7 @@ async function stageMessages(session, job, harness, stage, project, skills, allo
   return [...context, userMessage(job.prompt, job.attachments)];
 }
 
-async function execute(project, skills, job, call, allowed, checks, signal, stageIndex) {
+async function execute(project, skills, job, call, allowed, checks, signal, stageIndex, token) {
   const name = call.function.name;
   if (!allowed.includes(name)) throw new Error('Tool is unavailable in this stage: ' + name);
   const args = JSON.parse(call.function.arguments || '{}');
@@ -140,7 +140,7 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
     }
     case 'run_check': {
       if (job.review) throw new Error('Check execution waits until the proposed changes are reviewed.');
-      const result = await runCheck(project.root, checks, args.name, signal);
+      const result = await runCheck(project.root, checks, args.name, signal, { secrets: [token] });
       job.checks ??= [];
       job.checks.push({ ...result, stageIndex });
       return { ...result, stdout: clipped(result.stdout, 5000), stderr: clipped(result.stderr, 5000) };
@@ -183,7 +183,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   for (let index = job.completed.length; index < stagePlan(job).length; index++) {
     signal.throwIfAborted();
     const stage = stagePlan(job)[index];
-    const rechecked = await recheck(stage, job, session, checks, { signal, save, emit, stageIndex: index });
+    const rechecked = await recheck(stage, job, session, checks, { signal, save, emit, stageIndex: index, token });
     if (rechecked?.skipped) {
       emit({ type: 'note', text: rechecked.skipped });
       job.completed.push({ name: stage.name, answer: rechecked.skipped });
@@ -229,7 +229,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         let result;
         try {
           signal.throwIfAborted();
-          result = await execute(project, skills, job, call, allowed, checks, signal, index);
+          result = await execute(project, skills, job, call, allowed, checks, signal, index, token);
         } catch (error) {
           result = { error: signal.aborted ? 'Stopped before this tool finished.' : error.message };
         }

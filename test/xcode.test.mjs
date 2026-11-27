@@ -867,3 +867,17 @@ test('review separates distant changes and previews both sides of a selected mov
   assert.match(move, /\+moved with edits/);
   assert.match(move, /-original/);
 });
+
+test('verification records bounded output and redacts the model token before retaining it', async t => {
+  const { runCheck } = await import('../src/checks.mjs');
+  const root = await temp(t);
+  const secret = ['fixture', 'private', 'value'].join('-');
+  const result = await runCheck(root, {
+    unit: { argv: ['node', '-e', 'process.stdout.write("x".repeat(15000));process.stderr.write(process.argv[1]);', secret], timeout: 8 },
+  }, 'unit', undefined, { secrets: [secret] });
+  assert.equal(result.status, 'passed');
+  assert.equal(result.stdout.length, 12000);
+  assert.deepEqual(result.truncated, { stdout: true, stderr: false });
+  assert.equal(result.stderr, '[redacted]');
+  assert.ok(!JSON.stringify(result).includes(secret));
+});

@@ -1,4 +1,4 @@
-import { runCheck } from './checks.mjs';
+import { checkKey, runCheck } from './checks.mjs';
 
 export function latestChecks(checks) {
   const latest = new Map();
@@ -11,7 +11,8 @@ export function checkEvidence(check, limit = 1200) {
   const paths = [...new Set(lines.flatMap(line => line.match(/(?:[\w./\\-]+\.[\w-]+):\d+(?::\d+)?/g) ?? []))].slice(0, 4);
   const message = lines.slice(-12).join('\n').slice(-limit);
   return check.name + ' · ' + check.status + (check.exitCode == null ? '' : ' · exit ' + check.exitCode) +
-    (paths.length ? '\nLocations: ' + paths.join(', ') : '') + (message ? '\n' + message : '');
+    (paths.length ? '\nLocations: ' + paths.join(', ') : '') +
+    (check.truncated ? '\nShowing the end of limited output.' : '') + (message ? '\n' + message : '');
 }
 
 export function stagePlan(job) {
@@ -28,7 +29,7 @@ export function scheduleRepair(job, index, session) {
   if (attempt > limit) return { exhausted: true, names: checks.map(check => check.name) };
   const repairIndex = index + 1;
   const evidence = checks.map(check => checkEvidence(check)).join('\n\n');
-  const savedChecks = checks.map(({ name, command, timeout }) => ({ name, command, timeout }));
+  const savedChecks = checks.map(({ name, command, commandKey, timeout }) => ({ name, command, commandKey, timeout }));
   job.plan ??= [...job.harness.stages];
   job.plan.splice(repairIndex, 0, {
     name: 'Repair ' + attempt,
@@ -47,7 +48,7 @@ export function scheduleRepair(job, index, session) {
   return { attempt, names: savedChecks.map(check => check.name) };
 }
 
-export async function recheck(stage, job, session, configured, { signal, save, emit, stageIndex }) {
+export async function recheck(stage, job, session, configured, { signal, save, emit, stageIndex, token }) {
   if (!stage.recheck) return null;
   const approvals = job.approvals ?? [];
   if (!approvals.some(approval => approval.stageIndex === stage.recheck.repairIndex && approval.files.length))
@@ -55,8 +56,11 @@ export async function recheck(stage, job, session, configured, { signal, save, e
   if (!session.checks) return { skipped: 'Automatic rerun skipped because checks are disabled for this session.' };
   for (const original of stage.recheck.checks) {
     const check = Object.hasOwn(configured, original.name) ? configured[original.name] : null;
-    if (!check || JSON.stringify(check.argv) !== JSON.stringify(original.command) ||
-      (original.timeout !== undefined && original.timeout !== check.timeout))
+    const same = check && (original.commandKey
+      ? checkKey(check.argv, check.timeout) === original.commandKey
+      : JSON.stringify(check.argv) === JSON.stringify(original.command) &&
+        (original.timeout === undefined || original.timeout === check.timeout));
+    if (!same)
       return { skipped: 'The registered command for ' + original.name + ' changed. Run the current check explicitly.' };
   }
   job.checks ??= [];
@@ -65,7 +69,7 @@ export async function recheck(stage, job, session, configured, { signal, save, e
     signal.throwIfAborted();
     let result = job.checks.find(check => check.stageIndex === stageIndex && check.automatic && check.name === original.name);
     if (!result) {
-      result = { ...await runCheck(session.root, configured, original.name, signal), stageIndex, automatic: true };
+      result = { ...await runCheck(session.root, configured, original.name, signal, { secrets: [token] }), stageIndex, automatic: true };
       job.checks.push(result);
       await save();
       emit({ type: 'note', text: 'Recheck · ' + checkEvidence(result, 550) });
