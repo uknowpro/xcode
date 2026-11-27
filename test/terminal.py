@@ -145,6 +145,11 @@ def smoke(scratch, endpoint):
         resumed.expect(b"Enter Switch")
         resumed.send(b"\x1b[B\r")
         resumed.expect(b"xcode \xc2\xb7 read this file")
+        resumed.send(b"/sessions New session\r")
+        resumed.expect(b"Sessions \xc2\xb7 1 \xc2\xb7 New session")
+        resumed.expect(b"Enter Switch")
+        resumed.send(b"\r")
+        resumed.expect(b"xcode \xc2\xb7 New session")
         resumed.send(b"/exit\r")
         assert resumed.process.wait(timeout=WAIT_SECONDS) == 0
     finally:

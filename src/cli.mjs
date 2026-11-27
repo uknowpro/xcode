@@ -15,7 +15,7 @@ import { checkEvidence } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
 import { reviewDiff, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
-import { completeReference, pageKey } from './terminal.mjs';
+import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
 import { settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { projectRoot } from './workspace.mjs';
@@ -69,7 +69,8 @@ const help = [
 ].join('\n');
 
 const chatHelp = [
-  '/new, /sessions, /resume <id>   Start, browse with arrow keys, or resume sessions',
+  '/new, /sessions [search]        Start, filter, or browse saved sessions',
+  '/resume <id>                    Resume a session by ID',
   '/model [name]                  View or select a model profile',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
@@ -302,7 +303,7 @@ function sessionStatus(session, live) {
   return 'idle';
 }
 
-async function sessionRows(manager) {
+async function sessionRows(manager, query = '') {
   let unreadable = 0;
   const entries = await manager.list(() => { unreadable++; });
   const rows = entries.map(entry => {
@@ -312,13 +313,14 @@ async function sessionRows(manager) {
     return { id: session.id, text: session.id.slice(0, 8) + ' · ' + sessionStatus(session, live) + ' · ' +
       (pending ? pending + ' pending · ' : '') + session.title };
   });
-  return { rows, unreadable };
+  const term = query.trim().toLowerCase();
+  return { rows: term ? rows.filter(row => row.text.toLowerCase().includes(term)) : rows, unreadable };
 }
 
-async function describeSessions(manager, selected) {
-  const { rows, unreadable } = await sessionRows(manager);
+async function describeSessions(manager, selected, query = '') {
+  const { rows, unreadable } = await sessionRows(manager, query);
   if (unreadable) info(unreadable + ' unreadable saved session file(s). Existing files were preserved.');
-  if (!rows.length) print('No sessions for this project.');
+  if (!rows.length) print(query ? 'No sessions match this search.' : 'No sessions for this project.');
   for (const row of rows) print((selected === row.id ? '* ' : '  ') + row.text);
 }
 
@@ -563,11 +565,12 @@ async function chat(root, base, defaults, options, prefix) {
     if (pager.focus >= pager.offset + rowCount) pager.offset = pager.focus - rowCount + 1;
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
-    print('Sessions · ' + pager.rows.length + (pager.unreadable ? ' · ' + pager.unreadable + ' unreadable' : ''));
+    print(terminalClip('Sessions · ' + pager.rows.length + (pager.query ? ' · ' + pager.query : '') +
+      (pager.unreadable ? ' · ' + pager.unreadable + ' unreadable' : ''), width));
     for (const [index, row] of pager.rows.slice(pager.offset, pager.offset + rowCount).entries()) {
       const pointer = index + pager.offset === pager.focus ? '› ' : '  ';
       const line = pointer + (row.id === selected.session.id ? '* ' : '  ') + row.text;
-      print(line.length > width ? line.slice(0, width - 1) + '…' : line);
+      print(terminalClip(line, width));
     }
     print('↑/↓ Select session · Enter Switch · Esc Close');
   }
@@ -586,15 +589,11 @@ async function chat(root, base, defaults, options, prefix) {
     if (mode === 'files' && pager.focus >= pager.offset + rows) pager.offset = pager.focus - rows + 1;
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
-    print('Review ' + review.id + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
-      (mode === 'diff' && pager.file ? ' · ' + pager.file : ''));
-    for (const line of lines.slice(pager.offset, pager.offset + rows)) {
-      const width = Math.max(16, (stdout.columns || 80) - 1);
-      const column = mode === 'files' ? 0 : pager.column;
-      const prefix = column ? '…' : '';
-      const visible = line.slice(column, column + width - prefix.length);
-      print(prefix + (column + visible.length < line.length ? visible.slice(0, -1) + '…' : visible));
-    }
+    const width = Math.max(16, (stdout.columns || 80) - 1);
+    print(terminalClip('Review ' + review.id + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
+      (mode === 'diff' && pager.file ? ' · ' + pager.file : ''), width));
+    for (const line of lines.slice(pager.offset, pager.offset + rows))
+      print(terminalClip(line, width, mode === 'files' ? 0 : pager.column));
     print(mode === 'files'
       ? '↑/↓ Select file · Space Toggle · Enter Diff · Tab Tests · Esc Close'
       : '↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Tab ' + (mode === 'diff' ? 'Files' : 'Diff') + ' · Esc/q Close');
@@ -657,6 +656,7 @@ async function chat(root, base, defaults, options, prefix) {
         pager.mode = 'diff';
         pager.file = file.path;
         pager.lines = reviewDiff(pager.review, file.path);
+        pager.lineWidth = undefined;
         pager.offset = 0;
         pager.column = 0;
       } else {
@@ -669,7 +669,8 @@ async function chat(root, base, defaults, options, prefix) {
     }
     if (key.name === 'left' || key.name === 'right') {
       const lines = pager.mode === 'tests' ? verificationLines(selected.session) : pager.lines;
-      const max = lines.reduce((value, line) => Math.max(value, line.length - 1), 0);
+      const measure = () => lines.reduce((value, line) => Math.max(value, terminalWidth(line) - 1), 0);
+      const max = pager.mode === 'diff' ? (pager.lineWidth ??= measure()) : measure();
       pager.column = Math.max(0, Math.min(max, pager.column + (key.name === 'left' ? -40 : 40)));
       drawReview();
       return;
@@ -866,14 +867,15 @@ async function chat(root, base, defaults, options, prefix) {
         if (!arg) throw new Error('Use /resume <id|latest>.');
         await select(arg); banner(); break;
       case '/sessions': {
+        const query = (arg === 'list' ? args.slice(1) : args).join(' ');
         if (arg === 'list' || process.env.TERM === 'dumb') {
-          await describeSessions(sessions, session.id);
+          await describeSessions(sessions, session.id, query);
           break;
         }
-        const { rows, unreadable } = await sessionRows(sessions);
-        if (!rows.length) { show('No sessions for this project.'); break; }
+        const { rows, unreadable } = await sessionRows(sessions, query);
+        if (!rows.length) { show(query ? 'No sessions match this search.' : 'No sessions for this project.'); break; }
         endStream();
-        pager = { kind: 'sessions', rows, unreadable, focus: Math.max(0, rows.findIndex(row => row.id === session.id)), offset: 0 };
+        pager = { kind: 'sessions', rows, unreadable, query, focus: Math.max(0, rows.findIndex(row => row.id === session.id)), offset: 0 };
         stdout.write('\x1b[?1049h');
         drawSessions();
         break;
@@ -1033,7 +1035,7 @@ async function main() {
   if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'sessions') {
     const sessions = new Sessions(root);
-    return describeSessions(sessions);
+    return describeSessions(sessions, undefined, rest.join(' '));
   }
   if (command === 'ask' || (!command && !stdin.isTTY)) {
     const prompt = (rest.length ? rest.join(' ') : await readInput(maxPrompt * 4)).trim();

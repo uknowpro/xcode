@@ -1021,3 +1021,22 @@ test('a broken one-shot model stream leaves stdout free of partial answers', asy
   await assert.rejects(cli('ask', 'Explain the fixture'), error =>
     error.code === 1 && error.stdout === '' && /stream ended early/.test(error.stderr));
 });
+
+test('terminal views clip Korean and emoji on display columns without breaking graphemes', async () => {
+  const { terminalClip, terminalWidth } = await import('../src/terminal.mjs');
+  assert.equal(terminalWidth('가🙂e\u0301'), 5);
+  assert.equal(terminalClip('가🙂e\u0301', 3), '가…');
+  assert.equal(terminalClip('가🙂e\u0301', 4, 2), '…🙂e\u0301');
+  assert.equal(terminalWidth('a\t가'), 6);
+});
+
+test('session listing can be filtered by title without opening the session', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Ready.'));
+  const { cli } = await profile(t, api);
+  await cli('ask', 'Find the build changelog');
+  await cli('ask', 'Read another note');
+  const listed = await cli('sessions', 'build changelog');
+  assert.match(listed.stdout, /Find the build changelog/);
+  assert.doesNotMatch(listed.stdout, /Read another note/);
+  assert.match((await cli('sessions', 'missing title')).stdout, /No sessions match/);
+});
