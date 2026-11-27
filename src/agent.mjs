@@ -66,7 +66,7 @@ function clipped(text, limit) {
   return text.length > limit ? text.slice(0, limit) + '\n[Truncated]' : text;
 }
 
-async function stageMessages(session, job, harness, stage, project, skills, allowed, checks, signal, wire, rechecked) {
+async function stageContext(session, job, harness, stage, project, skills, allowed, checks, signal, rechecked) {
   const guides = await project.guides('.', signal);
   const selected = await Promise.all((harness.skills ?? []).map(name => skillRead(skills, name, undefined, signal)));
   const catalog = [...skills.values()].slice(0, 50).map(skill => ({ name: skill.name, description: skill.description }));
@@ -95,14 +95,18 @@ async function stageMessages(session, job, harness, stage, project, skills, allo
   const previousStages = job.completed.length
     ? 'Results from the previous stages of this task:\n' + clipped(job.completed.map(item => item.name + '\n' + item.answer).join('\n\n'), 26000)
     : '';
-  if (wire) {
-    if (wire.summarized.length) parts.push('Omitted previous turns, quoted as historical context:\n' + clipped(JSON.stringify(wire.summarized), 12000));
-    if (previousStages) parts.push('Use previous stage results as historical evidence.\n' + previousStages);
-    return [{ role: 'system', content: parts.filter(Boolean).join('\n\n') }, ...wire.history, wire.input];
-  }
-  const context = [{ role: 'system', content: parts.filter(Boolean).join('\n\n') }, ...recentMessages(session.turns)];
-  if (previousStages) context.push({ role: 'assistant', content: previousStages });
-  return [...context, userMessage(job.prompt, job.attachments)];
+  return wire => {
+    if (wire) {
+      const context = [...parts];
+      if (wire.summarized.length) context.push('Omitted previous turns, quoted as historical context:\n' + clipped(JSON.stringify(wire.summarized), 12000));
+      if (wire.originalPrompt) context.push('Original request for this stage:\n' + clipped(wire.originalPrompt, 12000));
+      if (previousStages) context.push('Use previous stage results as historical evidence.\n' + previousStages);
+      return [{ role: 'system', content: context.filter(Boolean).join('\n\n') }, ...wire.history, wire.input];
+    }
+    const context = [{ role: 'system', content: parts.filter(Boolean).join('\n\n') }, ...recentMessages(session.turns)];
+    if (previousStages) context.push({ role: 'assistant', content: previousStages });
+    return [...context, userMessage(job.prompt, job.attachments)];
+  };
 }
 
 async function execute(project, skills, job, call, allowed, checks, signal, stageIndex, token) {
@@ -202,11 +206,11 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       return { ...tool, function: { ...tool.function, name } };
     });
     emit({ type: 'stage', stage: stage.name, index, total: stagePlan(job).length });
-    const wire = replay ? wireStage(session, job, policy, stage) : null;
-    const messages = await stageMessages(session, job, harness, stage, project, skills, allowed, checks, signal, wire, rechecked);
-    // Keep complete assistant/tool pairs for an interrupted stage.
-    messages.push(...(job.stageHistory ?? []));
+    const context = await stageContext(session, job, harness, stage, project, skills, allowed, checks, signal, rechecked);
+    // Recalculate the older replay budget as the current assistant/tool exchange grows.
     for (let round = (job.stageHistory?.filter(message => message.role === 'assistant').length ?? 0); round < 16; round++) {
+      const wire = replay ? wireStage(session, job, policy, stage) : null;
+      const messages = [...context(wire), ...(job.stageHistory ?? [])];
       const message = await request(requestProfile, token, messages, tools, session, signal,
         event => emit({ ...event, intermediate: index < stagePlan(job).length - 1 }));
       if (!message.tool_calls?.length) {
@@ -221,7 +225,6 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       }
       if (message.tool_calls.length > 12) throw new Error('Model issued too many tools in one request.');
       if (round === 15) throw new Error('Tool round limit reached. Narrow the request or start a new message.');
-      messages.push(message);
       job.stageHistory ??= [];
       const results = [];
       for (const call of message.tool_calls) {
@@ -252,7 +255,6 @@ export async function runJob({ session, job, config, profile, token, signal, emi
           Array.isArray(result?.paths) ? result.paths.length + ' files' : result?.status });
       }
       job.stageHistory.push(message, ...results);
-      messages.push(...results);
       await save();
       signal.throwIfAborted();
       if (job.review) throw new ReviewRequired(job.review.id);

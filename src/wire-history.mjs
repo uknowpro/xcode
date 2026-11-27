@@ -31,7 +31,8 @@ function replayBudget(policy) {
 }
 
 export function wireStage(session, job, policy, stage) {
-  let remaining = replayBudget(policy);
+  // Keep the active tool exchange whole. Evict older completed blocks first.
+  let remaining = Math.max(0, replayBudget(policy) - wireSize(job.stageHistory ?? []) - Buffer.byteLength(job.prompt));
   const current = [];
   for (const block of job.wire.blocks.slice().reverse()) {
     const size = wireSize(block);
@@ -51,13 +52,16 @@ export function wireStage(session, job, policy, stage) {
     boundary--;
   }
   const exact = job.wire.full && current.length === job.wire.blocks.length;
-  const input = exact && current.length ? {
+  job.wire.stageInput ??= exact && current.length ? 'continuation' : 'original';
+  const continuing = job.wire.stageInput === 'continuation';
+  const input = continuing ? {
     role: 'user',
     content: 'Continue the current task with the ' + stage.name + ' stage. Use its current instructions and preserve approved decisions.',
   } : userMessage(job.prompt, job.attachments);
   const recentStart = Math.max(0, session.turns.length - maxTurns);
   return {
     input,
+    originalPrompt: continuing && !exact ? job.prompt : '',
     history: [...older.flat(), ...current.flat()],
     summarized: recentMessages(session.turns.slice(recentStart, boundary)),
   };
@@ -67,6 +71,7 @@ export function completeWireStage(job, input, assistant, policy) {
   if (!job.wire) return;
   const messages = [input, ...(job.stageHistory ?? []), assistant];
   job.wire.blocks.push(messages);
+  delete job.wire.stageInput;
   const budget = replayBudget(policy);
   let size = job.wire.blocks.reduce((sum, block) => sum + wireSize(block), 0);
   while (size > budget && job.wire.blocks.length) {

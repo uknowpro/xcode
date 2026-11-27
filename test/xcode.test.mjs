@@ -881,3 +881,23 @@ test('verification records bounded output and redacts the model token before ret
   assert.equal(result.stderr, '[redacted]');
   assert.ok(!JSON.stringify(result).includes(secret));
 });
+
+test('replay drops old blocks before current tool history and retains the same stage input', async () => {
+  const { modelPolicy } = await import('../src/model-profile.mjs');
+  const { completeWireStage, startWire, wireStage } = await import('../src/wire-history.mjs');
+  const profile = { endpoint: 'http://model.example/v1', model: 'deepseek-flash', contextWindow: 4096 };
+  const policy = modelPolicy(profile);
+  const session = { turns: [] };
+  const job = { prompt: 'Original requested change', completed: [], attachments: [] };
+  startWire(job, profile, policy);
+  const initial = wireStage(session, job, policy, { name: 'Inspect' });
+  completeWireStage(job, initial.input, { role: 'assistant', content: 'Observed ' + 'a'.repeat(2400) }, policy);
+  const stage = { name: 'Check' };
+  const next = wireStage(session, job, policy, stage);
+  assert.equal(next.history.length, 2);
+  job.stageHistory = [{ role: 'tool', content: 'b'.repeat(3200) }];
+  const resumed = wireStage(session, JSON.parse(JSON.stringify(job)), policy, stage);
+  assert.equal(resumed.history.length, 0);
+  assert.deepEqual(resumed.input, next.input);
+  assert.equal(resumed.originalPrompt, job.prompt);
+});
