@@ -960,3 +960,21 @@ test('custom harness imports, project skills and native PDF attachments retain t
   assert.match((await skillRead(skills, 'verify-doc')).content, /Use the document summary/);
   await assert.rejects(skillRead(skills, 'verify-doc', '../other.md'), /inside the skill/);
 });
+
+test('session listing rebuilds a missing or invalid summary without changing the saved conversation', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Keep this reply.'));
+  const { cli, state } = await profile(t, api);
+  await cli('ask', 'First title');
+  const dir = join(state, 'sessions');
+  const files = await readdir(dir);
+  const summary = join(dir, files.find(name => name.endsWith('.summary')));
+  const session = join(dir, files.find(name => name.endsWith('.json')));
+  const original = JSON.parse(await readFile(session, 'utf8'));
+  assert.doesNotMatch(await readFile(summary, 'utf8'), /Keep this reply/);
+  await writeFile(summary, '{');
+  assert.match((await cli('sessions')).stdout, /First title/);
+  assert.equal(JSON.parse(await readFile(summary, 'utf8')).summary.title, 'First title');
+  await writeFile(session, JSON.stringify({ ...original, title: 'Updated title' }));
+  assert.match((await cli('sessions')).stdout, /Updated title/);
+  assert.equal(JSON.parse(await readFile(session, 'utf8')).turns[0].answer, 'Keep this reply.');
+});

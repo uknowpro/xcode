@@ -136,12 +136,14 @@ export function sessionPath(id) {
   return join(sessionsDir, id + '.json');
 }
 
+function missing(error) {
+  if (error.code === 'ENOENT') return null;
+  throw error;
+}
+
 export async function readSession(id) {
   const path = sessionPath(id);
-  const info = await lstat(path).catch(error => {
-    if (error.code === 'ENOENT') return null;
-    throw error;
-  });
+  const info = await lstat(path).catch(missing);
   if (!info) return null;
   if (!info.isFile()) throw new Error('Session file must be a regular file.');
   const session = await readJson(path, null);
@@ -152,23 +154,63 @@ export async function readSession(id) {
   return session;
 }
 
+function summarizeSession(session) {
+  const pending = session.queue[0];
+  const last = session.turns.at(-1);
+  return {
+    id: session.id, root: session.root, title: session.title, updated: session.updated,
+    pendingCount: session.queue.length,
+    queue: pending ? [{ review: pending.review ? { state: pending.review.state } : null, failure: Boolean(pending.failure) }] : [],
+    turns: last ? [{ status: last.status }] : [],
+    undoInProgress: Boolean(session.undoInProgress),
+  };
+}
+
+const recordKey = info => [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs].join(':');
+const indexPath = id => sessionPath(id).replace(/\.json$/, '.summary');
+
+async function writeSummary(id, info, summary) {
+  // The session remains the source of truth. An unwritable index never discards a saved session.
+  await saveJson(indexPath(id), { record: recordKey(info), summary }).catch(() => {});
+}
+
+export async function writeSession(session) {
+  const path = sessionPath(session.id);
+  await saveJson(path, session);
+  const info = await lstat(path).catch(() => null);
+  if (info) await writeSummary(session.id, info, summarizeSession(session));
+}
+
+async function sessionSummary(id) {
+  const path = sessionPath(id);
+  const record = await lstat(path).catch(missing);
+  if (!record) return null;
+  if (!record.isFile()) throw new Error('Session file must be a regular file.');
+  const index = await lstat(indexPath(id)).catch(() => null);
+  if (index?.isFile() && index.size <= 16384) {
+    const cached = await readJson(indexPath(id), null).catch(() => null);
+    const entry = cached?.summary;
+    if (cached?.record === recordKey(record) && entry?.id === id && typeof entry.root === 'string' &&
+      typeof entry.title === 'string' && typeof entry.updated === 'string' &&
+      Number.isSafeInteger(entry.pendingCount) && Array.isArray(entry.queue) && Array.isArray(entry.turns))
+      return entry;
+  }
+  const session = await readSession(id);
+  if (!session) return null;
+  const summary = summarizeSession(session);
+  const current = await lstat(path).catch(missing);
+  if (current?.isFile() && recordKey(record) === recordKey(current)) await writeSummary(id, current, summary);
+  return summary;
+}
+
 export async function listSessions(root, onProblem = () => {}) {
   await mkdir(sessionsDir, { recursive: true, mode: 0o700 });
   const files = await readdir(sessionsDir);
   const sessions = [];
   for (const file of files.filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
     try {
-      const session = await readSession(file.slice(0, -5));
-      if (session?.root !== root) continue;
-      const pending = session.queue[0];
-      const last = session.turns.at(-1);
-      sessions.push({
-        id: session.id, root: session.root, title: session.title, updated: session.updated,
-        pendingCount: session.queue.length,
-        queue: pending ? [{ review: pending.review ? { state: pending.review.state } : null, failure: Boolean(pending.failure) }] : [],
-        turns: last ? [{ status: last.status }] : [],
-        undoInProgress: Boolean(session.undoInProgress),
-      });
+      const session = await sessionSummary(file.slice(0, -5));
+      if (session?.root === root) sessions.push(session);
     } catch (error) {
       onProblem(file, error);
     }

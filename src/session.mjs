@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
-import { lock, saveJson, sessionsDir, sessionPath, listSessions, readSession, settings, tokenFor } from './store.mjs';
+import { lock, sessionsDir, listSessions, readSession, settings, tokenFor, writeSession } from './store.mjs';
 import { runJob } from './agent.mjs';
 import { applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
@@ -62,7 +62,7 @@ export class Sessions {
   persist(live) {
     live.session.updated = new Date().toISOString();
     const value = structuredClone(live.session);
-    live.writes = live.writes.catch(() => {}).then(() => saveJson(sessionPath(value.id), value));
+    live.writes = live.writes.catch(() => {}).then(() => writeSession(value));
     return live.writes;
   }
 
