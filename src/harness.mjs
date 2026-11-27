@@ -31,10 +31,10 @@ export const presets = {
     stages: [step('Work', 'Follow the user request and reference files you used.', [...readTools, ...changeTools])],
   },
   'deepseek-flash': {
-    description: 'Focused search and a short evidence-based response',
+    description: 'Focused code exploration with DeepSeek Flash',
     stages: [
-      step('Locate', 'Use short queries and read only relevant regions.', readTools, 'Identify paths and line numbers.'),
-      step('Answer', 'Use findings from the first stage to answer concisely.', readTools, 'Cite the root cause or state what remains unverified.'),
+      step('Locate', 'Search the workspace with short targeted queries. Read only the relevant source ranges, then identify the evidence and any gaps.', readTools, 'Record paths and line numbers.'),
+      step('Answer', 'Use the evidence from the previous stage. Search again only when a missing fact could change the answer.', readTools, 'Cite the relevant paths and state what remains unverified.'),
     ],
   },
   'code-review': {

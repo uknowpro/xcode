@@ -440,3 +440,146 @@ test('harness checks restrict the model to the registered binding for this proje
   await cli('harness', 'checks', 'terraform-review', '--clear');
   assert.match((await cli('harness', 'checks', 'terraform-review')).stdout, /other/);
 });
+
+function reasoningReply(res, content, reasoning, call, field = 'reasoning_content') {
+  res.setHeader('Content-Type', 'text/event-stream');
+  const send = delta => res.write('data: ' + JSON.stringify({ choices: [{ delta }] }) + '\n\n');
+  const split = Math.floor(reasoning.length / 2);
+  send({ [field]: reasoning.slice(0, split) });
+  send({ [field]: reasoning.slice(split) });
+  if (call) {
+    send({ tool_calls: [{ index: 0, id: call.id, function: { name: call.name, arguments: JSON.stringify(call.args) } }] });
+  } else {
+    send({ content });
+  }
+  res.end('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: call ? 'tool_calls' : 'stop' }] }) + '\n\ndata: [DONE]\n\n');
+}
+
+test('DeepSeek profile auto-detects and diagnoses a full tool round trip with configured effort', async t => {
+  const api = await server(t, (body, res, request) => {
+    assert.equal(body.model, 'deepseek-ai/DeepSeek-V4.1-Flash');
+    if (request <= 2) {
+      assert.deepEqual(body.thinking, { type: 'enabled' });
+      assert.equal(body.reasoning_effort, 'max');
+      assert.equal(body.max_tokens, 4096);
+    } else {
+      assert.equal(body.thinking, undefined);
+      assert.equal(body.reasoning_effort, undefined);
+      assert.equal(body.max_tokens, undefined);
+    }
+    if (request === 1) return reasoningReply(res, '', '프로브 원본', { id: 'probe', name: 'xcode_probe', args: {} });
+    if (request === 2) {
+      assert.equal(body.messages[1].reasoning_content, '프로브 원본');
+      assert.equal(body.messages[2].tool_call_id, 'probe');
+      return reasoningReply(res, 'OK', 'probe finish');
+    }
+    return reply(res, 'OK');
+  });
+  const { cli, state } = await profile(t, api);
+  await cli('profile', 'set', 'work', '--model', 'deepseek-ai/DeepSeek-V4.1-Flash');
+  const settings = await cli('profile', 'show');
+  assert.match(settings.stdout, /deepseek-flash \(auto\)/);
+  assert.match(settings.stdout, /Effort · server default/);
+  await assert.rejects(cli('profile', 'tune', '--effort', 'ultra'), /Effort must be/);
+  await cli('profile', 'tune', '--thinking', 'on', '--effort', 'max', '--context-window', '65536', '--max-tokens', '4096');
+  const test = await cli('profile', 'test', '--only', 'tools');
+  assert.match(test.stdout, /TOOLS PASS.*reasoning replay/);
+  assert.doesNotMatch(test.stdout, /프로브 원본|fixture-token/);
+  assert.equal(JSON.parse(await readFile(join(state, 'tokens.json'), 'utf8')).work, 'fixture-token');
+  await cli('profile', 'tune', '--adapter', 'compatible');
+  await cli('profile', 'test', '--only', 'chat');
+});
+
+test('DeepSeek replays assistant fields across tools, stages, approvals and a restarted session', async t => {
+  const call = (id, name, args) => ({ id, name, args });
+  const api = await server(t, (body, res, request) => {
+    assert.equal(body.reasoning_effort, undefined);
+    assert.equal(body.thinking, undefined);
+    const thinking = label => body.messages.some(item => item.role === 'assistant' && item.reasoning_content === label);
+    if (request === 1)
+      return reasoningReply(res, '', 'private read 한글', call('read-file', 'read', { path: 'a.txt' }));
+    if (request === 2) {
+      assert.ok(thinking('private read 한글'));
+      assert.equal(body.messages.at(-1).tool_call_id, 'read-file');
+      return reasoningReply(res, 'Inspected a.txt.', 'private inspect', undefined, 'reasoning');
+    }
+    assert.ok(thinking('private read 한글') && thinking('private inspect'));
+    if (request === 3) {
+      assert.match(body.messages.at(-1).content, /Continue the current task/);
+      return reasoningReply(res, '', 'private proposal',
+        call('proposal', 'edit', { path: 'a.txt', oldText: 'before', newText: 'after' }));
+    }
+    assert.ok(thinking('private proposal'));
+    if (request === 4) {
+      assert.equal(JSON.parse(body.messages.at(-1).content).status, 'applied');
+      return reasoningReply(res, 'Applied a.txt.', 'private applied');
+    }
+    assert.ok(thinking('private applied'));
+    if (request === 5) return reasoningReply(res, 'Verified a.txt.', 'private verified');
+    assert.ok(thinking('private verified'));
+    assert.equal(body.messages.at(-1).content, 'What was previously changed?');
+    return reasoningReply(res, 'a.txt was changed.', 'private follow-up');
+  });
+  const { work, state, cli } = await profile(t, api);
+  await writeFile(join(work, 'a.txt'), 'before\n');
+  await cli('profile', 'set', 'work', '--model', 'DeepSeek-V4.1-Flash');
+  await assert.rejects(cli('ask', 'Change a.txt', '--harness', 'implement', '--write'),
+    error => error.code === 3 && !/private /.test(error.stdout + error.stderr));
+  await cli('review', 'apply');
+  await cli('profile', 'set', 'work', '--endpoint', api.url + '/wrong/v1');
+  await assert.rejects(cli('continue'), error => error.code === 1 && /original model endpoint/.test(error.stderr));
+  assert.equal(api.requests.length, 3);
+  await cli('profile', 'set', 'work', '--endpoint', api.url);
+  const resumed = await cli('continue');
+  assert.match(resumed.stdout, /Verified a\.txt/);
+  assert.doesNotMatch(resumed.stdout + resumed.stderr, /private /);
+  assert.equal(await readFile(join(work, 'a.txt'), 'utf8'), 'after\n');
+
+  const module = new URL('../src/session.mjs', import.meta.url).href;
+  const program = [
+    'const { Sessions } = await import(' + JSON.stringify(module) + ');',
+    'const sessions = new Sessions(process.cwd());',
+    'try {',
+    '  const live = await sessions.select("latest", {});',
+    '  live.session.harness = "default";',
+    '  const { run } = await sessions.enqueue(live, "What was previously changed?");',
+    '  const outcome = await run;',
+    '  if (outcome.error) throw outcome.error;',
+    '  console.log(outcome.answer);',
+    '} finally { await sessions.close(); }',
+  ].join('\n');
+  const env = { ...process.env, XCODE_HOME: state };
+  delete env.XCODE_API_TOKEN;
+  const next = await exec(process.execPath, ['--input-type=module', '--eval', program], { cwd: work, env, timeout: 15000 });
+  assert.match(next.stdout, /a\.txt was changed/);
+  assert.doesNotMatch(next.stdout, /private /);
+  assert.equal(api.requests.length, 6);
+});
+
+test('DeepSeek never archives incomplete protocol turns and keeps old reasoning scoped to the same endpoint', async () => {
+  const { modelPolicy } = await import('../src/model-profile.mjs');
+  const { completeWireStage, completedWire, startWire, wireStage } = await import('../src/wire-history.mjs');
+  const jobs = prompt => ({ prompt, completed: [], attachments: [] });
+  const profile = { model: 'DeepSeek-V4.1-Flash', endpoint: 'http://one.example/v1', contextWindow: 4096 };
+  const policy = modelPolicy(profile);
+  const stage = { name: 'Answer' };
+  const session = { turns: [] };
+  const first = jobs('Retain this prompt');
+  startWire(first, profile, policy);
+  const input = wireStage(session, first, policy, stage).input;
+  completeWireStage(first, input, { role: 'assistant', content: 'summarizable', reasoning_content: 'x'.repeat(9000) }, policy);
+  assert.equal(completedWire(first), undefined);
+  assert.equal(wireStage(session, first, policy, stage).input.content, 'Retain this prompt');
+  assert.throws(() => startWire(first, { ...profile, endpoint: 'http://two.example/v1' }, policy), /original model endpoint/);
+  const small = jobs('Question on first endpoint');
+  startWire(small, profile, policy);
+  completeWireStage(small, wireStage(session, small, policy, stage).input,
+    { role: 'assistant', content: 'public answer', reasoning_content: 'hidden on first endpoint' }, policy);
+  session.turns.push({ prompt: small.prompt, answer: 'public answer', wire: completedWire(small) });
+  const second = jobs('New endpoint');
+  startWire(second, { ...profile, endpoint: 'http://two.example/v1' }, policy);
+  const result = wireStage(session, second, policy, stage);
+  assert.equal(result.history.length, 0);
+  assert.match(JSON.stringify(result.summarized), /public answer/);
+  assert.doesNotMatch(JSON.stringify(result), /hidden on first/);
+});

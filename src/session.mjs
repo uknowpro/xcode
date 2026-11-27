@@ -4,6 +4,7 @@ import { runJob } from './agent.mjs';
 import { applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
 import { refreshMemory } from './memory.mjs';
+import { completedWire, pruneWire } from './wire-history.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -136,16 +137,17 @@ export class Sessions {
     const item = {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
       checks: job.checks ?? [], attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
+      ...(status === 'complete' && job.wire ? { wire: completedWire(job) } : {}),
     };
     const previousMemory = live.session.memory;
-    turns.push(item);
+    live.session.turns = pruneWire([...turns, item]);
     queue.shift();
     live.session.memory = refreshMemory(live.session);
     try {
       await this.persist(live);
     } catch (error) {
       queue.unshift(job);
-      turns.pop();
+      live.session.turns = turns;
       live.session.memory = previousMemory;
       throw error;
     }

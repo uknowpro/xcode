@@ -16,8 +16,8 @@ const prefix = join(scratch, 'app');
 const workspace = join(scratch, 'workspace');
 const env = { ...process.env, npm_config_cache: join(scratch, 'cache'), XCODE_HOME: state };
 delete env.XCODE_API_TOKEN;
-// 0.1.1 introduced the settings and session fields exercised by this upgrade.
-const baselineCommit = 'ff5a0d6956a7cd5bcda523908962e88dd7e4c45a';
+// Verify installation over the preceding public release.
+const baselineCommit = '2b0ba71ac546ed234715037a9e70916279cf73e9';
 let worktreeAdded = false;
 let endpoint;
 

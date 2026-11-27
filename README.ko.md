@@ -46,3 +46,19 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
 - **하네스** · xcode harness list에서 버그 수정, 리팩터링, API 리뷰, Terraform, Helm, Kubernetes 프리셋을 확인합니다. /harness preview <이름>은 미리보기, /harness <이름>은 전환입니다. 커스텀 JSON과 .claude/skills, .xcode/skills의 호환 스킬도 사용할 수 있습니다.
 
 파일 검색은 로컬에서 실행합니다. 선택된 파일 구간, 첨부, 허용된 테스트의 출력은 설정한 모델 주소로 전송됩니다. npm test와 npm run test:install로 검증합니다.
+
+## DeepSeek V4.1 Flash
+
+DeepSeek 전용 프로필은 xcode 0.1.3 이상에서 사용할 수 있습니다. main에서 설치할 때는 npm install -g .을 실행하세요.
+
+    xcode setup deepseek
+    xcode profile show deepseek
+    xcode profile test deepseek --only tools
+    xcode --profile deepseek --harness bug-fix --write --checks
+
+모델 ID가 표준 Flash 이름이면 자동 감지되고, 처음에는 서버의 기본 추론 설정을 사용합니다. 서버가 지원하면 다음과 같이 지정할 수 있습니다.
+
+    xcode profile tune deepseek --thinking on --effort high
+    xcode profile tune deepseek --context-window 65536 --max-tokens 8192
+
+사용자 지정 모델 별칭은 --adapter deepseek-flash로 지정하고, 일반 Chat Completions 호환 모드는 --adapter compatible로 선택합니다. 도구 진단은 도구 결과를 보낸 뒤에도 대화가 이어지는지 확인합니다. 최근 추론 데이터와 도구 기록은 같은 모델 주소에 이어 보내기 위해 세션과 함께 로컬에 저장합니다. 재전송 범위를 넘은 이전 대화는 요약해 사용합니다.

@@ -1,3 +1,5 @@
+import { modelPolicy, requestOptions } from './model-profile.mjs';
+
 const maxResponse = 16 * 1024 * 1024;
 
 export function completionUrl(input) {
@@ -26,7 +28,9 @@ function failed(status, detail = '') {
   if (status === 429 || status === 402 || /quota|insufficient.{0,20}(?:credit|balance)|resource.exhausted|rate.limit|usage.{0,20}(?:limit|exceed)|billing/i.test(detail))
     return new ModelError('Model rate or usage limit reached' + (status ? ' (HTTP ' + status + ')' : '') + '.', { status });
   const explanation = {
-    400: 'Check the model ID, request format, and supported inputs or tools.',
+    400: /reasoning_content|(?:thinking|reasoning).{0,50}(?:unsupported|required|invalid|not supported)/i.test(detail)
+      ? 'The server rejected reasoning settings or conversation state. Run the profile tool probe and check the serving backend.'
+      : 'Check the model ID, request format, and supported inputs or tools.',
     401: 'Check the API token.',
     403: 'Check access to this model.',
     404: 'Check the Chat Completions URL and model ID.',
@@ -142,11 +146,13 @@ async function streamResponse(body, result, onText, signal) {
 }
 
 export async function complete(profile, token, messages, { tools = [], stream = true, signal, onText = () => {}, onFormat = () => {} } = {}) {
+  const policy = modelPolicy(profile);
   const body = JSON.stringify({
     model: profile.model,
     messages,
     stream,
     ...(tools.length ? { tools } : {}),
+    ...requestOptions(policy),
   });
   if (Buffer.byteLength(body) > 24 * 1024 * 1024) throw new ModelError('Model request exceeds 24 MiB.');
   const response = await fetch(completionUrl(profile.endpoint), {
@@ -188,6 +194,12 @@ export async function complete(profile, token, messages, { tools = [], stream = 
   if (toolCalls.some(call => !call.id || !call.function.name) || (finished === 'tool_calls' && !toolCalls.length))
     throw new ModelError('The model returned an incomplete tool call.');
   if (toolCalls.length) message.tool_calls = toolCalls;
+  if (policy.adapter === 'deepseek-flash') {
+    // Some compatible servers expose the same stream under the alias reasoning.
+    if (!message.reasoning_content && typeof message.reasoning === 'string')
+      message.reasoning_content = message.reasoning;
+    delete message.reasoning;
+  }
   if (!message.content.trim() && !toolCalls.length) throw new ModelError('The model returned an empty reply.');
   return message;
 }

@@ -9,6 +9,7 @@ import { parseArgs } from 'node:util';
 import { attach, explicitReferences, splitArgs } from './attachments.mjs';
 import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
 import { completionUrl } from './model.mjs';
+import { configureModel, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
 import { reviewDiff } from './changes.mjs';
@@ -46,7 +47,8 @@ const help = [
   '  xcode sessions                 List sessions for this project',
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode continue [id|latest]    Run the pending message once',
-  '  xcode profile list|use|set|test [name]',
+  '  xcode profile list|show|use|set|tune|test [name]',
+  '  xcode profile tune [name] --adapter auto|compatible|deepseek-flash --effort high',
   '  xcode harness list|show|import [name] [file]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
@@ -58,6 +60,8 @@ const help = [
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
   '  --attach <path>     --endpoint <url>   --model <id>      --token-stdin',
+  '  --thinking on|off|default   --effort low|high|max|default',
+  '  --context-window <tokens>   --max-tokens <tokens>',
   '  --help             --version',
 ].join('\n');
 
@@ -96,13 +100,13 @@ async function readInput(limit) {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function saveProfile(name, endpoint, model, token, use) {
+async function saveProfile(name, endpoint, model, token, use, options = {}) {
   validName(name);
   const url = completionUrl(endpoint);
   if (!model?.trim() || model.length > 256) throw new Error('Enter a model ID up to 256 characters.');
   if (token !== undefined && (token.length > 8192 || /[\r\n]/.test(token))) throw new Error('Invalid API token.');
   await updateSettings(async config => {
-    config.profiles[name] = { ...own(config.profiles, name), endpoint: url, model: model.trim() };
+    config.profiles[name] = configureModel({ ...own(config.profiles, name), endpoint: url, model: model.trim() }, options);
     if (token !== undefined) await setToken(name, token);
     if (use || !config.defaultProfile) config.defaultProfile = name;
   });
@@ -153,22 +157,39 @@ async function profileCommand(action, name, options) {
   if (action === 'set') {
     const existing = own(config.profiles, name);
     const token = options['token-stdin'] ? (await readInput(16384)).trim() : undefined;
-    await saveProfile(name, options.endpoint || existing?.endpoint, options.model || existing?.model, token, false);
+    await saveProfile(name, options.endpoint || existing?.endpoint, options.model || existing?.model, token, false, options);
     print('Saved profile ' + name + '.');
     return;
   }
-  profileFor(config, name);
+  const profile = profileFor(config, name);
+  if (action === 'show' || action === 'tune') {
+    if (action === 'tune') {
+      await updateSettings(value => {
+        value.profiles[name] = configureModel(profileFor(value, name), options);
+      });
+    }
+    const current = action === 'tune' ? profileFor(await settings(), name) : profile;
+    const url = new URL(current.endpoint);
+    return print([
+      'Profile · ' + name + ' · ' + current.model,
+      'Endpoint · ' + url.origin + url.pathname,
+      ...modelTuning(current),
+    ].join('\n'));
+  }
   if (action === 'use') {
     await updateSettings(value => { value.defaultProfile = name; });
     print('Default profile: ' + name);
   } else if (action === 'test') {
-    const results = await diagnose(profileFor(config, name), await tokenFor(name), {
-      only: options.only,
+    const timeout = options.timeout === undefined
+      ? (modelPolicy(profile).adapter === 'deepseek-flash' ? 60 : 15) : Number(options.timeout);
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 600) throw new Error('Probe timeout must be 1–600 seconds.');
+    const results = await diagnose(profile, await tokenFor(name), {
+      only: options.only, timeout: timeout * 1000,
       onResult: item => print(item.name.toUpperCase() + ' ' + item.status.toUpperCase() + ' · ' + item.detail),
     });
     if (results.some(item => item.status === 'fail')) process.exitCode = 1;
   } else {
-    throw new Error('Use profile list, set, use or test.');
+    throw new Error('Use profile list, show, set, tune, use or test.');
   }
 }
 
@@ -313,6 +334,7 @@ async function describeSettings(root, session) {
     'Workspace · ' + root,
     'Model profile · ' + profileName + (profile ? ' · ' + profile.model : ' · setup required'),
     url ? 'Endpoint · ' + url.origin + url.pathname : '',
+    ...(profile ? modelTuning(profile) : []),
     profile ? 'Model inputs · tools ' + (profile.tools === false ? 'off' : 'on') +
       ' · image ' + (profile.imageInput ? 'on' : 'off') + ' · PDF ' + (profile.pdfInput ? 'on' : 'off') : '',
     'Harness · ' + (session?.harness ?? 'default'),
@@ -830,6 +852,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' },
+      adapter: { type: 'string' }, thinking: { type: 'string' }, effort: { type: 'string' },
+      'context-window': { type: 'string' }, 'max-tokens': { type: 'string' },
     },
   });
   const [command, ...rest] = positionals;
