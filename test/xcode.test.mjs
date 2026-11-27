@@ -838,3 +838,16 @@ test('custom state inside a project is excluded from browsing, reads and explici
     cwd: root, env: { ...process.env, XCODE_HOME: localState },
   });
 });
+
+test('corrupt saved sessions do not block valid sessions or new work', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Ready.'));
+  const { state, cli } = await profile(t, api);
+  await cli('ask', 'Earlier valid session');
+  const corrupt = join(state, 'sessions', '00000000-0000-4000-8000-000000000000.json');
+  await writeFile(corrupt, '{ malformed');
+  const listed = await cli('sessions');
+  assert.match(listed.stdout, /Earlier valid session/);
+  assert.match(listed.stderr, /1 unreadable saved session/);
+  assert.match((await cli('ask', 'Continue working')).stdout, /Ready/);
+  assert.equal(await readFile(corrupt, 'utf8'), '{ malformed');
+});

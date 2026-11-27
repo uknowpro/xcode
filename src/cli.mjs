@@ -295,10 +295,13 @@ function sessionStatus(session, live) {
   return 'idle';
 }
 
-function describeSessions(sessions, selected, statuses = new Map()) {
+async function describeSessions(manager, selected) {
+  const unreadable = [];
+  const sessions = await manager.list(file => unreadable.push(file));
+  if (unreadable.length) info(unreadable.length + ' unreadable saved session file(s). Existing files were preserved.');
   if (!sessions.length) print('No sessions for this project.');
   for (const session of sessions) {
-    const live = statuses.get(session.id);
+    const live = manager.open.get(session.id);
     const row = live?.session ?? session;
     print((selected === row.id ? '* ' : '  ') + row.id.slice(0, 8) + ' · ' + sessionStatus(row, live) + ' · ' +
       (row.queue.length ? row.queue.length + ' pending · ' : '') + row.title);
@@ -794,7 +797,7 @@ async function chat(root, base, defaults, options, prefix) {
       case '/resume':
         if (!arg) throw new Error('Use /resume <id|latest>.');
         await select(arg); banner(); break;
-      case '/sessions': describeSessions(await sessions.list(), session.id, sessions.open); break;
+      case '/sessions': await describeSessions(sessions, session.id); break;
       case '/queue':
         show(session.queue.length ? session.queue.map((item, index) =>
           (index + 1) + ' · ' + (index === 0 && selected.active ? '[running] ' : '') + item.prompt.slice(0, 100)).join('\n') : 'Queue is empty.');
@@ -950,7 +953,7 @@ async function main() {
   if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'sessions') {
     const sessions = new Sessions(root);
-    return describeSessions(await sessions.list());
+    return describeSessions(sessions);
   }
   if (command === 'ask' || (!command && !stdin.isTTY)) {
     const prompt = (rest.length ? rest.join(' ') : await readInput(maxPrompt * 4)).trim();

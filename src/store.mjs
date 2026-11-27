@@ -1,6 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 
@@ -136,13 +136,33 @@ export function sessionPath(id) {
   return join(sessionsDir, id + '.json');
 }
 
-export async function listSessions(root) {
+export async function readSession(id) {
+  const path = sessionPath(id);
+  const info = await lstat(path).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  if (!info) return null;
+  if (!info.isFile()) throw new Error('Session file must be a regular file.');
+  const session = await readJson(path, null);
+  if (!session || session.id !== id || typeof session.root !== 'string' ||
+    typeof session.title !== 'string' || typeof session.updated !== 'string' ||
+    !Array.isArray(session.queue) || !Array.isArray(session.turns))
+    throw new Error('Session file has an invalid structure.');
+  return session;
+}
+
+export async function listSessions(root, onProblem = () => {}) {
   await mkdir(sessionsDir, { recursive: true, mode: 0o700 });
   const files = await readdir(sessionsDir);
   const sessions = [];
   for (const file of files.filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
-    const session = await readJson(join(sessionsDir, file), null);
-    if (session?.root === root) sessions.push(session);
+    try {
+      const session = await readSession(file.slice(0, -5));
+      if (session?.root === root) sessions.push(session);
+    } catch (error) {
+      onProblem(file, error);
+    }
   }
   return sessions.sort((a, b) => b.updated.localeCompare(a.updated));
 }

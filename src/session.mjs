@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { lock, saveJson, sessionsDir, sessionPath, listSessions, settings, tokenFor } from './store.mjs';
+import { mkdir } from 'node:fs/promises';
+import { lock, saveJson, sessionsDir, sessionPath, listSessions, readSession, settings, tokenFor } from './store.mjs';
 import { runJob } from './agent.mjs';
 import { applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
@@ -13,14 +14,14 @@ export class Sessions {
     this.open = new Map();
   }
 
-  async list() {
-    return listSessions(this.root);
+  async list(onProblem) {
+    return listSessions(this.root, onProblem);
   }
 
   async select(prefix, defaults) {
-    const previous = await this.list();
     let found;
     if (prefix) {
+      const previous = await this.list();
       const matches = prefix === 'latest' ? previous.slice(0, 1) : previous.filter(session => session.id.startsWith(prefix));
       if (matches.length !== 1) throw new Error(matches.length ? 'Session prefix is ambiguous.' : 'Session not found in this project.');
       found = matches[0];
@@ -39,16 +40,20 @@ export class Sessions {
       turns: [],
       updated: new Date().toISOString(),
     };
+    await mkdir(sessionsDir, { recursive: true, mode: 0o700 });
     const unlock = await lock(sessionsDir, session.id);
     try {
-      if (found) session = (await this.list()).find(item => item.id === found.id) ?? found;
+      if (found) {
+        session = await readSession(found.id);
+        if (!session || session.root !== this.root) throw new Error('Session is no longer available in this project.');
+      }
       session.memory = refreshMemory(session);
       const live = { session, unlock, active: null, held: Boolean(session.queue.length), writes: Promise.resolve() };
       this.open.set(session.id, live);
       await this.persist(live);
       return live;
     } catch (error) {
-      this.open.delete(session.id);
+      this.open.delete(found?.id ?? session.id);
       await unlock();
       throw error;
     }
@@ -75,7 +80,9 @@ export class Sessions {
     try {
       await this.persist(live);
     } catch (error) {
-      live.session.queue.splice(live.session.queue.indexOf(job), 1);
+      const index = live.session.queue.indexOf(job);
+      if (index >= 0) live.session.queue.splice(index, 1);
+      if (!live.session.queue.length && !live.session.turns.length) live.session.title = 'New session';
       throw error;
     }
     if (live.active || live.held) this.notify(live, { type: 'queue', count: live.session.queue.length - Number(Boolean(live.active)) });
