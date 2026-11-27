@@ -168,6 +168,9 @@ export class Sessions {
     if (live.session.undoInProgress?.state === 'applying')
       throw new Error('Finish the interrupted undo before reviewing another change.');
     if (decision === 'reject' && review.state === 'applying') throw new Error('An interrupted apply must be reconciled before it can be discarded.');
+    const chosen = paths.length || review.state === 'applying' ? paths : review.markedPaths ?? paths;
+    if (decision === 'apply' && review.state !== 'applying' && review.markedPaths && !chosen.length)
+      throw new Error('Select at least one file in /diff or pass paths to apply.');
     live.reviewing = true;
     try {
       const tool = job.stageHistory?.findLast(message => {
@@ -180,14 +183,16 @@ export class Sessions {
       });
       if (!tool) throw new Error('Missing the tool result for this review.');
       const files = decision === 'apply'
-        ? await applyReview(new Workspace(this.root), review, () => this.persist(live), paths)
+        ? await applyReview(new Workspace(this.root), review, () => this.persist(live), chosen)
         : [];
       const previous = tool.content;
       const oldChanged = job.changed;
       const oldHistory = live.session.changes;
+      const approvals = job.approvals;
       job.changed = [...new Set([...oldChanged, ...files])];
       const excluded = review.files.map(file => file.path).filter(path => !files.includes(path));
       if (decision === 'apply') {
+        job.approvals = [...(approvals ?? []), { stageIndex: job.completed.length, files }];
         live.session.changes = [...(oldHistory ?? []), {
           id: review.id, prompt: job.prompt.slice(0, 160), appliedAt: new Date().toISOString(),
           files: review.files.filter(file => files.includes(file.path)),
@@ -203,6 +208,7 @@ export class Sessions {
       } catch (error) {
         job.review = review;
         job.changed = oldChanged;
+        job.approvals = approvals;
         live.session.changes = oldHistory;
         tool.content = previous;
         throw error;

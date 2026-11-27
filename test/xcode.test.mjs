@@ -583,3 +583,192 @@ test('DeepSeek never archives incomplete protocol turns and keeps old reasoning 
   assert.match(JSON.stringify(result.summarized), /public answer/);
   assert.doesNotMatch(JSON.stringify(result), /hidden on first/);
 });
+
+function providerEvents(res, parts) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.end(parts.map(part => 'data: ' + JSON.stringify(part) + '\n\n').join(''));
+}
+
+const nativeTool = {
+  type: 'function', function: { name: 'fixture', description: 'Fixture tool', parameters: { type: 'object', properties: {} } },
+};
+
+test('OpenAI Responses replays encrypted reasoning and typed tool replies with storage disabled', async t => {
+  const reasoning = { type: 'reasoning', id: 'rs_1', encrypted_content: 'encrypted-fixture', summary: [] };
+  const call = { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'fixture', arguments: '{}' };
+  const api = await server(t, (body, res, request) => {
+    assert.equal(body.store, false);
+    assert.deepEqual(body.include, ['reasoning.encrypted_content']);
+    assert.deepEqual(body.reasoning, { effort: 'high' });
+    assert.equal(body.tools[0].name, 'fixture');
+    if (request === 1) return providerEvents(res, [{ type: 'response.completed', response: { output: [reasoning, call] } }]);
+    assert.deepEqual(body.input.slice(-3), [reasoning, call, { type: 'function_call_output', call_id: 'call_1', output: 'success' }]);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'Done.' }] }] }));
+  });
+  const profile = { endpoint: api.url + '/v1/responses', model: 'gpt-6-astra', reasoningEffort: 'high' };
+  const input = [{ role: 'user', content: 'Use the fixture.' }];
+  const first = await complete(profile, 'fixture-secret', input, { tools: [nativeTool] });
+  const second = await complete(profile, 'fixture-secret', [...input, first, { role: 'tool', tool_call_id: 'call_1', content: 'success' }], { tools: [nativeTool], stream: false });
+  assert.equal(second.content, 'Done.');
+  assert.ok(api.requests.every(request => request.url === '/v1/responses' && request.headers.authorization === 'Bearer fixture-secret'));
+});
+
+test('Claude Messages assembles and replays signed thinking and groups tool results', async t => {
+  const thinking = { type: 'thinking', thinking: 'trace fixture', signature: 'signature-fixture' };
+  const api = await server(t, (body, res, request) => {
+    assert.deepEqual(body.thinking, { type: 'adaptive' });
+    assert.deepEqual(body.output_config, { effort: 'medium' });
+    assert.ok(body.tools[0].input_schema);
+    if (request === 1) {
+      return providerEvents(res, [
+        { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'trace fixture' } },
+        { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'signature-fixture' } },
+        { type: 'content_block_stop', index: 0 },
+        { type: 'content_block_start', index: 1, content_block: { type: 'tool_use', name: 'fixture', id: 'toolu_1', input: {} } },
+        { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"passed":' } },
+        { type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: 'true}' } },
+        { type: 'content_block_stop', index: 1 },
+        { type: 'message_delta', delta: { stop_reason: 'tool_use' } },
+        { type: 'message_stop' },
+      ]);
+    }
+    assert.deepEqual(body.messages[1].content[0], thinking);
+    assert.deepEqual(body.messages[1].content[1].input, { passed: true });
+    assert.deepEqual(body.messages[2], { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'success' }] });
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ stop_reason: 'end_turn', content: [{ type: 'text', text: 'Done.' }] }));
+  });
+  const profile = { endpoint: api.url + '/v1/messages', model: 'claude-sonnet', thinking: 'on', reasoningEffort: 'medium' };
+  const input = [{ role: 'user', content: 'Use the fixture.' }];
+  const first = await complete(profile, 'fixture-secret', input, { tools: [nativeTool] });
+  const second = await complete(profile, 'fixture-secret', [...input, first, { role: 'tool', tool_call_id: 'toolu_1', content: 'success' }], { tools: [nativeTool], stream: false });
+  assert.equal(second.content, 'Done.');
+  assert.ok(api.requests.every(request => request.url === '/v1/messages' && request.headers['x-api-key'] === 'fixture-secret' &&
+    request.headers['anthropic-version'] === '2023-06-01'));
+});
+
+test('Gemini native requests retain thought signatures and correlate tool responses', async t => {
+  const part = { functionCall: { id: 'function-id', name: 'fixture', args: {} }, thoughtSignature: 'fixture-sig' };
+  const api = await server(t, (body, res, request) => {
+    assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, 'MEDIUM');
+    assert.ok(body.tools[0].functionDeclarations[0].parametersJsonSchema);
+    if (request === 1) return providerEvents(res, [{ candidates: [{ content: { parts: [part] }, finishReason: 'STOP' }] }]);
+    assert.deepEqual(body.contents[1].parts, [part]);
+    assert.deepEqual(body.contents[2].parts, [{ functionResponse: { name: 'fixture', id: 'function-id', response: { output: 'success' } } }]);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'Done.' }] }, finishReason: 'STOP' }] }));
+  });
+  const profile = { endpoint: api.url + '/v1beta', protocol: 'gemini', model: 'gemini-4-neon', reasoningEffort: 'medium' };
+  const input = [{ role: 'user', content: 'Use the fixture.' }];
+  const first = await complete(profile, 'fixture-secret', input, { tools: [nativeTool] });
+  const second = await complete(profile, 'fixture-secret', [...input, first, { role: 'tool', tool_call_id: 'function-id', content: 'success' }], { tools: [nativeTool], stream: false });
+  assert.equal(second.content, 'Done.');
+  assert.equal(api.requests[0].url, '/v1beta/models/gemini-4-neon:streamGenerateContent?alt=sse');
+  assert.equal(api.requests[1].url, '/v1beta/models/gemini-4-neon:generateContent');
+  assert.ok(api.requests.every(request => request.headers['x-goog-api-key'] === 'fixture-secret'));
+});
+
+test('Qwen and Kimi presets keep base profiles compatible and opt into model-specific parameters', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) {
+      assert.equal(body.temperature, undefined);
+      assert.equal(body.chat_template_kwargs, undefined);
+    } else if (request === 2) {
+      assert.equal(body.temperature, 0.6);
+      assert.equal(body.top_p, 0.95);
+      assert.equal(body.top_k, 20);
+      assert.equal(body.chat_template_kwargs.preserve_thinking, true);
+    } else {
+      assert.equal(body.temperature, 1);
+      assert.equal(body.top_p, 1);
+      assert.equal(body.reasoning_effort, 'max');
+    }
+    return reply(res, 'OK');
+  });
+  const { cli } = await profile(t, api);
+  await cli('profile', 'set', 'work', '--model', 'Qwen/Qwen3.6-35B-A3B');
+  assert.match((await cli('profile', 'show', 'work')).stdout, /qwen \(auto\)/);
+  await cli('profile', 'test', 'work', '--only', 'chat');
+  await cli('profile', 'tune', 'work', '--preset', 'coding');
+  await cli('profile', 'test', 'work', '--only', 'chat');
+  await cli('profile', 'set', 'work', '--model', 'moonshotai/Kimi-K3');
+  assert.match((await cli('profile', 'show', 'work')).stdout, /kimi \(auto\)/);
+  await cli('profile', 'test', 'work', '--only', 'chat');
+});
+
+test('profile eval measures search, checkpoint replay, local tests and citation in an isolated fixture', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return tool(res, 'grep', '{"query":"invoiceLimit"}');
+    if (request === 2) {
+      assert.match(body.messages.at(-1).content, /invoice\.mjs/);
+      return tool(res, 'read', '{"path":"invoice.mjs","start":3,"count":1}');
+    }
+    if (request === 3) return tool(res, 'run_check', '{"name":"unit"}');
+    assert.equal(JSON.parse(body.messages.at(-1).content).exitCode, 0);
+    return reply(res, 'Defined in invoice.mjs:3.');
+  });
+  const { cli } = await profile(t, api);
+  const result = await cli('profile', 'eval', 'work');
+  for (const phase of ['search', 'read', 'resume', 'check', 'citation']) assert.match(result.stdout, new RegExp(phase + ' · PASS'));
+  await cli('profile', 'set', 'different', '--endpoint', api.url, '--model', 'different');
+  await assert.rejects(cli('profile', 'eval', 'work', '--against', 'different'), /same model and endpoint/);
+});
+
+test('a failed test prompts a reviewed repair and only then repeats the original registered check', async t => {
+  const api = await server(t, (body, res, request) => {
+    switch (request) {
+      case 1: return tool(res, 'read', '{"path":"a.txt"}');
+      case 2: return reply(res, 'Located a.txt.');
+      case 3: return tool(res, 'edit', '{"path":"a.txt","oldText":"original","newText":"still-bad"}');
+      case 4: return reply(res, 'Initial patch applied.');
+      case 5: return tool(res, 'run_check', '{"name":"regression"}');
+      case 6:
+        assert.equal(JSON.parse(body.messages.at(-1).content).exitCode, 7);
+        return reply(res, 'Regression failed.');
+      case 7:
+        assert.match(body.messages[0].content, /a\.txt:1/);
+        return tool(res, 'read', '{"path":"a.txt"}');
+      case 8:
+        return tool(res, 'edit', '{"path":"a.txt","oldText":"still-bad","newText":"correct"}');
+      case 9:
+        assert.equal(JSON.parse(body.messages.at(-1).content).status, 'applied');
+        return reply(res, 'Repair applied.');
+      default:
+        assert.match(body.messages[0].content, /Recorded rerun results/);
+        assert.match(body.messages[0].content, /regression · passed · exit 0/);
+        return reply(res, 'The original regression check passed.');
+    }
+  });
+  const { work, cli, state } = await profile(t, api);
+  await writeFile(join(work, 'a.txt'), 'original\n');
+  const script = 'const fs=require("fs");fs.appendFileSync("calls.txt","run\\n");if(fs.readFileSync("a.txt","utf8").trim()!=="correct"){console.error("a.txt:1 needs repair");process.exit(7)}';
+  await cli('check', 'add', 'regression', '--', 'node', '-e', script);
+  await assert.rejects(cli('ask', 'Fix a.txt', '--harness', 'implement', '--write', '--checks'), error => error.code === 3);
+  await cli('review', 'apply');
+  await assert.rejects(cli('continue'), error => error.code === 3 && /Preparing repair 1/.test(error.stderr));
+  assert.equal(await readFile(join(work, 'calls.txt'), 'utf8'), 'run\n');
+  assert.equal(await readFile(join(work, 'a.txt'), 'utf8'), 'still-bad\n');
+  await cli('review', 'apply');
+  const response = await cli('continue');
+  assert.match(response.stdout, /original regression check passed/);
+  assert.equal(await readFile(join(work, 'calls.txt'), 'utf8'), 'run\nrun\n');
+  const sessions = join(state, 'sessions');
+  const [file] = (await readdir(sessions)).filter(name => name.endsWith('.json'));
+  const checks = JSON.parse(await readFile(join(sessions, file), 'utf8')).turns[0].checks;
+  assert.deepEqual(checks.map(check => [check.status, Boolean(check.automatic)]), [['failed', false], ['passed', true]]);
+});
+
+test('repair verification skips rejected fixes and changed commands', async () => {
+  const { recheck, scheduleRepair } = await import('../src/repair.mjs');
+  const stage = { name: 'Verify', repairAttempts: 2 };
+  const job = { harness: { stages: [stage] }, checks: [
+    { name: 'test', command: ['node', 'original.mjs'], timeout: 5, status: 'failed', exitCode: 1, stageIndex: 0, stderr: 'src/a.mjs:5:1' },
+  ] };
+  const session = { write: true, checks: true };
+  assert.equal(scheduleRepair(job, 0, session).attempt, 1);
+  assert.match((await recheck(job.plan[2], job, session, {}, {})).skipped, /No repair was approved/);
+  job.approvals = [{ stageIndex: 1, files: ['src/a.mjs'] }];
+  assert.match((await recheck(job.plan[2], job, session, { test: { argv: ['node', 'changed.mjs'], timeout: 5 } }, {})).skipped, /command.*changed/i);
+});

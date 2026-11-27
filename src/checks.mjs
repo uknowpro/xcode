@@ -87,7 +87,7 @@ export async function runCheck(root, checks, name, signal) {
       cleanup();
       if (signal?.aborted) return reject(signal.reason);
       resolve({
-        name, command: argv, durationMs: Date.now() - started, exitCode, exitSignal,
+        name, command: argv, timeout, durationMs: Date.now() - started, exitCode, exitSignal,
         status: stopReason ?? (exitCode === 0 ? 'passed' : 'failed'), ...output,
       });
     });

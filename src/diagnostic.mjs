@@ -37,17 +37,19 @@ export async function diagnose(profile, token, { timeout = 15000, only, onResult
       if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).length)
         throw new Error('The model did not return a valid xcode_probe function call.');
       const policy = modelPolicy(profile);
-      if (policy.adapter !== 'deepseek-flash') return 'Function call and arguments received.';
-      if (result.tool_calls.length !== 1) throw new Error('The DeepSeek probe expected exactly one function call.');
+      if (!policy.replay) return 'Function call and arguments received.';
+      if (result.tool_calls.length !== 1) throw new Error('The tool probe expected exactly one function call.');
       const hasReasoning = typeof result.reasoning_content === 'string' && result.reasoning_content.length > 0;
-      if (policy.thinking === 'on' && !hasReasoning)
+      if (policy.adapter === 'deepseek-flash' && policy.thinking === 'on' && !hasReasoning)
         throw new Error('Function call received without reasoning_content. Check thinking mode and the server reasoning parser, or use --thinking off.');
       const final = await complete(profile, token, [
         ...input, result, { role: 'tool', tool_call_id: call.id, content: '{"ok":true}' },
       ], { signal, tools: [probe] });
       if (final.tool_calls?.length) throw new Error('The model issued another tool call after receiving the probe result.');
-      return hasReasoning ? 'Function call, reasoning replay, and follow-up passed.'
-        : 'Function call and follow-up passed. The server did not send reasoning content.';
+      if (hasReasoning) return 'Function call, reasoning replay, and follow-up passed.';
+      if (policy.protocol !== 'chat-completions' || policy.adapter === 'gemini')
+        return 'Function call and provider-specific continuation passed.';
+      return 'Function call and follow-up passed. The server did not send reasoning content.';
     }],
   ];
   if (only && !tests.some(([name]) => name === only)) throw new Error('Use --only chat, sse or tools.');

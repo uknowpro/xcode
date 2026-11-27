@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { userMessage } from './attachments.mjs';
-import { completionUrl } from './model.mjs';
+import { modelEndpoint } from './model-profile.mjs';
 import { recentMessages } from './memory.mjs';
 
 const storedLimit = 512 * 1024;
@@ -11,14 +11,14 @@ function wireSize(messages) {
 }
 
 export function startWire(job, profile, policy) {
-  const deepseek = policy.adapter === 'deepseek-flash';
-  const scope = deepseek ? createHash('sha256').update(JSON.stringify([
-    policy.adapter, completionUrl(profile.endpoint), profile.model, policy.thinking,
+  const scope = policy.replay ? createHash('sha256').update(JSON.stringify([
+    policy.adapter, modelEndpoint(profile, policy).href, profile.model, policy.thinking,
+    ...(policy.protocol === 'chat-completions' ? [] : [policy.protocol]),
   ])).digest('hex') : null;
   if (job.wire) {
     if (job.wire.scope !== scope)
       throw new Error('This paused turn belongs to its original model endpoint and thinking mode. Restore that profile or discard the pending turn.');
-  } else if (deepseek && !job.stageHistory?.length) {
+  } else if (policy.replay && !job.stageHistory?.length) {
     job.wire = { scope, blocks: [], full: !job.completed.length };
   }
   return job.wire ?? null;

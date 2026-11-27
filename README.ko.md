@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-로컬 프로젝트와 OpenAI 호환 Chat Completions API를 연결하는 터미널 앱입니다. 질문에 필요한 코드를 찾고, 변경안을 검토한 뒤 적용하고 테스트할 수 있습니다.
+로컬 프로젝트용 터미널 앱입니다. OpenAI 호환 API와 OpenAI Responses, Claude Messages, Gemini GenerateContent를 연결합니다. 질문에 필요한 코드를 찾고, 변경안을 검토한 뒤 적용하고 테스트할 수 있습니다.
 
 ## 설정
 
@@ -47,18 +47,26 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
 
 파일 검색은 로컬에서 실행합니다. 선택된 파일 구간, 첨부, 허용된 테스트의 출력은 설정한 모델 주소로 전송됩니다. npm test와 npm run test:install로 검증합니다.
 
-## DeepSeek V4.1 Flash
+## 모델 프로필
 
-DeepSeek 전용 프로필은 xcode 0.1.3 이상에서 사용할 수 있습니다. main에서 설치할 때는 npm install -g .을 실행하세요.
+0.1.4의 모델 프로필과 검토 화면은 최신 소스에서 npm install -g .으로 설치할 수 있습니다.
 
     xcode setup deepseek
     xcode profile show deepseek
     xcode profile test deepseek --only tools
     xcode --profile deepseek --harness bug-fix --write --checks
 
-모델 ID가 표준 Flash 이름이면 자동 감지되고, 처음에는 서버의 기본 추론 설정을 사용합니다. 서버가 지원하면 다음과 같이 지정할 수 있습니다.
+표준 DeepSeek Flash, Qwen, Kimi 모델 ID는 자동 감지되고, 처음에는 서버의 기본 추론 설정을 사용합니다. 서버가 지원하면 다음과 같이 지정할 수 있습니다.
 
     xcode profile tune deepseek --thinking on --effort high
     xcode profile tune deepseek --context-window 65536 --max-tokens 8192
 
 사용자 지정 모델 별칭은 --adapter deepseek-flash로 지정하고, 일반 Chat Completions 호환 모드는 --adapter compatible로 선택합니다. 도구 진단은 도구 결과를 보낸 뒤에도 대화가 이어지는지 확인합니다. 최근 추론 데이터와 도구 기록은 같은 모델 주소에 이어 보내기 위해 세션과 함께 로컬에 저장합니다. 재전송 범위를 넘은 이전 대화는 요약해 사용합니다.
+
+Qwen3.6·Kimi K3는 xcode profile tune <이름> --preset coding으로 모델별 설정을 적용할 수 있습니다. 공식 호스트나 전체 API 주소는 프로토콜을 자동 감지합니다. 그 외 주소에는 --protocol responses, --protocol anthropic, --protocol gemini, --protocol chat-completions를 지정할 수 있습니다.
+
+    xcode profile eval deepseek --against deepseek-tuned
+
+동일한 모델과 주소를 쓰는 두 설정을 임시 프로젝트로 평가합니다. 파일 탐색, 도구 호출, 재개, 테스트, 경로·줄 번호 인용, 소요 시간을 확인합니다.
+
+검토 화면에서 Tab으로 Diff·Files·Tests를 전환합니다. Files에서 방향키와 Space로 적용할 파일을 고르세요. 선택은 검토에 저장됩니다. 화면을 닫은 뒤 /apply를 실행하세요. implement와 bug-fix 하네스에서 실패한 등록 테스트는 수정안을 최대 두 번 제안합니다. 수정안을 승인하면 같은 테스트를 다시 실행하고 /verification에서 이전 결과와 함께 확인합니다.

@@ -8,11 +8,12 @@ import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { attach, explicitReferences, splitArgs } from './attachments.mjs';
 import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
-import { completionUrl } from './model.mjs';
-import { configureModel, modelPolicy, modelTuning } from './model-profile.mjs';
+import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
+import { evaluateProfile } from './profile-eval.mjs';
+import { checkEvidence } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
-import { reviewDiff } from './changes.mjs';
+import { reviewDiff, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey } from './terminal.mjs';
 import { Sessions } from './session.mjs';
@@ -47,8 +48,9 @@ const help = [
   '  xcode sessions                 List sessions for this project',
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode continue [id|latest]    Run the pending message once',
-  '  xcode profile list|show|use|set|tune|test [name]',
-  '  xcode profile tune [name] --adapter auto|compatible|deepseek-flash --effort high',
+  '  xcode profile list|show|use|set|tune|test|eval [name]',
+  '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
+  '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>]',
   '  xcode harness list|show|import [name] [file]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
@@ -60,7 +62,8 @@ const help = [
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
   '  --attach <path>     --endpoint <url>   --model <id>      --token-stdin',
-  '  --thinking on|off|default   --effort low|high|max|default',
+  '  --thinking on|off|default   --effort low|medium|high|xhigh|max|default',
+  '  --preset default|coding     Apply vendor sampling defaults where supported',
   '  --context-window <tokens>   --max-tokens <tokens>',
   '  --help             --version',
 ].join('\n');
@@ -77,6 +80,7 @@ const chatHelp = [
   '/retry off|<seconds>            Retry transient failures while the session is running',
   '/write on|off                  Allow model change proposals. Applying still requires approval',
   '/diff [path], /apply [paths]    Review or approve all or selected files',
+  '/verification                  View test outcomes for the current or last turn',
   '/reject, /changes, /undo [id]  Reject a proposal, see history, or undo',
   '/context [query]               Inspect the compacted session context',
   '/harness preview <name>        View an available harness without switching',
@@ -102,7 +106,7 @@ async function readInput(limit) {
 
 async function saveProfile(name, endpoint, model, token, use, options = {}) {
   validName(name);
-  const url = completionUrl(endpoint);
+  const url = endpointUrl(endpoint).href;
   if (!model?.trim() || model.length > 256) throw new Error('Enter a model ID up to 256 characters.');
   if (token !== undefined && (token.length > 8192 || /[\r\n]/.test(token))) throw new Error('Invalid API token.');
   await updateSettings(async config => {
@@ -145,7 +149,7 @@ async function setup(name) {
 
 function showProfiles(config) {
   for (const [name, profile] of Object.entries(config.profiles)) {
-    const url = new URL(profile.endpoint);
+    const url = modelEndpoint(profile, modelPolicy(profile));
     print((name === config.defaultProfile ? '* ' : '  ') + name + ' · ' + profile.model + ' · ' + url.origin + url.pathname);
   }
   if (!Object.keys(config.profiles).length) print('No profiles. Run xcode setup.');
@@ -169,7 +173,7 @@ async function profileCommand(action, name, options) {
       });
     }
     const current = action === 'tune' ? profileFor(await settings(), name) : profile;
-    const url = new URL(current.endpoint);
+    const url = modelEndpoint(current, modelPolicy(current));
     return print([
       'Profile · ' + name + ' · ' + current.model,
       'Endpoint · ' + url.origin + url.pathname,
@@ -179,6 +183,21 @@ async function profileCommand(action, name, options) {
   if (action === 'use') {
     await updateSettings(value => { value.defaultProfile = name; });
     print('Default profile: ' + name);
+  } else if (action === 'eval') {
+    const comparison = options.against ? profileFor(config, options.against) : null;
+    if (comparison && (comparison.model !== profile.model ||
+      modelEndpoint(comparison, modelPolicy(comparison)).href !== modelEndpoint(profile, modelPolicy(profile)).href))
+      throw new Error('Compare settings for the same model and endpoint.');
+    const timeout = options.timeout === undefined ? 120 : Number(options.timeout);
+    if (!Number.isInteger(timeout) || timeout < 1 || timeout > 600) throw new Error('Evaluation timeout must be 1–600 seconds.');
+    for (const [entry, value] of [[name, profile], ...(comparison ? [[options.against, comparison]] : [])]) {
+      const { error, durationMs, checkpoint, ...phases } = await evaluateProfile(value, await tokenFor(entry), { timeout: timeout * 1000 });
+      print(entry + ' · ' + (durationMs / 1000).toFixed(2) + 's');
+      for (const [phase, passed] of Object.entries(phases)) print('  ' + phase + ' · ' + (passed ? 'PASS' : 'FAIL'));
+      if (error) info(error);
+      else if (!checkpoint) info('The model did not use tools, so there was no checkpoint to resume.');
+      if (error || Object.values(phases).includes(false)) process.exitCode = 1;
+    }
   } else if (action === 'test') {
     const timeout = options.timeout === undefined
       ? (modelPolicy(profile).adapter === 'deepseek-flash' ? 60 : 15) : Number(options.timeout);
@@ -189,7 +208,7 @@ async function profileCommand(action, name, options) {
     });
     if (results.some(item => item.status === 'fail')) process.exitCode = 1;
   } else {
-    throw new Error('Use profile list, show, set, tune, use or test.');
+    throw new Error('Use profile list, show, set, tune, use, test or eval.');
   }
 }
 
@@ -213,6 +232,7 @@ function showHarness(config, name, root) {
     print('  ' + (index + 1) + '. ' + stage.name + ' — ' + stage.instruction);
     if (stage.tools) print('     Tools: ' + (stage.tools.join(', ') || 'none'));
     if (stage.done) print('     Done: ' + stage.done);
+    if (stage.repairAttempts) print('     Repair attempts: ' + stage.repairAttempts);
   });
 }
 
@@ -329,7 +349,7 @@ async function describeSettings(root, session) {
   const config = await settings();
   const profileName = session?.profile ?? config.defaultProfile ?? 'default';
   const profile = own(config.profiles, profileName);
-  const url = profile ? new URL(profile.endpoint) : null;
+  const url = profile ? modelEndpoint(profile, modelPolicy(profile)) : null;
   return [
     'Workspace · ' + root,
     'Model profile · ' + profileName + (profile ? ' · ' + profile.model : ' · setup required'),
@@ -360,6 +380,13 @@ async function reviewCommand(root, action, prefix, paths) {
   } finally {
     await sessions.close();
   }
+}
+
+function verificationLines(session) {
+  const checks = session.queue[0]?.checks ?? session.turns.at(-1)?.checks ?? [];
+  return checks.length ? checks.slice(-20).flatMap(check => [
+    ...(check.automatic ? ['Automatic rerun'] : []), ...checkEvidence(check, 850).split('\n'), '',
+  ]) : ['No verification results for this turn.'];
 }
 
 function reviewDecision(files, review) {
@@ -497,21 +524,29 @@ async function chat(root, base, defaults, options, prefix) {
   }
   function drawReview(move = 0) {
     const rows = Math.max(6, (stdout.rows || 24) - 4);
-    const last = Math.max(0, pager.lines.length - rows);
+    const { review, mode, picked } = pager;
+    const lines = mode === 'files' ? review.files.map((file, index) =>
+      (index === pager.focus ? '› ' : '  ') + (picked.has(file.path) ? '[x] ' : '[ ] ') + file.path +
+      (file.move?.to ? ' → ' + file.move.to : file.after === null ? ' · delete' : file.before === null ? ' · new' : ' · edit')
+    ) : mode === 'tests' ? verificationLines(selected.session) : pager.lines;
+    const last = Math.max(0, lines.length - rows);
     pager.offset = Math.max(0, Math.min(last, pager.offset + move));
+    if (mode === 'files' && pager.focus < pager.offset) pager.offset = pager.focus;
+    if (mode === 'files' && pager.focus >= pager.offset + rows) pager.offset = pager.focus - rows + 1;
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
-    print('Review ' + pager.id + ' · ' + (pager.offset + 1) + '–' +
-      Math.min(pager.offset + rows, pager.lines.length) + '/' + pager.lines.length);
-    for (const line of pager.lines.slice(pager.offset, pager.offset + rows)) {
+    print('Review ' + review.id + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
+      (mode === 'diff' && pager.file ? ' · ' + pager.file : ''));
+    for (const line of lines.slice(pager.offset, pager.offset + rows)) {
       const width = Math.max(16, (stdout.columns || 80) - 1);
-      // Avoid wrapping and keep the pager usable when patches contain very long lines.
-      const prefix = pager.column ? '…' : '';
-      const available = width - prefix.length;
-      const visible = line.slice(pager.column, pager.column + available);
-      print(prefix + (pager.column + visible.length < line.length ? visible.slice(0, -1) + '…' : visible));
+      const column = mode === 'files' ? 0 : pager.column;
+      const prefix = column ? '…' : '';
+      const visible = line.slice(column, column + width - prefix.length);
+      print(prefix + (column + visible.length < line.length ? visible.slice(0, -1) + '…' : visible));
     }
-    print('↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Esc/q Close');
+    print(mode === 'files'
+      ? '↑/↓ Select file · Space Toggle · Enter Diff · Tab Tests · Esc Close'
+      : '↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Tab ' + (mode === 'diff' ? 'Files' : 'Diff') + ' · Esc/q Close');
   }
 
   function closeReview() {
@@ -524,17 +559,55 @@ async function chat(root, base, defaults, options, prefix) {
 
   function reviewKey(_text, key) {
     if (!pager || !key) return;
+    const clearInput = () => rl.write(null, { ctrl: true, name: 'u' });
     if (key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c')) {
+      clearInput();
       closeReview();
-      rl.write(null, { ctrl: true, name: 'u' });
       return;
     }
-    if (key.name === 'left' || key.name === 'right') {
-      pager.column = Math.max(0, Math.min(pager.maxColumn, pager.column + (key.name === 'left' ? -40 : 40)));
+    if (key.name === 'tab') {
+      const tabs = ['diff', 'files', 'tests'];
+      pager.mode = tabs[(tabs.indexOf(pager.mode) + (key.shift ? 2 : 1)) % 3];
+      pager.offset = 0;
+      pager.column = 0;
       drawReview();
       return;
     }
-    const move = pageKey(key.name, Math.max(6, (stdout.rows || 24) - 4), pager.lines.length);
+    if (pager.mode === 'files') {
+      const file = pager.review.files[pager.focus];
+      if (key.name === 'space' && pager.review.state !== 'applying') {
+        const group = selectedFiles(pager.review, [file.path]);
+        const remove = pager.picked.has(file.path);
+        for (const item of group) {
+          if (remove) pager.picked.delete(item.path);
+          else pager.picked.add(item.path);
+        }
+        pager.review.markedPaths = [...pager.picked];
+        sessions.persist(selected).catch(error => show('Could not save review selection: ' + error.message));
+        clearInput();
+      } else if (key.name === 'return' || key.name === 'enter') {
+        pager.mode = 'diff';
+        pager.file = file.path;
+        pager.lines = reviewDiff(pager.review, file.path);
+        pager.offset = 0;
+        pager.column = 0;
+      } else {
+        const move = pageKey(key.name, Math.max(6, (stdout.rows || 24) - 4), pager.review.files.length);
+        if (move === undefined) return;
+        pager.focus = Math.max(0, Math.min(pager.review.files.length - 1, pager.focus + move));
+      }
+      drawReview();
+      return;
+    }
+    if (key.name === 'left' || key.name === 'right') {
+      const lines = pager.mode === 'tests' ? verificationLines(selected.session) : pager.lines;
+      const max = lines.reduce((value, line) => Math.max(value, line.length - 1), 0);
+      pager.column = Math.max(0, Math.min(max, pager.column + (key.name === 'left' ? -40 : 40)));
+      drawReview();
+      return;
+    }
+    const rows = pager.mode === 'tests' ? verificationLines(selected.session).length : pager.lines.length;
+    const move = pageKey(key.name, Math.max(6, (stdout.rows || 24) - 4), rows);
     if (move !== undefined) drawReview(move);
   }
 
@@ -646,6 +719,7 @@ async function chat(root, base, defaults, options, prefix) {
       case '/paste': paste = []; pasteLength = 0; show('Paste or type multiple lines. /send submits, /cancel discards.'); break;
       case '/settings': show(await describeSettings(root, session)); break;
       case '/changes': show(changeHistory(session)); break;
+      case '/verification': show(verificationLines(session).join('\n')); break;
       case '/undo': {
         const result = await sessions.undo(selected, arg);
         show('Undid change ' + result.id + ' (' + result.files.length + ' files).');
@@ -671,8 +745,9 @@ async function chat(root, base, defaults, options, prefix) {
         const lines = reviewDiff(review, arg);
         if (process.env.TERM === 'dumb') { show(lines.join('\n')); break; }
         endStream();
-        pager = { id: review.id, lines, offset: 0, column: 0,
-          maxColumn: lines.reduce((max, line) => Math.max(max, line.length - 1), 0) };
+        const picked = new Set(review.state !== 'applying' && review.markedPaths ? review.markedPaths :
+          selectedFiles(review).map(file => file.path));
+        pager = { review, picked, file: arg, mode: 'diff', lines, focus: 0, offset: 0, column: 0 };
         stdout.write('\x1b[?1049h');
         drawReview();
         break;
@@ -852,7 +927,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' },
-      adapter: { type: 'string' }, thinking: { type: 'string' }, effort: { type: 'string' },
+      adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
+      thinking: { type: 'string' }, effort: { type: 'string' },
       'context-window': { type: 'string' }, 'max-tokens': { type: 'string' },
     },
   });

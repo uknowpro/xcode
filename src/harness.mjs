@@ -51,7 +51,7 @@ export const presets = {
     stages: [
       step('Investigate', 'Read instructions and identify the smallest viable change.'),
       step('Implement', 'Propose targeted edits or new files as one change set. Wait for the review decision.', [...readTools, ...changeTools], 'Report the paths affected.'),
-      step('Verify', 'Read back changes, check whitespace and run an enabled project check when applicable.', [...readTools, 'verify_edits', 'run_check'], 'Report verified results and remaining checks.'),
+      { ...step('Verify', 'Read back changes, check whitespace and run an enabled project check when applicable.', verification, 'Report verified results and remaining checks.'), repairAttempts: 2 },
     ],
   },
   infrastructure: {
@@ -68,7 +68,7 @@ export const presets = {
     stages: [
       step('Reproduce', 'Trace the failing path from evidence. Use an enabled check when its scope covers the defect.', verification),
       step('Fix', 'Propose the smallest source and regression-test changes that address the root cause.', [...readTools, ...changeTools]),
-      step('Retest', 'Run the registered regression check if enabled and report what it verifies.', verification),
+      { ...step('Retest', 'Run the registered regression check if enabled and report what it verifies.', verification), repairAttempts: 2 },
     ],
   },
   refactor: {
@@ -144,9 +144,10 @@ export function harnessFor(config, name) {
   for (const stage of harness.stages) {
     if (typeof stage?.name !== 'string' || !stage.name.trim() || typeof stage.instruction !== 'string' ||
       (stage.done !== undefined && typeof stage.done !== 'string') ||
+      (stage.repairAttempts !== undefined && (!Number.isInteger(stage.repairAttempts) || stage.repairAttempts < 0 || stage.repairAttempts > 3)) ||
       (stage.tools !== undefined && (!Array.isArray(stage.tools) ||
         stage.tools.some(tool => ![...readTools, ...changeTools, 'verify_edits', 'run_check'].includes(tool)))))
-      throw new Error('Each stage needs a name and instruction. Tools must use supported names.');
+      throw new Error('Each stage needs a name and instruction, supported tools, and at most 3 repair attempts.');
   }
   if (harness.skills !== undefined && (!Array.isArray(harness.skills) ||
     harness.skills.some(name => typeof name !== 'string')))

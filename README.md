@@ -2,7 +2,7 @@
 
 [한국어](README.ko.md)
 
-A terminal coding assistant for your local project and an OpenAI-compatible Chat Completions endpoint. Ask it to find code, propose changes, and verify approved edits.
+A terminal coding assistant for your local project. Connect an OpenAI-compatible endpoint or use OpenAI Responses, Claude Messages, or Gemini GenerateContent. Ask it to find code, propose changes, and verify approved edits.
 
 ## Setup
 
@@ -47,18 +47,26 @@ Read-only mode is the default. /write on allows proposals, and /checks on allows
 
 File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.
 
-## DeepSeek V4.1 Flash
+## Model profiles
 
-The DeepSeek profile is available in xcode 0.1.3 or later. Use npm install -g . from the checkout to install it from main.
+Use npm install -g . from an up-to-date checkout for model profiles and the review improvements in 0.1.4.
 
     xcode setup deepseek
     xcode profile show deepseek
     xcode profile test deepseek --only tools
     xcode --profile deepseek --harness bug-fix --write --checks
 
-Standard Flash model IDs are detected automatically. The basic setup uses the server's thinking defaults. For an endpoint that supports these settings, use
+Standard DeepSeek Flash, Qwen, and Kimi model IDs are detected automatically. The basic setup uses the server's thinking defaults. For an endpoint that supports these settings, use
 
     xcode profile tune deepseek --thinking on --effort high
     xcode profile tune deepseek --context-window 65536 --max-tokens 8192
 
 Use --adapter deepseek-flash for a custom model alias, or --adapter compatible for generic Chat Completions. The tool probe checks that the endpoint accepts a follow-up after a tool result. On DeepSeek profiles, recent model-returned reasoning and tool state are saved with sessions locally for replay to the same model endpoint. Older turns are summarized as the replay budget fills.
+
+For Qwen3.6 or Kimi K3, use xcode profile tune <name> --preset coding to try its model-specific sampling settings. Use the default preset when your server does not expose those options. The protocol is inferred from official hostnames or full API paths. You can set --protocol responses, --protocol anthropic, --protocol gemini, or --protocol chat-completions explicitly for other endpoints.
+
+    xcode profile eval deepseek --against deepseek-tuned
+
+Both profiles must refer to the same model and endpoint. The temporary fixture checks file discovery, tool use, checkpoint replay, a local test, citation, and elapsed time.
+
+In /diff, use Tab to switch between Diff, Files, and Tests. In Files, use the arrow keys and Space to choose paths. The selection is saved with the pending review. Close the panel, then /apply. In the implement and bug-fix harnesses, an eligible failed test can trigger up to two repair proposals. Approving a repair reruns the same registered check. See the result with /verification.
