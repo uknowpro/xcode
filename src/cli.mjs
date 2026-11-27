@@ -106,11 +106,12 @@ async function readInput(limit) {
 
 async function saveProfile(name, endpoint, model, token, use, options = {}) {
   validName(name);
-  const url = endpointUrl(endpoint).href;
-  if (!model?.trim() || model.length > 256) throw new Error('Enter a model ID up to 256 characters.');
-  if (token !== undefined && (token.length > 8192 || /[\r\n]/.test(token))) throw new Error('Invalid API token.');
   await updateSettings(async config => {
-    config.profiles[name] = configureModel({ ...own(config.profiles, name), endpoint: url, model: model.trim() }, options);
+    const existing = own(config.profiles, name);
+    const url = endpointUrl(endpoint ?? existing?.endpoint).href;
+    const modelId = model ?? existing?.model;
+    if (!modelId?.trim() || modelId.length > 256) throw new Error('Enter a model ID up to 256 characters.');
+    config.profiles[name] = configureModel({ ...existing, endpoint: url, model: modelId.trim() }, options);
     if (token !== undefined) await setToken(name, token);
     if (use || !config.defaultProfile) config.defaultProfile = name;
   });
@@ -134,13 +135,15 @@ async function setup(name) {
   rl.on('SIGINT', () => rl.close());
   try {
     const signal = controller.signal;
-    const endpoint = (await rl.question('API URL' + (profile ? ' [' + clean(profile.endpoint) + ']' : '') + ': ', { signal })).trim();
+    const savedUrl = profile ? endpointUrl(profile.endpoint) : null;
+    const shown = savedUrl ? savedUrl.origin + savedUrl.pathname + (savedUrl.search ? '?[saved parameters]' : '') : null;
+    const endpoint = (await rl.question('API URL' + (shown ? ' [' + clean(shown) + ']' : '') + ': ', { signal })).trim();
     const model = (await rl.question('Model ID' + (profile ? ' [' + clean(profile.model) + ']' : '') + ': ', { signal })).trim();
     stdout.write('API token (hidden, Enter to keep, - to clear): ');
     hidden = true;
     const token = (await rl.question('', { signal })).trim();
     stdout.write('\n');
-    await saveProfile(name, endpoint || profile?.endpoint, model || profile?.model, token === '-' ? '' : token || undefined, true);
+    await saveProfile(name, endpoint || undefined, model || undefined, token === '-' ? '' : token || undefined, true);
     print('Saved default profile ' + name + '.');
   } finally {
     rl.close();
@@ -159,9 +162,8 @@ async function profileCommand(action, name, options) {
   const config = await settings();
   if (action === 'list' || !action) return showProfiles(config);
   if (action === 'set') {
-    const existing = own(config.profiles, name);
     const token = options['token-stdin'] ? (await readInput(16384)).trim() : undefined;
-    await saveProfile(name, options.endpoint || existing?.endpoint, options.model || existing?.model, token, false, options);
+    await saveProfile(name, options.endpoint, options.model, token, false, options);
     print('Saved profile ' + name + '.');
     return;
   }

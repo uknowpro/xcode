@@ -61,11 +61,23 @@ export async function lock(directory, name) {
   return () => rm(path, { force: true });
 }
 
+function objectValue(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error(label + ' must be a JSON object.');
+  return value;
+}
+
 export async function settings() {
   await mkdir(storage, { recursive: true, mode: 0o700 });
-  const config = await readJson(join(storage, 'settings.json'), { profiles: {}, harnesses: {} });
+  const path = join(storage, 'settings.json');
+  const config = objectValue(await readJson(path, {}), 'settings.json');
+  for (const key of ['profiles', 'harnesses', 'projectChecks', 'harnessChecks']) {
+    if (config[key] != null) objectValue(config[key], 'settings.json field ' + key);
+  }
   config.profiles ??= {};
   config.harnesses ??= {};
+  if (config.defaultProfile != null && typeof config.defaultProfile !== 'string')
+    throw new Error('settings.json field defaultProfile must be a profile name.');
   return config;
 }
 
@@ -81,15 +93,22 @@ export async function updateSettings(change) {
   }
 }
 
+function validToken(value) {
+  if (typeof value !== 'string' || value.length > 8192 || /[\x00-\x1f\x7f]/.test(value))
+    throw new Error('Invalid API token. Use xcode setup to update it.');
+  return value;
+}
+
 export async function tokenFor(name) {
-  const tokens = await readJson(join(storage, 'tokens.json'), {});
-  return process.env.XCODE_API_TOKEN ?? (Object.hasOwn(tokens, name) ? tokens[name] : '');
+  if (process.env.XCODE_API_TOKEN !== undefined) return validToken(process.env.XCODE_API_TOKEN);
+  const tokens = objectValue(await readJson(join(storage, 'tokens.json'), {}), 'tokens.json');
+  return Object.hasOwn(tokens, name) ? validToken(tokens[name]) : '';
 }
 
 export async function setToken(name, token) {
   const path = join(storage, 'tokens.json');
-  const tokens = await readJson(path, {});
-  await saveJson(path, { ...tokens, [name]: token });
+  const tokens = objectValue(await readJson(path, {}), 'tokens.json');
+  await saveJson(path, { ...tokens, [name]: validToken(token) });
 }
 
 export function sessionPath(id) {

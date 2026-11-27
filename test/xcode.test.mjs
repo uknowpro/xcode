@@ -772,3 +772,15 @@ test('repair verification skips rejected fixes and changed commands', async () =
   job.approvals = [{ stageIndex: 1, files: ['src/a.mjs'] }];
   assert.match((await recheck(job.plan[2], job, session, { test: { argv: ['node', 'changed.mjs'], timeout: 5 } }, {})).skipped, /command.*changed/i);
 });
+
+test('malformed local configuration produces an actionable error and is left intact', async t => {
+  const state = await temp(t);
+  const path = join(state, 'settings.json');
+  const env = { ...process.env, XCODE_HOME: state };
+  for (const contents of ['[]', '{"profiles":[]}', '{"defaultProfile":7}']) {
+    await writeFile(path, contents);
+    await assert.rejects(exec(process.execPath, [cliPath, 'profile', 'list'], { env }),
+      error => error.code === 1 && /settings\.json/.test(error.stderr));
+    assert.equal(await readFile(path, 'utf8'), contents);
+  }
+});
