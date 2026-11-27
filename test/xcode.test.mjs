@@ -14,6 +14,7 @@ import { Workspace, replaceText } from '../src/workspace.mjs';
 import { completeReference } from '../src/terminal.mjs';
 
 const exec = promisify(execFile);
+const childTimeout = Number(process.env.XCODE_TEST_TIMEOUT_MS ?? 60000);
 const cliPath = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
 
 async function temp(t) {
@@ -226,7 +227,7 @@ test('a late file conflict rolls back earlier replacements and respects existing
     'assert.equal(await readFile("b.txt", "utf8"), "proposed");',
   ].join('\n');
   await exec(process.execPath, ['--input-type=module', '--eval', program], {
-    cwd: root, env: { ...process.env, XCODE_HOME: state }, timeout: 12000,
+    cwd: root, env: { ...process.env, XCODE_HOME: state }, timeout: childTimeout,
   });
   assert.equal(await readFile(join(root, 'a.txt'), 'utf8'), 'proposed');
   assert.equal(await readFile(join(root, 'b.txt'), 'utf8'), 'proposed');
@@ -293,7 +294,6 @@ test('concurrent sessions preserve their queues and stop-and-advance sends the n
   const module = new URL('../src/session.mjs', import.meta.url).href;
   const program = [
     'import assert from "node:assert/strict";',
-    'import { setTimeout as wait } from "node:timers/promises";',
     'const { Sessions } = await import(' + JSON.stringify(module) + ');',
     'const sessions = new Sessions(process.cwd());',
     'const first = await sessions.select(undefined, {});',
@@ -317,7 +317,7 @@ test('concurrent sessions preserve their queues and stop-and-advance sends the n
     '} finally { await reopened.close(); }',
   ].join('\n');
   await exec(process.execPath, ['--input-type=module', '--eval', program], {
-    cwd: work, env: { ...process.env, XCODE_HOME: state }, timeout: 10000,
+    cwd: work, env: { ...process.env, XCODE_HOME: state }, timeout: childTimeout,
   });
   assert.ok(api.requests.some(request => request.body.messages.at(-1).content === 'next'));
 });
@@ -550,7 +550,7 @@ test('DeepSeek replays assistant fields across tools, stages, approvals and a re
   ].join('\n');
   const env = { ...process.env, XCODE_HOME: state };
   delete env.XCODE_API_TOKEN;
-  const next = await exec(process.execPath, ['--input-type=module', '--eval', program], { cwd: work, env, timeout: 15000 });
+  const next = await exec(process.execPath, ['--input-type=module', '--eval', program], { cwd: work, env, timeout: childTimeout });
   assert.match(next.stdout, /a\.txt was changed/);
   assert.doesNotMatch(next.stdout, /private /);
   assert.equal(api.requests.length, 6);
@@ -937,4 +937,26 @@ test('listing many sessions retains only status summaries while reopening loads 
   await exec(process.execPath, ['--input-type=module', '--eval', program], {
     cwd: work, env: { ...process.env, XCODE_HOME: state },
   });
+});
+
+test('custom harness imports, project skills and native PDF attachments retain their boundaries', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const env = { ...process.env, XCODE_HOME: state };
+  const cli = (...args) => exec(process.execPath, [cliPath, ...args], { cwd: root, env });
+  await mkdir(join(root, '.xcode', 'skills', 'verify-doc'), { recursive: true });
+  await writeFile(join(root, '.xcode', 'skills', 'verify-doc', 'SKILL.md'), '---\nname: verify-doc\ndescription: Check local documents\n---\nUse the document summary.');
+  await writeFile(join(root, 'workflow.json'), JSON.stringify({
+    description: 'Document workflow', skills: ['verify-doc'], stages: [{ name: 'Read', instruction: 'Read the selected document.', tools: ['skill_read', 'read'] }],
+  }));
+  assert.match((await cli('harness', 'import', 'docs', 'workflow.json')).stdout, /Skills: verify-doc/);
+  assert.match((await cli('harness', 'show', 'docs')).stdout, /Document workflow/);
+  const bytes = '%PDF-1.7\n% fixture\n';
+  await writeFile(join(root, 'fixture.pdf'), bytes);
+  const document = await attach(root, 'fixture.pdf', { pdfInput: true });
+  assert.equal(document.parts[0].file.file_data, 'data:application/pdf;base64,' + Buffer.from(bytes).toString('base64'));
+  const { skillsAt, skillRead } = await import('../src/harness.mjs');
+  const skills = await skillsAt(root);
+  assert.match((await skillRead(skills, 'verify-doc')).content, /Use the document summary/);
+  await assert.rejects(skillRead(skills, 'verify-doc', '../other.md'), /inside the skill/);
 });

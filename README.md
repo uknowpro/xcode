@@ -8,7 +8,7 @@ A terminal coding assistant for your local project. Connect an OpenAI-compatible
 
 Requires Node.js 22.5 or later on Linux, macOS, or Windows. Download the .tgz from [GitHub Releases](https://github.com/uknowpro/xcode/releases), then run
 
-    npm install -g ./uknowpro-xcode-0.1.2.tgz
+    npm install -g ./uknowpro-xcode-0.1.5.tgz
     xcode setup
     xcode profile test
 
@@ -41,7 +41,7 @@ Read-only mode is the default. /write on allows proposals, and /checks on allows
 ## Settings and sessions
 
 - **Global** · xcode setup saves the default model, xcode profile use <name> changes it, and xcode settings shows your profile and project checks. settings.json and a separate token file live under ~/.xcode or XCODE_HOME. XCODE_API_TOKEN overrides a stored token.
-- **Session** · /settings shows the active profile, harness, and permissions. Use /new, /sessions, or /resume for parallel or saved conversations. Earlier decisions, file references, changes, and check results are summarized for continuing work. Use /context to inspect the summary.
+- **Session** · /settings shows the active profile, harness, and permissions. Use /new and /resume for parallel or saved conversations, or press the arrow keys and Enter in /sessions to switch. Earlier decisions, file references, changes, and check results are summarized for continuing work. Use /context to inspect the summary.
 - **Input** · /attach accepts text, images and PDFs. Use /inputs image on or /inputs pdf on for supported models. For a text-only PDF workflow, xcode can use the optional pdftotext tool.
 - **Harness** · xcode harness list shows presets for bug fixes, refactoring, API review, Terraform, Helm, and Kubernetes. Use /harness preview <name> to inspect steps or /harness <name> to switch. xcode harness import <name> <file> accepts custom JSON. Compatible SKILL.md files can be loaded from .claude/skills and .xcode/skills.
 
@@ -49,7 +49,7 @@ File search runs locally. Selected file excerpts, attachments, and outputs from 
 
 ## Model profiles
 
-Use npm install -g . from an up-to-date checkout for model profiles and the review improvements in 0.1.4.
+Use xcode profile show to see the detected adapter, protocol and effective settings.
 
     xcode setup deepseek
     xcode profile show deepseek
@@ -67,6 +67,6 @@ For Qwen3.6 or Kimi K3, use xcode profile tune <name> --preset coding to try its
 
     xcode profile eval deepseek --against deepseek-tuned
 
-Both profiles must refer to the same model and endpoint. The temporary fixture checks file discovery, tool use, checkpoint replay, a local test, citation, and elapsed time.
+Both profiles must refer to the same model and endpoint. The temporary fixture checks file discovery, tool use, checkpoint replay, a local test, citation, and elapsed time. Add --json to either profile eval or profile test for a machine-readable report.
 
 In /diff, use Tab to switch between Diff, Files, and Tests. In Files, use the arrow keys and Space to choose paths. The selection is saved with the pending review. Close the panel, then /apply. In the implement and bug-fix harnesses, an eligible failed test can trigger up to two repair proposals. Approving a repair reruns the same registered check. See the result with /verification.

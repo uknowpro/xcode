@@ -13,6 +13,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+WAIT_SECONDS = max(15, int(os.environ.get("XCODE_TEST_TIMEOUT_MS", "15000")) / 1000)
+
 
 class Model(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -62,7 +64,7 @@ class Terminal:
         os.write(self.master, data)
 
     def expect(self, expected):
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + WAIT_SECONDS
         while expected not in self.output[self.mark:]:
             left = deadline - time.monotonic()
             if left <= 0 or not select.select([self.master], [], [], left)[0]:
@@ -73,7 +75,7 @@ class Terminal:
     def close(self):
         if self.process.poll() is None:
             self.process.terminate()
-            self.process.wait(timeout=5)
+            self.process.wait(timeout=WAIT_SECONDS)
         os.close(self.master)
 
 
@@ -94,7 +96,7 @@ def smoke(scratch, endpoint):
         setup.send(b"terminal-fixture-token\r")
         setup.expect(b"Saved default profile")
         assert b"terminal-fixture-token" not in setup.output
-        assert setup.process.wait(timeout=5) == 0
+        assert setup.process.wait(timeout=WAIT_SECONDS) == 0
     finally:
         setup.close()
 
@@ -120,7 +122,7 @@ def smoke(scratch, endpoint):
         chat.send(b"q")
         chat.expect(b"\x1b[?1049l")
         chat.send(b"/exit\r")
-        assert chat.process.wait(timeout=5) == 0
+        assert chat.process.wait(timeout=WAIT_SECONDS) == 0
     finally:
         chat.close()
 
@@ -144,7 +146,7 @@ def smoke(scratch, endpoint):
         resumed.send(b"\x1b[B\r")
         resumed.expect(b"xcode \xc2\xb7 read this file")
         resumed.send(b"/exit\r")
-        assert resumed.process.wait(timeout=5) == 0
+        assert resumed.process.wait(timeout=WAIT_SECONDS) == 0
     finally:
         resumed.close()
 

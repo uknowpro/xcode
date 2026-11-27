@@ -17,19 +17,22 @@ const workspace = join(scratch, 'workspace');
 const env = { ...process.env, npm_config_cache: join(scratch, 'cache'), XCODE_HOME: state };
 delete env.XCODE_API_TOKEN;
 // Verify installation over the preceding main version.
-const baselineCommit = 'eb6ff37b5ddc3d03b250fce7784d45d9ed287ca6';
+const baselineCommit = '407dfa9f1ffc5a1a8d70c049d161e8f051af2917';
 let worktreeAdded = false;
 let endpoint;
 
 function npmRun(args, { cwd, input } = {}) {
-  const run = exec(process.execPath, [npm, ...args], { cwd, env, timeout: 60000 });
+  const run = exec(process.execPath, [npm, ...args], { cwd, env, timeout: Number(process.env.XCODE_TEST_TIMEOUT_MS ?? 60000) });
   if (input !== undefined) run.child.stdin.end(input);
   return run;
 }
 
 async function pack(cwd) {
   const { stdout } = await npmRun(['pack', '--json', '--pack-destination', scratch], { cwd });
-  return JSON.parse(stdout)[0];
+  const manifest = JSON.parse(stdout)[0];
+  assert.ok(manifest.files.some(file => file.path === 'src/cli.mjs'));
+  assert.ok(!manifest.files.some(file => /(?:^|\/)(?:\.xcode|\.env(?:\..*)?|tokens\.json|settings\.json|sessions)(?:\/|$)/.test(file.path)));
+  return manifest;
 }
 
 async function install(manifest) {

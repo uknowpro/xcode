@@ -8,7 +8,7 @@
 
 Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Releases](https://github.com/uknowpro/xcode/releases)에서 .tgz를 내려받아 실행하세요.
 
-    npm install -g ./uknowpro-xcode-0.1.2.tgz
+    npm install -g ./uknowpro-xcode-0.1.5.tgz
     xcode setup
     xcode profile test
 
@@ -41,7 +41,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
 ## 설정과 세션 확인
 
 - **전역** · xcode setup에서 기본 모델을 저장하고 xcode profile use <이름>으로 기본값을 바꿉니다. xcode settings에서 모델과 프로젝트 테스트를 확인합니다. 기본 경로는 ~/.xcode입니다. XCODE_HOME으로 경로를 바꾸거나 XCODE_API_TOKEN으로 현재 실행의 토큰을 지정할 수 있습니다.
-- **세션** · /settings에서 현재 모델·하네스·권한을 확인합니다. /new, /sessions, /resume으로 세션을 전환합니다. 오래된 결정·참조 파일·변경·검증은 요약해 이어가며 /context에서 확인할 수 있습니다.
+- **세션** · /settings에서 현재 모델·하네스·권한을 확인합니다. /new와 /resume으로 세션을 관리하고, /sessions에서 방향키와 Enter로 전환합니다. 오래된 결정·참조 파일·변경·검증은 요약해 이어가며 /context에서 확인할 수 있습니다.
 - **입력** · /attach로 텍스트·이미지·PDF를 첨부합니다. 지원 모델에서 /inputs image on과 /inputs pdf on을 사용하세요. PDF 텍스트는 pdftotext가 설치된 경우 로컬에서 추출할 수 있습니다.
 - **하네스** · xcode harness list에서 버그 수정, 리팩터링, API 리뷰, Terraform, Helm, Kubernetes 프리셋을 확인합니다. /harness preview <이름>은 미리보기, /harness <이름>은 전환입니다. 커스텀 JSON과 .claude/skills, .xcode/skills의 호환 스킬도 사용할 수 있습니다.
 
@@ -49,7 +49,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
 
 ## 모델 프로필
 
-0.1.4의 모델 프로필과 검토 화면은 최신 소스에서 npm install -g .으로 설치할 수 있습니다.
+xcode profile show에서 감지된 어댑터와 프로토콜, 적용 중인 설정을 확인할 수 있습니다.
 
     xcode setup deepseek
     xcode profile show deepseek
@@ -67,6 +67,6 @@ Qwen3.6·Kimi K3는 xcode profile tune <이름> --preset coding으로 모델별 
 
     xcode profile eval deepseek --against deepseek-tuned
 
-동일한 모델과 주소를 쓰는 두 설정을 임시 프로젝트로 평가합니다. 파일 탐색, 도구 호출, 재개, 테스트, 경로·줄 번호 인용, 소요 시간을 확인합니다.
+동일한 모델과 주소를 쓰는 두 설정을 임시 프로젝트로 평가합니다. 파일 탐색, 도구 호출, 재개, 테스트, 경로·줄 번호 인용, 소요 시간을 확인합니다. profile eval과 profile test에 --json을 붙이면 결과를 JSON으로 받을 수 있습니다.
 
 검토 화면에서 Tab으로 Diff·Files·Tests를 전환합니다. Files에서 방향키와 Space로 적용할 파일을 고르세요. 선택은 검토에 저장됩니다. 화면을 닫은 뒤 /apply를 실행하세요. implement와 bug-fix 하네스에서 실패한 등록 테스트는 수정안을 최대 두 번 제안합니다. 수정안을 승인하면 같은 테스트를 다시 실행하고 /verification에서 이전 결과와 함께 확인합니다.
