@@ -6,7 +6,7 @@ import { createInterface as questions } from 'node:readline/promises';
 import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
-import { attach, explicitReferences, splitArgs } from './attachments.mjs';
+import { attach, attachmentSize, explicitReferences, maxAttachmentBytes, maxAttachments, splitArgs } from './attachments.mjs';
 import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
 import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
@@ -433,9 +433,21 @@ async function historyCommand(root, action, prefix, id) {
 
 async function collectAttachments(root, base, profile, prompt, paths) {
   const requests = new Map([...explicitReferences(prompt).map(path => [path, false]), ...paths.map(path => [path, true])]);
-  if (requests.size > 8) throw new Error('Choose up to 8 attachments per message.');
   const results = [];
-  for (const [path, explicit] of requests) results.push(await attach(root, path, profile, undefined, { explicit, base }));
+  let bytes = 1;
+  for (const [path, explicit] of requests) {
+    let file;
+    try {
+      file = await attach(root, path, profile, undefined, { explicit, base });
+    } catch (error) {
+      if (!explicit && ['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
+      throw error;
+    }
+    bytes += attachmentSize(file);
+    if (results.length >= maxAttachments || bytes > maxAttachmentBytes)
+      throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
+    results.push(file);
+  }
   return results;
 }
 

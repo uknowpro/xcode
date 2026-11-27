@@ -8,6 +8,10 @@ import { blocked, decodeText, loadBytes, verifiedFile } from './workspace.mjs';
 const exec = promisify(execFile);
 const images = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
 
+export const maxAttachments = 8;
+export const maxAttachmentBytes = 12 * 1024 * 1024;
+export const attachmentSize = item => Buffer.byteLength(JSON.stringify(item)) + 1;
+
 export function splitArgs(input) {
   const parts = [];
   // Preserve Windows backslashes. Quotes delimit paths containing spaces.

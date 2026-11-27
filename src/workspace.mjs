@@ -167,13 +167,18 @@ const importPath = /(?:from\s*|import\s*\(?\s*|require\(\s*)['"](\.[^'"]+)['"]/g
 
 function excerpt(text, start, count) {
   const lines = text.split('\n');
-  const first = Math.min(lines.length, Math.max(1, Number.isInteger(start) ? start : 1));
-  const length = Math.min(200, Math.max(1, Number.isInteger(count) ? count : 80));
-  return {
-    totalLines: lines.length,
-    lines: lines.slice(first - 1, first + length - 1).map((line, index) =>
-      String(first + index) + ' ' + line.trimEnd().slice(0, 350)).join('\n').slice(0, 14000),
-  };
+  const first = Math.max(1, Number.isSafeInteger(start) ? start : 1);
+  const length = Math.min(200, Math.max(1, Number.isSafeInteger(count) ? count : 80));
+  const rows = [];
+  let size = 0;
+  for (let line = first; line <= Math.min(lines.length, first + length - 1); line++) {
+    const row = String(line) + ' ' + lines[line - 1].trimEnd().slice(0, 350);
+    if (size + row.length + 1 > 14000) break;
+    rows.push(row);
+    size += row.length + 1;
+  }
+  const next = first + rows.length;
+  return { totalLines: lines.length, lines: rows.join('\n'), ...(next <= lines.length ? { nextStart: next } : {}) };
 }
 
 export class Workspace {
@@ -223,11 +228,15 @@ export class Workspace {
     return scope;
   }
 
-  async glob({ pattern = '**', path = '.' }, signal) {
+  async glob({ pattern = '**', path = '.', offset = 0, count = 120 }, signal) {
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(count) || count < 1 || count > 120)
+      throw new Error('File listing needs a nonnegative offset and 1–120 paths per page.');
     const scope = this.scope(path);
     const { files, truncated } = await this.files(signal);
     const matches = files.filter(file => within(scope, resolve(this.root, file)) && matchesGlob(file, pattern));
-    return { paths: matches.slice(0, 120), truncated: truncated || matches.length > 120 };
+    const paths = matches.slice(offset, offset + count);
+    const more = offset + paths.length < matches.length;
+    return { paths, truncated: truncated || more, ...(more ? { nextOffset: offset + paths.length } : {}) };
   }
 
   async read({ path, start, count }, signal) {

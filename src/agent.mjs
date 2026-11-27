@@ -23,9 +23,11 @@ const schema = (description, properties, required = []) => ({
 const string = { type: 'string' };
 const integer = { type: 'integer' };
 const definitions = {
-  glob: schema('Find paths by workspace-relative glob. Scope by directory when useful.', { pattern: string, path: string }),
+  glob: schema('Find paths by workspace-relative glob. Use nextOffset to request another page.', {
+    pattern: string, path: string, offset: integer, count: integer,
+  }),
   grep: schema('Search UTF-8 source for literal text, returning paths and line numbers.', { query: string, pattern: string, path: string }, ['query']),
-  read: schema('Read a bounded range of numbered UTF-8 lines in a workspace file.', { path: string, start: integer, count: integer }, ['path']),
+  read: schema('Read a bounded range of numbered UTF-8 lines. Use nextStart to continue.', { path: string, start: integer, count: integer }, ['path']),
   project_guides: schema('Read AGENTS.md files for a workspace file or directory, root first.', { path: string }),
   repo_map: schema('Summarize source declarations and resolvable relative JavaScript and TypeScript imports.', { query: string }),
   skill_read: schema('Read SKILL.md or a resource from a discovered local skill. Scripts are returned as text.', { name: string, path: string }, ['name']),

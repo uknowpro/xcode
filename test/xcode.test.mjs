@@ -978,3 +978,27 @@ test('session listing rebuilds a missing or invalid summary without changing the
   assert.match((await cli('sessions')).stdout, /Updated title/);
   assert.equal(JSON.parse(await readFile(session, 'utf8')).turns[0].answer, 'Keep this reply.');
 });
+
+test('workspace pages glob results and reads from the requested line or EOF', async t => {
+  const root = await temp(t);
+  for (const name of ['a.txt', 'b.txt', 'c.txt']) await writeFile(join(root, name), 'first\nsecond');
+  const project = new Workspace(root);
+  assert.deepEqual(await project.glob({ count: 2 }), { paths: ['a.txt', 'b.txt'], truncated: true, nextOffset: 2 });
+  assert.deepEqual(await project.glob({ offset: 2 }), { paths: ['c.txt'], truncated: false });
+  assert.equal((await project.read({ path: 'a.txt', count: 1 })).nextStart, 2);
+  assert.equal((await project.read({ path: 'a.txt', start: 3 })).lines, '');
+});
+
+test('literal inline @ references coexist with files and explicit missing attachments fail', async t => {
+  const api = await server(t, (body, res) => {
+    const parts = body.messages.at(-1).content;
+    assert.match(parts[0].text, /@scope\/module/);
+    assert.match(parts[1].text, /Actual attached content/);
+    assert.equal(parts.length, 2);
+    reply(res, 'Attached.');
+  });
+  const { cli, work } = await profile(t, api);
+  await writeFile(join(work, 'source.txt'), 'Actual attached content');
+  await cli('ask', 'Check @scope/module using @source.txt');
+  await assert.rejects(cli('ask', 'Check the file', '--attach', 'missing.txt'), /ENOENT/);
+});

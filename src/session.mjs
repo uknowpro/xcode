@@ -5,6 +5,7 @@ import { runJob } from './agent.mjs';
 import { applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
 import { refreshMemory } from './memory.mjs';
+import { attachmentSize, maxAttachmentBytes, maxAttachments } from './attachments.mjs';
 import { completedWire, pruneWire } from './wire-history.mjs';
 
 export class Sessions {
@@ -72,7 +73,8 @@ export class Sessions {
 
   async enqueue(live, prompt, attachments = []) {
     if (live.session.queue.length >= 12) throw new Error('The session queue already has 12 messages.');
-    if (attachments.length > 8 || Buffer.byteLength(JSON.stringify(attachments)) > 12 * 1024 * 1024)
+    if (attachments.length > maxAttachments ||
+      1 + attachments.reduce((bytes, item) => bytes + attachmentSize(item), 0) > maxAttachmentBytes)
       throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
     const job = { prompt, attachments, completed: [], changed: [], tools: [] };
     if (live.session.title === 'New session') live.session.title = prompt.replace(/\s+/g, ' ').slice(0, 72);
