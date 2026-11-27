@@ -64,10 +64,11 @@ export function modelPolicy(profile) {
     throw new Error('DeepSeek Flash effort must be default, low, high or max.');
   const contextWindow = integer(profile.contextWindow, 'Context window', 4096, 2097152);
   const maxTokens = integer(profile.maxTokens, 'Output tokens', 64, 131072);
+  const requestTimeout = integer(profile.requestTimeout, 'Request timeout seconds', 5, 1800) ?? 180;
   if (contextWindow && maxTokens && maxTokens >= contextWindow)
     throw new Error('Output tokens must be smaller than the context window.');
   const replay = protocol !== 'chat-completions' || ['deepseek-flash', 'qwen', 'kimi', 'gemini'].includes(adapter);
-  return { adapter, selected, protocol, selection, preset, thinking, effort, contextWindow, maxTokens, replay };
+  return { adapter, selected, protocol, selection, preset, thinking, effort, contextWindow, maxTokens, requestTimeout, replay };
 }
 
 export function modelEndpoint(profile, policy, stream = false) {
@@ -95,7 +96,7 @@ export function configureModel(profile, options) {
   ]) {
     if (options[flag] !== undefined) value[key] = options[flag];
   }
-  for (const [flag, key] of [['context-window', 'contextWindow'], ['max-tokens', 'maxTokens']]) {
+  for (const [flag, key] of [['context-window', 'contextWindow'], ['max-tokens', 'maxTokens'], ['request-timeout', 'requestTimeout']]) {
     const input = options[flag];
     if (input === undefined) continue;
     if (input === 'default') delete value[key];
@@ -137,6 +138,7 @@ export function modelTuning(profile) {
   return [
     'Protocol · ' + policy.protocol + (policy.selection === 'auto' ? ' (auto)' : ''),
     'Adapter · ' + policy.adapter + (policy.selected === 'auto' ? ' (auto)' : ''),
+    'Request timeout · ' + policy.requestTimeout + 's',
     ...(policy.adapter === 'compatible' ? [] : [
       'Model preset · ' + (policy.preset === 'default' ? 'server defaults' : policy.preset),
       'Thinking · ' + (policy.thinking === 'default' ? 'server default' : policy.thinking),

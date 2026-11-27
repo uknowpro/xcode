@@ -64,7 +64,7 @@ const help = [
   '  --attach <path>     --endpoint <url>   --model <id>      --token-stdin',
   '  --thinking on|off|default   --effort low|medium|high|xhigh|max|default',
   '  --preset default|coding     Apply vendor sampling defaults where supported',
-  '  --context-window <tokens>   --max-tokens <tokens>',
+  '  --context-window <tokens>   --max-tokens <tokens>   --request-timeout <seconds>',
   '  --help             --version',
 ].join('\n');
 
@@ -453,7 +453,7 @@ async function collectAttachments(root, base, profile, prompt, paths) {
 
 function streamSession(root) {
   return new Sessions(root, (_live, event) => {
-    if (event.type === 'text' && !event.intermediate) stdout.write(clean(event.text));
+    if (event.type === 'text' && !event.intermediate && stdout.isTTY) stdout.write(clean(event.text));
     else if (event.type === 'stage' && event.total > 1) info('[' + (event.index + 1) + '/' + event.total + '] ' + event.stage);
     else if (event.type === 'note') info(event.text);
     else if (event.type === 'tool' && event.check)
@@ -469,7 +469,10 @@ async function oneMessage(sessions, live, start) {
     const { run } = await start();
     const result = await run;
     if (result?.error) throw result.error;
-    if (result?.answer) stdout.write('\n');
+    if (result?.answer) {
+      if (stdout.isTTY) stdout.write('\n');
+      else print(result.answer);
+    }
     if (result?.review) {
       const id = live.session.id.slice(0, 8);
       info('Change set awaiting approval. Run xcode review show ' + id + ' or xcode resume ' + id + '.');
@@ -1011,7 +1014,7 @@ async function main() {
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
-      'context-window': { type: 'string' }, 'max-tokens': { type: 'string' },
+      'context-window': { type: 'string' }, 'max-tokens': { type: 'string' }, 'request-timeout': { type: 'string' },
     },
   });
   const [command, ...rest] = positionals;

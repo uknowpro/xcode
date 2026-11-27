@@ -156,18 +156,21 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
 }
 
 async function request(profile, token, messages, tools, session, signal, emit) {
+  const timeout = modelPolicy(profile).requestTimeout * 1000;
   for (;;) {
     signal.throwIfAborted();
+    let visible = false;
     try {
       return await complete(profile, token, messages, {
         tools,
-        signal: AbortSignal.any([signal, AbortSignal.timeout(180000)]),
-        onText: text => emit({ type: 'text', text }),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
+        onText: text => { visible ||= Boolean(text); emit({ type: 'text', text }); },
       });
     } catch (error) {
       signal.throwIfAborted();
       if (!session.retrySeconds || !(error.retryable || error.name === 'TimeoutError')) throw error;
-      emit({ type: 'note', text: 'Temporary connection failure. Retrying in ' + session.retrySeconds + 's.' });
+      emit({ type: 'note', text: (visible ? 'Response interrupted. ' : 'Temporary connection failure. ') +
+        'Retrying the request in ' + session.retrySeconds + 's.' });
       await wait(session.retrySeconds * 1000, undefined, { signal });
     }
   }

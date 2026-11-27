@@ -17,7 +17,7 @@ export function failed(status, detail = '') {
       : 'Check the model ID, request format, and supported inputs or tools.',
     401: 'Check the API token.',
     403: 'Check access to this model.',
-    404: 'Check the Chat Completions URL and model ID.',
+    404: 'Check the API URL, protocol, and model ID.',
   }[status] ?? 'Check the endpoint and model server.';
   return new ModelError((status ? 'HTTP ' + status + '. ' : 'Model request failed. ') + explanation, {
     status,
@@ -29,7 +29,7 @@ function networkError(error, signal) {
   if (signal?.aborted) throw signal.reason;
   const code = error.cause?.code ?? '';
   if (error.cause?.message === 'unexpected redirect')
-    return new ModelError('The server redirected this request. Configure its final Chat Completions URL.');
+    return new ModelError('The server redirected this request. Configure its final API URL.');
   if (/CERT|TLS|SSL/.test(code))
     return new ModelError('The model endpoint certificate could not be verified (' + code + ').');
   return new ModelError('Model connection failed' + (/^[A-Z0-9_]+$/.test(code) ? ' (' + code + ')' : '') + '.', {

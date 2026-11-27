@@ -1002,3 +1002,22 @@ test('literal inline @ references coexist with files and explicit missing attach
   await cli('ask', 'Check @scope/module using @source.txt');
   await assert.rejects(cli('ask', 'Check the file', '--attach', 'missing.txt'), /ENOENT/);
 });
+
+test('slow model profiles can tune the request deadline without changing their endpoint', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Ready.'));
+  const { cli } = await profile(t, api);
+  assert.match((await cli('profile', 'tune', 'work', '--request-timeout', '240')).stdout, /Request timeout · 240s/);
+  await assert.rejects(cli('profile', 'tune', 'work', '--request-timeout', '2'), /Request timeout seconds/);
+  assert.match((await cli('profile', 'show', 'work')).stdout, /Request timeout · 240s/);
+  assert.match((await cli('profile', 'tune', 'work', '--request-timeout', 'default')).stdout, /Request timeout · 180s/);
+});
+
+test('a broken one-shot model stream leaves stdout free of partial answers', async t => {
+  const api = await server(t, (_body, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.end('data: {"choices":[{"delta":{"content":"Partial answer"}}]}\n\n');
+  });
+  const { cli } = await profile(t, api);
+  await assert.rejects(cli('ask', 'Explain the fixture'), error =>
+    error.code === 1 && error.stdout === '' && /stream ended early/.test(error.stderr));
+});
