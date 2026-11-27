@@ -851,3 +851,19 @@ test('corrupt saved sessions do not block valid sessions or new work', async t =
   assert.match((await cli('ask', 'Continue working')).stdout, /Ready/);
   assert.equal(await readFile(corrupt, 'utf8'), '{ malformed');
 });
+
+test('review separates distant changes and previews both sides of a selected move', async () => {
+  const { reviewDiff } = await import('../src/changes.mjs');
+  const before = Array.from({ length: 25 }, (_, i) => 'line ' + i).join('\n') + '\n';
+  const after = before.replace('line 2\n', 'updated first\n').replace('line 22\n', 'updated last\n');
+  const diff = reviewDiff({ files: [{ path: 'file.txt', before, after }] }).join('\n');
+  assert.equal((diff.match(/^@@/gm) ?? []).length, 2);
+  assert.doesNotMatch(diff, /[-+]line 10/);
+  assert.match(diff, /\+updated last/);
+  const move = reviewDiff({ files: [
+    { path: 'old.txt', before: 'original\n', after: null, move: { to: 'new.txt' } },
+    { path: 'new.txt', before: null, after: 'moved with edits\n', move: { from: 'old.txt' } },
+  ] }, 'old.txt').join('\n');
+  assert.match(move, /\+moved with edits/);
+  assert.match(move, /-original/);
+});

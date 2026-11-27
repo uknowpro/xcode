@@ -268,37 +268,88 @@ export function inverseReview(change) {
   };
 }
 
+function textLines(text) {
+  return text?.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+}
+
+function diffOperations(before, after) {
+  let head = 0;
+  while (head < before.length && head < after.length && before[head] === after[head]) head++;
+  let tail = 0;
+  while (tail < Math.min(before.length, after.length) - head && before.at(-1 - tail) === after.at(-1 - tail)) tail++;
+  const left = before.slice(head, before.length - tail);
+  const right = after.slice(head, after.length - tail);
+  const ops = before.slice(0, head).map(line => [' ', line]);
+  const width = right.length + 1;
+  // Bound the LCS table. Oversized replacements still show all changed text.
+  const table = left.length && right.length && (left.length + 1) * width <= 300000
+    ? new Uint16Array((left.length + 1) * width) : null;
+  if (table) {
+    for (let i = left.length - 1; i >= 0; i--) {
+      for (let j = right.length - 1; j >= 0; j--) {
+        const at = i * width + j;
+        table[at] = left[i] === right[j] ? 1 + table[at + width + 1] :
+          Math.max(table[at + width], table[at + 1]);
+      }
+    }
+    let i = 0, j = 0;
+    while (i < left.length || j < right.length) {
+      const at = i * width + j;
+      if (i < left.length && j < right.length && left[i] === right[j]) {
+        ops.push([' ', left[i++]]);
+        j++;
+      } else if (i < left.length && (j === right.length || table[at + width] >= table[at + 1])) {
+        ops.push(['-', left[i++]]);
+      } else {
+        ops.push(['+', right[j++]]);
+      }
+    }
+  } else {
+    for (const line of left) ops.push(['-', line]);
+    for (const line of right) ops.push(['+', line]);
+  }
+  for (const line of before.slice(before.length - tail)) ops.push([' ', line]);
+  return ops;
+}
+
+function hunks(ops) {
+  const ranges = [];
+  for (let at = 0; at < ops.length; at++) {
+    if (ops[at][0] === ' ') continue;
+    const start = Math.max(0, at - 3);
+    const end = Math.min(ops.length, at + 4);
+    const last = ranges.at(-1);
+    if (last && start <= last.end) last.end = end;
+    else ranges.push({ start, end });
+  }
+  const output = [];
+  let index = 0, oldBase = 0, newBase = 0;
+  for (const { start, end } of ranges) {
+    for (; index < start; index++) {
+      oldBase += Number(ops[index][0] !== '+');
+      newBase += Number(ops[index][0] !== '-');
+    }
+    const rows = ops.slice(start, end);
+    const oldCount = rows.filter(([sign]) => sign !== '+').length;
+    const newCount = rows.filter(([sign]) => sign !== '-').length;
+    output.push('@@ -' + (oldBase + Number(oldCount > 0)) + ',' + oldCount +
+      ' +' + (newBase + Number(newCount > 0)) + ',' + newCount + ' @@');
+    for (const [prefix, line] of rows) {
+      output.push(prefix + line.replace(/\n$/, '').replace(/\r/g, '␍'));
+      if (!line.endsWith('\n')) output.push('\\ No newline at end of file');
+    }
+  }
+  return output;
+}
+
 export function reviewDiff(review, filePath) {
-  const files = filePath ? review.files.filter(file => file.path === filePath) : review.files;
-  if (!files.length) throw new Error('No pending change for ' + filePath);
-  const lines = text => text?.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-  const display = (line, prefix) => {
-    const body = prefix + line.replace(/\n$/, '').replace(/\r/g, '␍');
-    return line.endsWith('\n') ? [body] : [body, '\\ No newline at end of file'];
-  };
-  return files.flatMap(file => {
-    const before = lines(file.before);
-    const after = lines(file.after);
-    let head = 0;
-    while (head < before.length && head < after.length && before[head] === after[head]) head++;
-    let tail = 0;
-    while (tail < Math.min(before.length, after.length) - head && before.at(-1 - tail) === after.at(-1 - tail)) tail++;
-    const start = Math.max(0, head - 3);
-    const trailing = Math.min(3, tail);
-    const oldEnd = before.length - tail;
-    const newEnd = after.length - tail;
-    return [
-      ...(file.move?.to ? ['rename ' + file.path + ' → ' + file.move.to] :
-        file.move?.from ? ['rename ' + file.move.from + ' → ' + file.path] : []),
-      '--- ' + (file.before === null ? '/dev/null' : file.path),
-      '+++ ' + (file.after === null ? '/dev/null' : file.path),
-      '@@ -' + (before.length ? start + 1 : 0) + ',' + (oldEnd - start + trailing) +
-        ' +' + (after.length ? start + 1 : 0) + ',' + (newEnd - start + trailing) + ' @@',
-      ...before.slice(start, head).flatMap(line => display(line, ' ')),
-      ...before.slice(head, oldEnd).flatMap(line => display(line, '-')),
-      ...after.slice(head, newEnd).flatMap(line => display(line, '+')),
-      ...after.slice(newEnd, newEnd + trailing).flatMap(line => display(line, ' ')),
-      '',
-    ];
-  });
+  const files = filePath ? choose(review.files, [filePath]) : review.files;
+  return files.flatMap(file => [
+    ...(file.move?.to ? ['rename ' + file.path + ' → ' + file.move.to] :
+      file.move?.from ? ['rename ' + file.move.from + ' → ' + file.path] : []),
+    '--- ' + (file.before === null ? '/dev/null' : file.path),
+    '+++ ' + (file.after === null ? '/dev/null' : file.path),
+    ...hunks(diffOperations(textLines(file.before), textLines(file.after))),
+    '',
+  ]);
 }
