@@ -1,10 +1,30 @@
+import { realpathSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 
 export const storage = resolve(process.env.XCODE_HOME || join(homedir(), '.xcode'));
 export const sessionsDir = join(storage, 'sessions');
+
+function canonicalStateRoot(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    const parent = dirname(path);
+    return parent === path ? path : join(canonicalStateRoot(parent), basename(path));
+  }
+}
+
+const stateRoots = new Set([storage, canonicalStateRoot(storage)]);
+
+export function isStatePath(path) {
+  for (const root of stateRoots) {
+    const first = relative(root, path).split(sep)[0];
+    if (/^(?:sessions|(?:settings|tokens)\.json(?:\..*)?|settings\.lock(?:\..*)?)$/i.test(first)) return true;
+  }
+  return false;
+}
 
 export async function readJson(path, fallback) {
   try {

@@ -810,3 +810,31 @@ test('native response completes on the SSE event even when the connection remain
     [{ role: 'user', content: 'Test' }], { signal: AbortSignal.timeout(3000) });
   assert.equal(result.content, 'Finished.');
 });
+
+test('custom state inside a project is excluded from browsing, reads and explicit attachments', async t => {
+  const root = await temp(t);
+  const localState = join(root, 'runtime-state');
+  await mkdir(join(localState, 'sessions'), { recursive: true });
+  await writeFile(join(localState, 'tokens.json'), '{"fixture":"test-marker"}');
+  await writeFile(join(localState, 'sessions', 'private.json'), '{"fixture":"test-marker"}');
+  await writeFile(join(root, 'src.txt'), 'test-marker');
+  const workspace = new URL('../src/workspace.mjs', import.meta.url).href;
+  const attachments = new URL('../src/attachments.mjs', import.meta.url).href;
+  const terminal = new URL('../src/terminal.mjs', import.meta.url).href;
+  const script = [
+    'import assert from "node:assert/strict";',
+    'const { Workspace } = await import(' + JSON.stringify(workspace) + ');',
+    'const { attach } = await import(' + JSON.stringify(attachments) + ');',
+    'const { completeReference } = await import(' + JSON.stringify(terminal) + ');',
+    'const root = process.cwd();',
+    'const ws = new Workspace(root);',
+    'assert.deepEqual((await ws.glob({})).paths, ["src.txt"]);',
+    'assert.deepEqual((await ws.search({query:"test-marker"})).matches.map(item=>item.path), ["src.txt"]);',
+    'await assert.rejects(ws.read({path:"runtime-state/tokens.json"}), /excluded/);',
+    'await assert.rejects(attach(root,"runtime-state/tokens.json",{},undefined,{explicit:true}), /excluded/);',
+    'assert.deepEqual(await completeReference(root,root,"@runtime-state/tok"), [[], "@runtime-state/tok"]);',
+  ].join('\n');
+  await exec(process.execPath, ['--input-type=module', '--eval', script], {
+    cwd: root, env: { ...process.env, XCODE_HOME: localState },
+  });
+});

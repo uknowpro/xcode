@@ -1,5 +1,6 @@
 import { readdir, realpath } from 'node:fs/promises';
-import { resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
+import { isStatePath } from './store.mjs';
 import { blocked, within } from './workspace.mjs';
 
 export async function completeReference(root, base, line) {
@@ -10,7 +11,7 @@ export async function completeReference(root, base, line) {
   const directory = input.slice(0, last);
   const stem = input.slice(last);
   const target = resolve(base, directory || '.');
-  if (!within(root, target) || blocked(target.slice(root.length))) return [[], reference];
+  if (!within(root, target) || blocked(target.slice(root.length)) || isStatePath(target)) return [[], reference];
   try {
     if (await realpath(target) !== target) return [[], reference];
     const caseFold = process.platform === 'win32' || process.platform === 'darwin';
@@ -18,7 +19,7 @@ export async function completeReference(root, base, line) {
     const entries = await readdir(target, { withFileTypes: true });
     const matches = entries.filter(entry => {
       const visible = stem.startsWith('.') || !entry.name.startsWith('.');
-      return visible && !blocked(entry.name) && (entry.isDirectory() || entry.isFile()) &&
+      return visible && !blocked(entry.name) && !isStatePath(join(target, entry.name)) && (entry.isDirectory() || entry.isFile()) &&
         comparable(entry.name).startsWith(comparable(stem));
     }).sort((a, b) => a.name.localeCompare(b.name)).slice(0, 60).map(entry => {
       const path = (directory + entry.name).split(sep).join('/') + (entry.isDirectory() ? '/' : '');

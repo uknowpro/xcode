@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, matchesGlob, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
+import { isStatePath } from './store.mjs';
 
 const exec = promisify(execFile);
 const ignored = new Set(['.git', '.xcode', 'node_modules', '.venv', '__pycache__', 'vendor', 'dist', 'build', 'coverage']);
@@ -21,9 +22,9 @@ export async function verifiedFile(root, path, signal) {
   signal?.throwIfAborted();
   if (typeof path !== 'string' || !path || path.includes('\0')) throw new Error('A file path is required.');
   const target = resolve(root, path);
-  if (!within(root, target) || blocked(relative(root, target))) throw new Error('Path is outside the workspace or excluded.');
+  if (!within(root, target) || blocked(relative(root, target)) || isStatePath(target)) throw new Error('Path is outside the workspace or excluded.');
   const resolved = await realpath(target);
-  if (resolved !== target || !within(root, resolved) || blocked(relative(root, resolved)))
+  if (resolved !== target || !within(root, resolved) || blocked(relative(root, resolved)) || isStatePath(resolved))
     throw new Error('Symbolic links and paths outside the workspace are excluded.');
   const info = await lstat(resolved);
   if (!info.isFile()) throw new Error('Select a regular file.');
@@ -127,6 +128,7 @@ async function walk(root, signal) {
       if (++visits > 25000) break;
       if (entry.name.startsWith('.') || blocked(entry.name) || entry.isSymbolicLink()) continue;
       const path = join(dir, entry.name);
+      if (isStatePath(path)) continue;
       let skip = false;
       for (const { dir: base, rule } of rules) {
         const negated = rule.startsWith('!');
@@ -150,7 +152,7 @@ async function inventory(root, signal) {
     const { stdout } = await exec('rg', ['--files', '--null', '--no-config', '--no-messages', '--no-require-git'], {
       cwd: root, signal, maxBuffer: 4 * 1024 * 1024,
     });
-    const paths = stdout.split('\0').filter(Boolean).map(slash).filter(path => !blocked(path)).sort();
+    const paths = stdout.split('\0').filter(Boolean).map(slash).filter(path => !blocked(path) && !isStatePath(resolve(root, path))).sort();
     return { files: paths.slice(0, 25000), truncated: paths.length > 25000 };
   } catch (error) {
     signal?.throwIfAborted();
@@ -217,7 +219,7 @@ export class Workspace {
   scope(path = '.') {
     if (typeof path !== 'string' || path.includes('\0')) throw new Error('Invalid directory.');
     const scope = resolve(this.root, path);
-    if (!within(this.root, scope) || blocked(relative(this.root, scope))) throw new Error('Scope is outside the workspace or excluded.');
+    if (!within(this.root, scope) || blocked(relative(this.root, scope)) || isStatePath(scope)) throw new Error('Scope is outside the workspace or excluded.');
     return scope;
   }
 

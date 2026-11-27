@@ -2,6 +2,7 @@ import { execFile } from 'node:child_process';
 import { lstat, realpath } from 'node:fs/promises';
 import { basename, extname, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { isStatePath } from './store.mjs';
 import { blocked, decodeText, loadBytes, verifiedFile } from './workspace.mjs';
 
 const exec = promisify(execFile);
@@ -32,7 +33,7 @@ export async function attach(root, input, profile, signal, { explicit = false, b
   if (explicit) {
     const absolute = resolve(base, input);
     path = await realpath(absolute);
-    if (blocked(absolute) || blocked(path) || !(await lstat(path)).isFile()) throw new Error('File excluded or unsupported.');
+    if (blocked(absolute) || blocked(path) || isStatePath(absolute) || isStatePath(path) || !(await lstat(path)).isFile()) throw new Error('File excluded or unsupported.');
   } else {
     ({ path } = await verifiedFile(root, resolve(base, input), signal));
   }
