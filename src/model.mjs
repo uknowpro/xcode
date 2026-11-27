@@ -8,6 +8,12 @@ export function completionUrl(input) {
   return modelEndpoint({ endpoint: input }, { protocol: 'chat-completions' }).href;
 }
 
+function identityFragment(previous, next) {
+  if (!next || next === previous) return previous;
+  if (previous && next.startsWith(previous)) return next;
+  return previous + next;
+}
+
 function applyChoice(result, part, onText) {
   if (part.error) {
     const error = part.error;
@@ -28,8 +34,8 @@ function applyChoice(result, part, onText) {
     const index = call.index ?? result.tool_calls.size;
     if (!Number.isInteger(index) || index < 0 || index >= 64) throw new ModelError('Invalid model tool index.');
     const existing = result.tool_calls.get(index) ?? { id: '', type: 'function', function: { name: '', arguments: '' } };
-    if (call.id) existing.id += call.id;
-    if (call.function?.name) existing.function.name += call.function.name;
+    existing.id = identityFragment(existing.id, call.id);
+    existing.function.name = identityFragment(existing.function.name, call.function?.name);
     if (call.function?.arguments) existing.function.arguments += call.function.arguments;
     if (call.extra_content) existing.extra_content = call.extra_content;
     result.tool_calls.set(index, existing);

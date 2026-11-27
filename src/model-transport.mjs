@@ -78,13 +78,20 @@ export async function fetchModel(url, headers, payload, signal) {
 }
 
 export async function readJsonResponse(response, signal) {
+  let data;
   try {
-    return JSON.parse(await responseText(response, maxResponse));
+    data = await responseText(response, maxResponse);
   } catch (error) {
     if (error instanceof ModelError) throw error;
-    signal?.throwIfAborted();
-    throw new ModelError('Expected a JSON or SSE model response.');
+    throw networkError(error, signal);
   }
+  try {
+    const value = JSON.parse(data);
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+  } catch {
+    // A non-JSON proxy response also uses this diagnostic.
+  }
+  throw new ModelError('Expected a JSON or SSE model response.');
 }
 
 export async function* readEvents(body, signal) {
@@ -99,19 +106,23 @@ export async function* readEvents(body, signal) {
       received += value?.byteLength ?? 0;
       if (received > maxResponse) throw new ModelError('Model stream exceeds the size limit.');
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-      const events = buffer.split(/\r?\n\r?\n/);
-      buffer = events.pop();
+      const trailingCr = !done && buffer.endsWith('\r');
+      const events = (trailingCr ? buffer.slice(0, -1) : buffer).replace(/\r\n?/g, '\n').split('\n\n');
+      buffer = events.pop() + (trailingCr ? '\r' : '');
       if (buffer.length > 1024 * 1024) throw new ModelError('Model stream event exceeds the size limit.');
       if (done && buffer.trim()) events.push(buffer);
       for (const event of events) {
         if (event.length > 1024 * 1024) throw new ModelError('Model stream event exceeds the size limit.');
-        const data = event.split(/\r?\n/).filter(line => line.startsWith('data:'))
-          .map(line => line.slice(5).replace(/^ /, '')).join('\n');
+        const lines = event.split('\n');
+        const data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
         if (!data.trim()) continue;
         if (data.trim() === '[DONE]') { yield null; return; }
         let part;
         try { part = JSON.parse(data); }
         catch { throw new ModelError('Invalid data from the model stream.'); }
+        if (!part || typeof part !== 'object' || Array.isArray(part)) throw new ModelError('Invalid model stream event.');
+        const eventType = lines.find(line => line.startsWith('event:'))?.slice(6).trim();
+        if (eventType && eventType !== 'message' && !part.type) part.type = eventType;
         yield part;
       }
       if (done) return;

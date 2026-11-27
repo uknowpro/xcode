@@ -784,3 +784,29 @@ test('malformed local configuration produces an actionable error and is left int
     assert.equal(await readFile(path, 'utf8'), contents);
   }
 });
+
+test('stream accepts split CRLF and CR records without duplicating repeated function IDs', async t => {
+  const api = await server(t, (_request, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    const part = (args, finish) => JSON.stringify({ choices: [{ delta: {
+      tool_calls: [{ index: 0, id: 'fixture-call', function: { name: 'fixture', arguments: args } }],
+    }, finish_reason: finish }] });
+    res.write('data: ' + part('{"a":') + '\r');
+    res.end('\n\r\ndata: ' + part('1}', 'tool_calls') + '\r\r');
+  });
+  const profile = { endpoint: api.url, model: 'fixture' };
+  const reply = await complete(profile, '', [{ role: 'user', content: 'Test' }]);
+  assert.deepEqual(reply.tool_calls[0], { id: 'fixture-call', type: 'function', function: { name: 'fixture', arguments: '{"a":1}' } });
+});
+
+test('native response completes on the SSE event even when the connection remains open', async t => {
+  const api = await server(t, (_request, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.write('event: response.completed\ndata: ' + JSON.stringify({ response: {
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'Finished.' }] }],
+    } }) + '\n\n');
+  });
+  const result = await complete({ endpoint: api.url + '/v1/responses', model: 'fixture' }, '',
+    [{ role: 'user', content: 'Test' }], { signal: AbortSignal.timeout(3000) });
+  assert.equal(result.content, 'Finished.');
+});

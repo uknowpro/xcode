@@ -153,7 +153,10 @@ async function responsesBody(events, onText) {
   for await (const part of events) {
     if (!part) break;
     if (part.type === 'response.output_text.delta') onText(part.delta);
-    if (part.type === 'response.completed') final = part.response;
+    if (part.type === 'response.completed') {
+      final = part.response;
+      break;
+    }
     if (part.type === 'response.incomplete') throw formatError('The Responses API ended before completing the turn.');
     if (part.type === 'response.failed' || part.type === 'error') throw failed(0, JSON.stringify(part.response?.error ?? part));
   }
@@ -191,7 +194,10 @@ async function anthropicBody(events, onText) {
       catch { throw formatError('The Claude stream returned malformed tool arguments.'); }
     } else if (part.type === 'message_delta') stop_reason = part.delta?.stop_reason ?? stop_reason;
     else if (part.type === 'error') throw failed(0, JSON.stringify(part.error ?? part));
-    else if (part.type === 'message_stop') stopped = true;
+    else if (part.type === 'message_stop') {
+      stopped = true;
+      break;
+    }
   }
   if (!stopped) throw new ModelError('The Claude stream ended early.', { retryable: true });
   return { content, stop_reason };
@@ -209,6 +215,7 @@ async function geminiBody(events, onText) {
       parts.push(part);
       if (!part.thought && part.text) onText(part.text);
     }
+    if (finishReason) break;
   }
   if (!finishReason) throw new ModelError('The Gemini stream ended early.', { retryable: true });
   return { candidates: [{ content: { parts }, finishReason }] };
