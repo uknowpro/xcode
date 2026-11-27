@@ -69,7 +69,7 @@ const help = [
 ].join('\n');
 
 const chatHelp = [
-  '/new, /sessions, /resume <id>   Start, view or switch sessions',
+  '/new, /sessions, /resume <id>   Start, browse with arrow keys, or resume sessions',
   '/model [name]                  View or select a model profile',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
@@ -295,17 +295,23 @@ function sessionStatus(session, live) {
   return 'idle';
 }
 
+async function sessionRows(manager) {
+  let unreadable = 0;
+  const entries = await manager.list(() => { unreadable++; });
+  const rows = entries.map(entry => {
+    const live = manager.open.get(entry.id);
+    const session = live?.session ?? entry;
+    return { id: session.id, text: session.id.slice(0, 8) + ' · ' + sessionStatus(session, live) + ' · ' +
+      (session.queue.length ? session.queue.length + ' pending · ' : '') + session.title };
+  });
+  return { rows, unreadable };
+}
+
 async function describeSessions(manager, selected) {
-  const unreadable = [];
-  const sessions = await manager.list(file => unreadable.push(file));
-  if (unreadable.length) info(unreadable.length + ' unreadable saved session file(s). Existing files were preserved.');
-  if (!sessions.length) print('No sessions for this project.');
-  for (const session of sessions) {
-    const live = manager.open.get(session.id);
-    const row = live?.session ?? session;
-    print((selected === row.id ? '* ' : '  ') + row.id.slice(0, 8) + ' · ' + sessionStatus(row, live) + ' · ' +
-      (row.queue.length ? row.queue.length + ' pending · ' : '') + row.title);
-  }
+  const { rows, unreadable } = await sessionRows(manager);
+  if (unreadable) info(unreadable + ' unreadable saved session file(s). Existing files were preserved.');
+  if (!rows.length) print('No sessions for this project.');
+  for (const row of rows) print((selected === row.id ? '* ' : '  ') + row.text);
 }
 
 function checkList(checks) {
@@ -527,7 +533,24 @@ async function chat(root, base, defaults, options, prefix) {
     print(text);
     prompt();
   }
+  function drawSessions() {
+    const rowCount = Math.max(4, (stdout.rows || 24) - 5);
+    const width = Math.max(16, (stdout.columns || 80) - 1);
+    pager.offset = Math.max(0, Math.min(pager.offset, pager.focus));
+    if (pager.focus >= pager.offset + rowCount) pager.offset = pager.focus - rowCount + 1;
+    cursorTo(stdout, 0, 0);
+    clearScreenDown(stdout);
+    print('Sessions · ' + pager.rows.length + (pager.unreadable ? ' · ' + pager.unreadable + ' unreadable' : ''));
+    for (const [index, row] of pager.rows.slice(pager.offset, pager.offset + rowCount).entries()) {
+      const pointer = index + pager.offset === pager.focus ? '› ' : '  ';
+      const line = pointer + (row.id === selected.session.id ? '* ' : '  ') + row.text;
+      print(line.length > width ? line.slice(0, width - 1) + '…' : line);
+    }
+    print('↑/↓ Select session · Enter Switch · Esc Close');
+  }
+
   function drawReview(move = 0) {
+    if (pager.kind === 'sessions') return drawSessions();
     const rows = Math.max(6, (stdout.rows || 24) - 4);
     const { review, mode, picked } = pager;
     const lines = mode === 'files' ? review.files.map((file, index) =>
@@ -568,6 +591,23 @@ async function chat(root, base, defaults, options, prefix) {
     if (key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c')) {
       clearInput();
       closeReview();
+      return;
+    }
+    if (pager.kind === 'sessions') {
+      if (key.name === 'return' || key.name === 'enter') {
+        const id = pager.rows[pager.focus]?.id;
+        closeReview();
+        if (id) chain = chain.then(async () => {
+          try { await select(id); banner(); }
+          catch (error) { show(error.message); }
+        });
+      } else {
+        const move = pageKey(key.name, Math.max(4, (stdout.rows || 24) - 5), pager.rows.length);
+        if (move !== undefined) {
+          pager.focus = Math.max(0, Math.min(pager.rows.length - 1, pager.focus + move));
+          drawSessions();
+        }
+      }
       return;
     }
     if (key.name === 'tab') {
@@ -625,6 +665,10 @@ async function chat(root, base, defaults, options, prefix) {
       return;
     }
     if (event.type === 'text') {
+      if (pager) {
+        pager.responseHidden = true;
+        return;
+      }
       clearPrompt();
       stdout.write(clean(event.text));
       streamOpen = true;
@@ -641,6 +685,7 @@ async function chat(root, base, defaults, options, prefix) {
       show(event.error?.message ?? event.text);
     } else if (event.type === 'complete') {
       endStream();
+      if (pager?.responseHidden) show('Response ready · /history to view.');
     }
     setImmediate(prompt);
   });
@@ -797,7 +842,19 @@ async function chat(root, base, defaults, options, prefix) {
       case '/resume':
         if (!arg) throw new Error('Use /resume <id|latest>.');
         await select(arg); banner(); break;
-      case '/sessions': await describeSessions(sessions, session.id); break;
+      case '/sessions': {
+        if (arg === 'list' || process.env.TERM === 'dumb') {
+          await describeSessions(sessions, session.id);
+          break;
+        }
+        const { rows, unreadable } = await sessionRows(sessions);
+        if (!rows.length) { show('No sessions for this project.'); break; }
+        endStream();
+        pager = { kind: 'sessions', rows, unreadable, focus: Math.max(0, rows.findIndex(row => row.id === session.id)), offset: 0 };
+        stdout.write('\x1b[?1049h');
+        drawSessions();
+        break;
+      }
       case '/queue':
         show(session.queue.length ? session.queue.map((item, index) =>
           (index + 1) + ' · ' + (index === 0 && selected.active ? '[running] ' : '') + item.prompt.slice(0, 100)).join('\n') : 'Queue is empty.');

@@ -137,6 +137,12 @@ def smoke(scratch, endpoint):
         resumed.send(b"/undo\r")
         resumed.expect(b"Undid change")
         assert not (root / "chosen.txt").exists()
+        resumed.send(b"/new\r")
+        resumed.expect(b"New session")
+        resumed.send(b"/sessions\r")
+        resumed.expect(b"Enter Switch")
+        resumed.send(b"\x1b[B\r")
+        resumed.expect(b"xcode \xc2\xb7 read this file")
         resumed.send(b"/exit\r")
         assert resumed.process.wait(timeout=5) == 0
     finally:
