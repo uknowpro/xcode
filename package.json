@@ -1,6 +1,6 @@
 {
   "name": "@uknowpro/xcode",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "A terminal coding assistant for your own model endpoint",
   "type": "module",
   "bin": { "xcode": "./src/cli.mjs" },

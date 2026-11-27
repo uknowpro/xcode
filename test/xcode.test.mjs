@@ -765,6 +765,34 @@ test('a failed test prompts a reviewed repair and only then repeats the original
   assert.deepEqual(checks.map(check => [check.status, Boolean(check.automatic)]), [['failed', false], ['passed', true]]);
 });
 
+test('failed verification is visible in sessions and scripts can read check JSON with its exit code', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return tool(res, 'run_check', '{"name":"unit"}');
+    assert.equal(JSON.parse(body.messages.at(-1).content).status, 'failed');
+    return reply(res, 'The unit check failed.');
+  });
+  const { work, cli } = await profile(t, api);
+  await writeFile(join(work, 'verify.json'), JSON.stringify({
+    stages: [{ name: 'Verify', instruction: 'Run the unit check.', tools: ['run_check'] }],
+  }));
+  await cli('harness', 'import', 'verify', 'verify.json');
+  const script = 'console.log("unit output"); console.error("unit error"); process.exit(7);';
+  await cli('check', 'add', 'unit', '--', 'node', '-e', script);
+  await assert.rejects(cli('check', 'run', 'unit', '--json'), error => {
+    const result = JSON.parse(error.stdout);
+    assert.equal(error.code, 7);
+    assert.equal(error.stderr, '');
+    assert.equal(result.status, 'failed');
+    assert.equal(result.exitCode, 7);
+    assert.match(result.stdout, /unit output/);
+    assert.match(result.stderr, /unit error/);
+    return true;
+  });
+  await assert.rejects(cli('ask', 'Verify the project', '--harness', 'verify', '--checks'), error =>
+    error.code === 4 && /The unit check failed/.test(error.stdout) && /Verification failed · unit/.test(error.stderr));
+  assert.match((await cli('sessions')).stdout, /check failed · Verify the project/);
+});
+
 test('repair verification skips rejected fixes and changed commands', async () => {
   const { recheck, scheduleRepair } = await import('../src/repair.mjs');
   const stage = { name: 'Verify', repairAttempts: 2 };

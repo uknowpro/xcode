@@ -161,7 +161,7 @@ function summarizeSession(session) {
     id: session.id, root: session.root, title: session.title, updated: session.updated,
     pendingCount: session.queue.length,
     queue: pending ? [{ review: pending.review ? { state: pending.review.state } : null, failure: Boolean(pending.failure) }] : [],
-    turns: last ? [{ status: last.status }] : [],
+    turns: last ? [{ status: last.status, verificationFailed: Boolean(last.verificationFailed) }] : [],
     undoInProgress: Boolean(session.undoInProgress),
   };
 }

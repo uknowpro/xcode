@@ -8,7 +8,7 @@ A terminal coding assistant for your local project. Connect an OpenAI-compatible
 
 Requires Node.js 22.5 or later on Linux, macOS, or Windows. Download the .tgz from [GitHub Releases](https://github.com/uknowpro/xcode/releases), then run
 
-    npm install -g ./uknowpro-xcode-0.1.5.tgz
+    npm install -g ./uknowpro-xcode-0.1.6.tgz
     xcode setup
     xcode profile test
 
@@ -21,7 +21,7 @@ Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS 
     cd my-project
     xcode
     xcode ask "Where is the retry policy configured?"
-    xcode sessions
+    xcode sessions "retry policy"
 
 xcode searches the current worktree and returns paths and line numbers. Tool calling must be supported by the model endpoint. Type @ and press Tab to complete a file path. Use /paste followed by /send for multi-line input.
 
@@ -33,7 +33,7 @@ To propose edits and run project verification, use
 
 1. Describe the change. xcode can propose edits, new files, moves, or deletions.
 2. Open /diff and scroll using the arrow or page keys. Close with Esc. Use /apply for the full proposal, /apply path1 path2 to accept selected paths and decline the rest, or /reject to decline everything. Either path of a move selects both.
-3. The verify stage can run a linked check and show its exit code. /check unit runs it manually.
+3. The verify stage can run a linked check and show its exit code. /check unit runs it manually. Use xcode check run unit --json in scripts. xcode ask and xcode continue exit with code 4 when the latest result of a check is a failure.
 4. Use /changes and /undo <id> to inspect or reverse changes applied with version 0.1.2 or later. Undo stops if a file was changed after approval.
 
 Read-only mode is the default. /write on allows proposals, and /checks on allows a compatible harness to run only registered commands for the current project. For one-off requests, use xcode review show, xcode review apply, and xcode continue after xcode ask pauses for review.
@@ -59,7 +59,7 @@ Use xcode profile show to see the detected adapter, protocol and effective setti
 Standard DeepSeek Flash, Qwen, and Kimi model IDs are detected automatically. The basic setup uses the server's thinking defaults. For an endpoint that supports these settings, use
 
     xcode profile tune deepseek --thinking on --effort high
-    xcode profile tune deepseek --context-window 65536 --max-tokens 8192
+    xcode profile tune deepseek --context-window 65536 --max-tokens 8192 --request-timeout 120
 
 Use --adapter deepseek-flash for a custom model alias, or --adapter compatible for generic Chat Completions. The tool probe checks that the endpoint accepts a follow-up after a tool result. On DeepSeek profiles, recent model-returned reasoning and tool state are saved with sessions locally for replay to the same model endpoint. Older turns are summarized as the replay budget fills.
 

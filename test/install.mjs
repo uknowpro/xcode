@@ -17,7 +17,7 @@ const workspace = join(scratch, 'workspace');
 const env = { ...process.env, npm_config_cache: join(scratch, 'cache'), XCODE_HOME: state };
 delete env.XCODE_API_TOKEN;
 // Verify installation over the preceding main version.
-const baselineCommit = '407dfa9f1ffc5a1a8d70c049d161e8f051af2917';
+const baselineCommit = 'eeb2b62e7b08465efd3220a51238399e8aa5d9e0';
 let worktreeAdded = false;
 let endpoint;
 

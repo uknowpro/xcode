@@ -7,6 +7,7 @@ import { Workspace } from './workspace.mjs';
 import { refreshMemory } from './memory.mjs';
 import { attachmentSize, maxAttachmentBytes, maxAttachments } from './attachments.mjs';
 import { completedWire, pruneWire } from './wire-history.mjs';
+import { latestChecks } from './repair.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -118,9 +119,10 @@ export class Sessions {
       delete job.failure;
       const answer = await runJob({ session, job, config, profile, token, signal,
         emit: event => this.notify(live, event), save: () => this.persist(live) });
-      await this.finish(live, job, answer, 'complete');
-      this.notify(live, { type: 'complete', answer });
-      return { answer };
+      const failedChecks = latestChecks(job.checks).filter(check => check.status !== 'passed').map(check => check.name);
+      await this.finish(live, job, answer, 'complete', failedChecks);
+      this.notify(live, { type: 'complete', answer, failedChecks });
+      return { answer, failedChecks };
     } catch (error) {
       if (error instanceof ReviewRequired || (job.review && !active.advance)) {
         live.held = true;
@@ -140,12 +142,13 @@ export class Sessions {
     }
   }
 
-  async finish(live, job, answer, status) {
+  async finish(live, job, answer, status, failedChecks = []) {
     const queue = live.session.queue;
     const turns = live.session.turns;
     const item = {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
       checks: job.checks ?? [], attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
+      ...(failedChecks.length ? { verificationFailed: true } : {}),
       ...(status === 'complete' && job.wire ? { wire: completedWire(job) } : {}),
     };
     const previousMemory = live.session.memory;

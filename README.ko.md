@@ -8,7 +8,7 @@
 
 Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Releases](https://github.com/uknowpro/xcode/releases)에서 .tgz를 내려받아 실행하세요.
 
-    npm install -g ./uknowpro-xcode-0.1.5.tgz
+    npm install -g ./uknowpro-xcode-0.1.6.tgz
     xcode setup
     xcode profile test
 
@@ -21,7 +21,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
     cd my-project
     xcode
     xcode ask "재시도 정책은 어디에 있나요?"
-    xcode sessions
+    xcode sessions "재시도 정책"
 
 함수 호출을 지원하는 모델의 경우, xcode가 현재 작업 트리를 검색해 경로와 줄 번호를 알려줍니다. @를 입력하고 Tab을 누르면 경로가 자동완성됩니다. 여러 줄 입력은 /paste로 시작하고 /send로 보냅니다.
 
@@ -33,7 +33,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
 
 1. 변경 요청을 입력하면 파일 수정·생성·이동·삭제안을 준비합니다.
 2. /diff에서 검토합니다. /apply는 전체 적용, /apply 경로1 경로2는 선택한 파일만 적용, /reject는 전체 거절입니다. 이동은 원래 경로와 새 경로를 함께 적용합니다.
-3. 적용 후 검증 단계에서 연결한 테스트와 종료 코드를 확인합니다. /check unit으로 직접 실행할 수도 있습니다.
+3. 적용 후 검증 단계에서 연결한 테스트와 종료 코드를 확인합니다. /check unit으로 직접 실행할 수 있고, 스크립트에서는 xcode check run unit --json으로 결과를 읽을 수 있습니다. 마지막 검사 결과에 실패가 남아 있으면 xcode ask와 xcode continue는 종료 코드 4를 반환합니다.
 4. /changes에서 이력을 확인하고 /undo <ID>로 0.1.2부터 적용한 변경을 되돌립니다. 적용 이후의 수정이 감지되면 충돌을 표시합니다.
 
 기본은 읽기 전용입니다. 세션에서 /write on은 변경안 작성을, /checks on은 해당 프로젝트에 직접 등록한 명령의 실행을 허용합니다. xcode ask가 검토에서 멈추면 xcode review show, xcode review apply, xcode continue로 이어갈 수 있습니다.
@@ -59,7 +59,7 @@ xcode profile show에서 감지된 어댑터와 프로토콜, 적용 중인 설�
 표준 DeepSeek Flash, Qwen, Kimi 모델 ID는 자동 감지되고, 처음에는 서버의 기본 추론 설정을 사용합니다. 서버가 지원하면 다음과 같이 지정할 수 있습니다.
 
     xcode profile tune deepseek --thinking on --effort high
-    xcode profile tune deepseek --context-window 65536 --max-tokens 8192
+    xcode profile tune deepseek --context-window 65536 --max-tokens 8192 --request-timeout 120
 
 사용자 지정 모델 별칭은 --adapter deepseek-flash로 지정하고, 일반 Chat Completions 호환 모드는 --adapter compatible로 선택합니다. 도구 진단은 도구 결과를 보낸 뒤에도 대화가 이어지는지 확인합니다. 최근 추론 데이터와 도구 기록은 같은 모델 주소에 이어 보내기 위해 세션과 함께 로컬에 저장합니다. 재전송 범위를 넘은 이전 대화는 요약해 사용합니다.
 

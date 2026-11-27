@@ -45,7 +45,7 @@ const help = [
   '  xcode setup [name]             Save API URL, model ID and token',
   '  xcode                          Start interactive chat',
   '  xcode ask "prompt"             Run a single prompt, or pipe text to xcode ask',
-  '  xcode sessions                 List sessions for this project',
+  '  xcode sessions [search]        List or filter sessions for this project',
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode continue [id|latest]    Run the pending message once',
   '  xcode profile list|show|use|set|tune|test|eval [name]',
@@ -54,7 +54,8 @@ const help = [
   '  xcode harness list|show|import [name] [file]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
-  '  xcode check list|run|remove [name]',
+  '  xcode check list|remove [name]',
+  '  xcode check run <name> [--json]',
   '  xcode review show|apply|reject [session] [paths...]',
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] Undo a change if its files still match',
@@ -299,7 +300,9 @@ function sessionStatus(session, live) {
   if (pending?.review) return 'review needed';
   if (pending?.failure) return 'failed';
   if (pending) return 'paused';
-  if (session.turns.at(-1)?.status === 'complete') return 'complete';
+  const last = session.turns.at(-1);
+  if (last?.verificationFailed) return 'check failed';
+  if (last?.status === 'complete') return 'complete';
   return 'idle';
 }
 
@@ -342,10 +345,15 @@ async function checkCommand(root, action, name, argv, options) {
     const abort = () => controller.abort();
     process.once('SIGINT', abort);
     try {
-      const result = await runCheck(root, projectChecks(await settings(), root), name, controller.signal);
-      if (result.stdout) print(result.stdout.trimEnd());
-      if (result.stderr) info(result.stderr.trimEnd());
-      info(checkSummary(result));
+      const config = await settings();
+      const token = await tokenFor(config.defaultProfile ?? 'default').catch(() => undefined);
+      const result = await runCheck(root, projectChecks(config, root), name, controller.signal, { secrets: [token] });
+      if (options.json) print(JSON.stringify(result, null, 2));
+      else {
+        if (result.stdout) print(result.stdout.trimEnd());
+        if (result.stderr) info(result.stderr.trimEnd());
+        info(checkSummary(result));
+      }
       process.exitCode = result.exitCode === 0 && result.status === 'passed' ? 0 : result.exitCode || 1;
     } finally {
       process.off('SIGINT', abort);
@@ -479,6 +487,9 @@ async function oneMessage(sessions, live, start) {
       const id = live.session.id.slice(0, 8);
       info('Change set awaiting approval. Run xcode review show ' + id + ' or xcode resume ' + id + '.');
       process.exitCode = 3;
+    } else if (result?.failedChecks?.length) {
+      info('Verification failed · ' + result.failedChecks.join(', '));
+      process.exitCode = 4;
     }
   } finally {
     process.off('SIGINT', interrupt);
@@ -710,6 +721,7 @@ async function chat(root, base, defaults, options, prefix) {
     } else if (event.type === 'complete') {
       endStream();
       if (pager?.responseHidden) show('Response ready · /history to view.');
+      if (event.failedChecks.length) show('Verification failed · ' + event.failedChecks.join(', '));
     }
     setImmediate(prompt);
   });
