@@ -700,6 +700,7 @@ test('Qwen and Kimi presets keep base profiles compatible and opt into model-spe
 
 test('profile eval measures search, checkpoint replay, local tests and citation in an isolated fixture', async t => {
   const api = await server(t, (body, res, request) => {
+    request = (request - 1) % 4 + 1;
     if (request === 1) return tool(res, 'grep', '{"query":"invoiceLimit"}');
     if (request === 2) {
       assert.match(body.messages.at(-1).content, /invoice\.mjs/);
@@ -712,6 +713,10 @@ test('profile eval measures search, checkpoint replay, local tests and citation 
   const { cli } = await profile(t, api);
   const result = await cli('profile', 'eval', 'work');
   for (const phase of ['search', 'read', 'resume', 'check', 'citation']) assert.match(result.stdout, new RegExp(phase + ' · PASS'));
+  const machine = JSON.parse((await cli('profile', 'eval', 'work', '--json')).stdout);
+  assert.equal(machine[0].phases.resume, true);
+  assert.equal(machine[0].metrics.toolCalls, 3);
+  assert.match(result.stdout, /3 tool calls · checks \d+ms/);
   await cli('profile', 'set', 'different', '--endpoint', api.url, '--model', 'different');
   await assert.rejects(cli('profile', 'eval', 'work', '--against', 'different'), /same model and endpoint/);
 });
@@ -900,4 +905,36 @@ test('replay drops old blocks before current tool history and retains the same s
   assert.equal(resumed.history.length, 0);
   assert.deepEqual(resumed.input, next.input);
   assert.equal(resumed.originalPrompt, job.prompt);
+});
+
+test('profile diagnostics emit a parseable report in JSON mode and preserve failure status', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'OK'));
+  const { cli } = await profile(t, api);
+  const chat = await cli('profile', 'test', 'work', '--only', 'chat', '--json');
+  assert.equal(JSON.parse(chat.stdout).results[0].status, 'pass');
+  await assert.rejects(cli('profile', 'test', 'work', '--only', 'sse', '--json'), error => {
+    const report = JSON.parse(error.stdout);
+    return error.code === 1 && report.profile === 'work' && report.results[0].status === 'fail' &&
+      report.results[0].name === 'sse';
+  });
+});
+
+test('listing many sessions retains only status summaries while reopening loads the original data', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Retained prior content.'));
+  const { work, state, cli } = await profile(t, api);
+  await cli('ask', 'Session summary title');
+  const module = new URL('../src/session.mjs', import.meta.url).href;
+  const program = [
+    'import assert from "node:assert/strict";',
+    'const { Sessions } = await import(' + JSON.stringify(module) + ');',
+    'const sessions = new Sessions(process.cwd());',
+    'const [row] = await sessions.list();',
+    'assert.equal(row.turns[0].status,"complete");',
+    'assert.equal(row.turns[0].answer,undefined);',
+    'try { assert.equal((await sessions.select(row.id,{})).session.turns[0].answer, "Retained prior content."); }',
+    'finally { await sessions.close(); }',
+  ].join('\n');
+  await exec(process.execPath, ['--input-type=module', '--eval', program], {
+    cwd: work, env: { ...process.env, XCODE_HOME: state },
+  });
 });

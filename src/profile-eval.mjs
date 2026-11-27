@@ -52,6 +52,10 @@ export async function evaluateProfile(profile, token, { timeout = 120000 } = {})
   results.citation = /invoice\.mjs:3\b/.test(answer);
   return {
     ...results, checkpoint, durationMs: Math.round(performance.now() - start),
+    metrics: {
+      toolCalls: job.tools.length,
+      checkMs: (job.checks ?? []).reduce((sum, check) => sum + check.durationMs, 0),
+    },
     ...(error ? { error } : {}),
   };
 }

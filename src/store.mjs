@@ -159,7 +159,16 @@ export async function listSessions(root, onProblem = () => {}) {
   for (const file of files.filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
     try {
       const session = await readSession(file.slice(0, -5));
-      if (session?.root === root) sessions.push(session);
+      if (session?.root !== root) continue;
+      const pending = session.queue[0];
+      const last = session.turns.at(-1);
+      sessions.push({
+        id: session.id, root: session.root, title: session.title, updated: session.updated,
+        pendingCount: session.queue.length,
+        queue: pending ? [{ review: pending.review ? { state: pending.review.state } : null, failure: Boolean(pending.failure) }] : [],
+        turns: last ? [{ status: last.status }] : [],
+        undoInProgress: Boolean(session.undoInProgress),
+      });
     } catch (error) {
       onProblem(file, error);
     }

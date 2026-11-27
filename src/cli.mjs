@@ -50,7 +50,7 @@ const help = [
   '  xcode continue [id|latest]    Run the pending message once',
   '  xcode profile list|show|use|set|tune|test|eval [name]',
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
-  '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>]',
+  '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>] [--json]',
   '  xcode harness list|show|import [name] [file]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
@@ -192,22 +192,29 @@ async function profileCommand(action, name, options) {
       throw new Error('Compare settings for the same model and endpoint.');
     const timeout = options.timeout === undefined ? 120 : Number(options.timeout);
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 600) throw new Error('Evaluation timeout must be 1–600 seconds.');
+    const reports = [];
     for (const [entry, value] of [[name, profile], ...(comparison ? [[options.against, comparison]] : [])]) {
-      const { error, durationMs, checkpoint, ...phases } = await evaluateProfile(value, await tokenFor(entry), { timeout: timeout * 1000 });
-      print(entry + ' · ' + (durationMs / 1000).toFixed(2) + 's');
-      for (const [phase, passed] of Object.entries(phases)) print('  ' + phase + ' · ' + (passed ? 'PASS' : 'FAIL'));
-      if (error) info(error);
-      else if (!checkpoint) info('The model did not use tools, so there was no checkpoint to resume.');
+      const { error, durationMs, checkpoint, metrics, ...phases } = await evaluateProfile(value, await tokenFor(entry), { timeout: timeout * 1000 });
+      reports.push({ profile: entry, durationMs, phases, checkpoint, metrics, ...(error ? { error } : {}) });
+      if (!options.json) {
+        print(entry + ' · ' + (durationMs / 1000).toFixed(2) + 's');
+        for (const [phase, passed] of Object.entries(phases)) print('  ' + phase + ' · ' + (passed ? 'PASS' : 'FAIL'));
+        print('  ' + metrics.toolCalls + ' tool calls · checks ' + metrics.checkMs + 'ms');
+        if (error) info(error);
+        else if (!checkpoint) info('The model did not use tools, so there was no checkpoint to resume.');
+      }
       if (error || Object.values(phases).includes(false)) process.exitCode = 1;
     }
+    if (options.json) print(JSON.stringify(reports, null, 2));
   } else if (action === 'test') {
     const timeout = options.timeout === undefined
       ? (modelPolicy(profile).adapter === 'deepseek-flash' ? 60 : 15) : Number(options.timeout);
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 600) throw new Error('Probe timeout must be 1–600 seconds.');
     const results = await diagnose(profile, await tokenFor(name), {
       only: options.only, timeout: timeout * 1000,
-      onResult: item => print(item.name.toUpperCase() + ' ' + item.status.toUpperCase() + ' · ' + item.detail),
+      onResult: options.json ? undefined : item => print(item.name.toUpperCase() + ' ' + item.status.toUpperCase() + ' · ' + item.detail),
     });
+    if (options.json) print(JSON.stringify({ profile: name, results }, null, 2));
     if (results.some(item => item.status === 'fail')) process.exitCode = 1;
   } else {
     throw new Error('Use profile list, show, set, tune, use, test or eval.');
@@ -301,8 +308,9 @@ async function sessionRows(manager) {
   const rows = entries.map(entry => {
     const live = manager.open.get(entry.id);
     const session = live?.session ?? entry;
+    const pending = session.pendingCount ?? session.queue.length;
     return { id: session.id, text: session.id.slice(0, 8) + ' · ' + sessionStatus(session, live) + ' · ' +
-      (session.queue.length ? session.queue.length + ' pending · ' : '') + session.title };
+      (pending ? pending + ' pending · ' : '') + session.title };
   });
   return { rows, unreadable };
 }
@@ -988,7 +996,7 @@ async function main() {
       cwd: { type: 'string' }, profile: { type: 'string' }, harness: { type: 'string' },
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
-      'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' },
+      'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
       'context-window': { type: 'string' }, 'max-tokens': { type: 'string' },
