@@ -159,7 +159,7 @@ function summarizeSession(session) {
   const last = session.turns.at(-1);
   return {
     id: session.id, root: session.root, title: session.title, updated: session.updated,
-    pendingCount: session.queue.length,
+    pendingCount: session.queue.length, pinned: Boolean(session.pinned), archived: Boolean(session.archived),
     queue: pending ? [{ review: pending.review ? { state: pending.review.state } : null, failure: Boolean(pending.failure) }] : [],
     turns: last ? [{ status: last.status, verificationFailed: Boolean(last.verificationFailed) }] : [],
     undoInProgress: Boolean(session.undoInProgress),

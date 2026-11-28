@@ -1146,6 +1146,42 @@ test('terminal views clip Korean and emoji on display columns without breaking g
   assert.equal(terminalWidth('a\t가'), 6);
 });
 
+test('session metadata persists and archived sessions filter separately', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'OK'));
+  const { cli } = await profile(t, api);
+  await cli('ask', 'Keep visible');
+  await cli('session', 'rename', 'latest', 'Renamed session');
+  await cli('session', 'pin', 'latest');
+  await cli('ask', 'Archive this item');
+  const listing = (await cli('sessions')).stdout;
+  assert.match(listing.split('\n')[0], /pinned · Renamed/);
+  const id = listing.split('\n').find(line => line.includes('Archive this item')).trim().slice(0, 8);
+  await cli('session', 'archive', id);
+  assert.doesNotMatch((await cli('sessions')).stdout, /Archive this item/);
+  assert.match((await cli('sessions', '--status', 'archived')).stdout, /archived · Archive this item/);
+  await cli('session', 'restore', id);
+  assert.match((await cli('sessions')).stdout, /Archive this item/);
+});
+
+test('waiting messages can be edited, dropped, moved and selected for immediate send', async () => {
+  const { Sessions } = await import('../src/session.mjs');
+  const sessions = new Sessions('.');
+  sessions.persist = async () => {};
+  const active = { controller: new AbortController() };
+  const running = { prompt: 'Current', harness: {} };
+  const queue = [running, { prompt: 'Second' }, { prompt: 'Third' }, { prompt: 'Fourth' }];
+  const live = { active, session: { queue } };
+  await sessions.updateQueue(live, 'edit', '3', 'Revised');
+  await sessions.updateQueue(live, 'drop', '2', '');
+  await sessions.updateQueue(live, 'move', '3', '2');
+  assert.deepEqual(queue.map(job => job.prompt), ['Current', 'Fourth', 'Revised']);
+  await assert.rejects(sessions.updateQueue(live, 'edit', '1', 'No'), /has started/);
+  await sessions.updateQueue(live, 'send', '3', '');
+  assert.deepEqual(queue.map(job => job.prompt), ['Current', 'Revised', 'Fourth']);
+  assert.equal(active.controller.signal.aborted, true);
+  assert.equal(active.advance, true);
+});
+
 test('session listing can be filtered by title without opening the session', async t => {
   const api = await server(t, (_body, res) => reply(res, 'Ready.'));
   const { cli } = await profile(t, api);

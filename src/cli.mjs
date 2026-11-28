@@ -50,7 +50,8 @@ const help = [
   '  xcode setup [name]             Save API URL, model ID and token',
   '  xcode                          Start interactive chat',
   '  xcode ask "prompt"             Run a single prompt, or pipe text to xcode ask',
-  '  xcode sessions [search]        List or filter sessions for this project',
+  '  xcode sessions [search] [--status <filter>]',
+  '  xcode session rename|pin|unpin|archive|restore <id|latest> [title]',
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode draft [id|latest]        Read an unsent draft without opening the session',
   '  xcode continue [id|latest]    Run the pending message once',
@@ -79,14 +80,16 @@ const help = [
 ].join('\n');
 
 const chatHelp = [
-  '/new, /sessions [search]        Start, filter, or browse saved sessions',
+  '/new, /sessions [search]        Start or browse sessions (status:review, status:archived, …)',
+  '/session rename|pin|unpin|archive|restore [title]   Manage the current session',
   '/resume <id>                    Resume a session by ID',
   '/model [name]                  View or select a model profile',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
   '/attach <path>, /clear         Add or clear attachments for the next message',
   '/inputs image|pdf|tools on|off Change these capabilities in the current model profile',
-  '/queue, /stop, /next            Show pending messages, pause, or stop and send the next',
+  '/queue [edit|move|drop|send <number> …]   Manage pending messages',
+  '/stop, /next                   Pause or stop and send the next message',
   '/continue, /skip                Resume an interrupted request or remove it from the queue',
   '/retry off|<seconds>            Retry transient failures while the session is running',
   '/write on|off                  Allow model change proposals. Applying still requires approval',
@@ -320,22 +323,38 @@ function sessionStatus(session, live) {
   return 'idle';
 }
 
-async function sessionRows(manager, query = '') {
+function sessionSearch(query, explicitStatus) {
+  const words = query.trim().split(/\s+/).filter(Boolean);
+  const flag = words.findIndex(word => word.startsWith('status:'));
+  const status = explicitStatus ?? (flag >= 0 ? words.splice(flag, 1)[0].slice(7) : 'visible');
+  if (!['visible', 'active', 'review', 'failed', 'archived', 'all'].includes(status))
+    throw new Error('Use status active, review, failed, archived or all.');
+  return { query: words.join(' ').toLowerCase(), status };
+}
+
+async function sessionRows(manager, query = '', status, updates) {
   let unreadable = 0;
   const entries = await manager.list(() => { unreadable++; });
+  const search = sessionSearch(query, status);
   const rows = entries.map(entry => {
     const live = manager.open.get(entry.id);
     const session = live?.session ?? entry;
     const pending = session.pendingCount ?? session.queue.length;
-    return { id: session.id, text: session.id.slice(0, 8) + ' · ' + sessionStatus(session, live) + ' · ' +
-      (pending ? pending + ' pending · ' : '') + session.title };
-  });
-  const term = query.trim().toLowerCase();
-  return { rows: term ? rows.filter(row => row.text.toLowerCase().includes(term)) : rows, unreadable };
+    const state = sessionStatus(session, live);
+    const include = search.status === 'all' || (search.status === 'archived' ? session.archived : !session.archived &&
+      (search.status === 'visible' || (search.status === 'active' && ['running', 'paused'].includes(state)) ||
+        (search.status === 'review' && ['review needed', 'apply interrupted', 'undo interrupted'].includes(state)) ||
+        (search.status === 'failed' && ['failed', 'check failed'].includes(state))));
+    return { id: session.id, pinned: Boolean(session.pinned), include,
+      text: session.id.slice(0, 8) + ' · ' + (session.archived ? 'archived' : state) + ' · ' +
+        (pending ? pending + ' pending · ' : '') + (updates?.has(session.id) ? 'unread · ' : '') +
+        (session.pinned ? 'pinned · ' : '') + session.title };
+  }).filter(row => row.include && row.text.toLowerCase().includes(search.query)).sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  return { rows, unreadable };
 }
 
-async function describeSessions(manager, selected, query = '') {
-  const { rows, unreadable } = await sessionRows(manager, query);
+async function describeSessions(manager, selected, query = '', status, updates) {
+  const { rows, unreadable } = await sessionRows(manager, query, status, updates);
   if (unreadable) info(unreadable + ' unreadable saved session file(s). Existing files were preserved.');
   if (!rows.length) print(query ? 'No sessions match this search.' : 'No sessions for this project.');
   for (const row of rows) print((selected === row.id ? '* ' : '  ') + row.text);
@@ -577,6 +596,7 @@ async function chat(root, base, defaults, options, prefix) {
   let recalled = [];
   const commands = [];
   const notices = [];
+  const sessionUpdates = new Set();
   const rl = createInterface({
     input: stdin, output: stdout, terminal: true,
     completer: (line, callback) => {
@@ -763,9 +783,11 @@ async function chat(root, base, defaults, options, prefix) {
   const sessions = new Sessions(root, (live, event) => {
     if (closed) return;
     if (live !== selected) {
-      if (['complete', 'error', 'review'].includes(event.type))
+      if (['complete', 'error', 'review'].includes(event.type)) {
+        sessionUpdates.add(live.session.id);
         show('[' + live.session.id.slice(0, 8) + '] ' + (event.type === 'complete' ? 'Response ready' :
           event.type === 'review' ? 'Change set needs review' : modelFailure(event.error).detail));
+      }
       return;
     }
     if (event.type === 'text') {
@@ -842,6 +864,7 @@ async function chat(root, base, defaults, options, prefix) {
     }
     if (selected && selected.session.id !== live.session.id) previousSession = selected.session.id;
     selected = live;
+    sessionUpdates.delete(live.session.id);
     recalled = [];
     attachments = draft?.attachments ?? [];
     paste = draft?.paste ?? null;
@@ -1065,6 +1088,10 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       }
       case '/exit': rl.close(); break;
+      case '/session':
+        await sessions.updateMetadata(selected, arg, args.slice(1).join(' '));
+        show('Session updated · ' + session.title);
+        break;
       case '/new': await select(); banner(); break;
       case '/resume':
         if (!arg) throw new Error('Use /resume <id|latest>.');
@@ -1072,10 +1099,10 @@ async function chat(root, base, defaults, options, prefix) {
       case '/sessions': {
         const query = (arg === 'list' ? args.slice(1) : args).join(' ');
         if (arg === 'list' || style.plain) {
-          await describeSessions(sessions, session.id, query);
+          await describeSessions(sessions, session.id, query, undefined, sessionUpdates);
           break;
         }
-        const { rows, unreadable } = await sessionRows(sessions, query);
+        const { rows, unreadable } = await sessionRows(sessions, query, undefined, sessionUpdates);
         if (!rows.length) { show(query ? 'No sessions match this search.' : 'No sessions for this project.'); break; }
         endStream();
         pager = { kind: 'sessions', rows, unreadable, query, focus: Math.max(0, rows.findIndex(row => row.id === session.id)), offset: 0 };
@@ -1084,8 +1111,13 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       }
       case '/queue':
-        show(session.queue.length ? session.queue.map((item, index) =>
-          (index + 1) + ' · ' + (index === 0 && selected.active ? '[running] ' : '') + item.prompt.slice(0, 100)).join('\n') : 'Queue is empty.');
+        if (arg) {
+          await sessions.updateQueue(selected, arg, value, args.slice(2).join(' '));
+          show('Queue updated.');
+        } else {
+          show(session.queue.length ? session.queue.map((item, index) =>
+            (index + 1) + ' · ' + (index === 0 && selected.active ? '[running] ' : '') + item.prompt.slice(0, 100)).join('\n') : 'Queue is empty.');
+        }
         break;
       case '/stop': if (!sessions.stop(selected)) show('No request is running.'); break;
       case '/next':
@@ -1280,7 +1312,7 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
-      'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
+      status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
@@ -1328,7 +1360,18 @@ async function main() {
   }
   if (command === 'sessions') {
     const sessions = new Sessions(root);
-    return describeSessions(sessions, undefined, rest.join(' '));
+    return describeSessions(sessions, undefined, rest.join(' '), values.status);
+  }
+  if (command === 'session') {
+    const sessions = new Sessions(root);
+    try {
+      const live = await sessions.select(rest[1] || 'latest', defaults);
+      const session = await sessions.updateMetadata(live, rest[0], rest.slice(2).join(' '));
+      print('Session updated · ' + session.title);
+    } finally {
+      await sessions.close();
+    }
+    return;
   }
   if (command === 'ask' || (!command && !stdin.isTTY)) {
     const prompt = (rest.length ? rest.join(' ') : await readInput(maxPrompt * 4)).trim();

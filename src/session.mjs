@@ -9,6 +9,7 @@ import { attachmentSize, maxAttachmentBytes, maxAttachments } from './attachment
 import { completedWire, pruneWire } from './wire-history.mjs';
 import { latestChecks } from './repair.mjs';
 import { modelFailure } from './model-transport.mjs';
+import { maxDraftLength } from './draft.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -23,7 +24,8 @@ export class Sessions {
 
   async find(prefix) {
     const previous = await this.list();
-    const matches = prefix === 'latest' ? previous.slice(0, 1) : previous.filter(session => session.id.startsWith(prefix));
+    const matches = prefix === 'latest' ? previous.filter(session => !session.archived).slice(0, 1) :
+      previous.filter(session => session.id.startsWith(prefix));
     if (matches.length !== 1) throw new Error(matches.length ? 'Session prefix is ambiguous.' : 'Session not found in this project.');
     return matches[0];
   }
@@ -80,14 +82,14 @@ export class Sessions {
       1 + attachments.reduce((bytes, item) => bytes + attachmentSize(item), 0) > maxAttachmentBytes)
       throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
     const job = { prompt, attachments, completed: [], changed: [], tools: [] };
-    if (live.session.title === 'New session') live.session.title = prompt.replace(/\s+/g, ' ').slice(0, 72);
+    if (!live.session.customTitle && live.session.title === 'New session') live.session.title = prompt.replace(/\s+/g, ' ').slice(0, 72);
     live.session.queue.push(job);
     try {
       await this.persist(live);
     } catch (error) {
       const index = live.session.queue.indexOf(job);
       if (index >= 0) live.session.queue.splice(index, 1);
-      if (!live.session.queue.length && !live.session.turns.length) live.session.title = 'New session';
+      if (!live.session.customTitle && !live.session.queue.length && !live.session.turns.length) live.session.title = 'New session';
       throw error;
     }
     if (live.active || live.held) this.notify(live, { type: 'queue', count: live.session.queue.length - Number(Boolean(live.active)) });
@@ -285,6 +287,72 @@ export class Sessions {
       return { id: change.id, files };
     } finally {
       live.reviewing = false;
+    }
+  }
+
+  async updateMetadata(live, action, title) {
+    const { session } = live;
+    if (action === 'rename') {
+      const name = title.trim();
+      if (!name || name.length > 120 || /[\x00-\x1f\x7f-\x9f]/.test(name))
+        throw new Error('Enter a single-line session title up to 120 characters.');
+      session.title = name;
+      session.customTitle = true;
+    } else if (action === 'pin' || action === 'unpin') {
+      session.pinned = action === 'pin';
+    } else if (action === 'archive' || action === 'restore') {
+      if (action === 'archive' && (live.active || session.queue.length || session.undoInProgress))
+        throw new Error('Finish pending work before archiving this session.');
+      session.archived = action === 'archive';
+    } else {
+      throw new Error('Use rename, pin, unpin, archive or restore.');
+    }
+    await this.persist(live);
+    return session;
+  }
+
+  async updateQueue(live, action, position, value) {
+    const queue = live.session.queue;
+    const index = Number(position) - 1;
+    const job = Number.isInteger(index) && index >= 0 ? queue[index] : undefined;
+    if (!job) throw new Error('Select a message number from /queue.');
+    const active = live.active;
+    const locked = item => (active && item === queue[0]) || item?.harness || item?.review;
+    if (locked(job)) throw new Error('This message has started. Use /stop, /continue or /skip.');
+    const previous = queue.slice();
+    const oldPrompt = job.prompt;
+    const sendNow = action === 'send';
+
+    if (action === 'edit') {
+      if (!value.trim() || value.length > maxDraftLength) throw new Error('Enter a prompt up to 32,000 characters.');
+      job.prompt = value;
+    } else if (action === 'drop') {
+      queue.splice(index, 1);
+    } else if (action === 'move' || sendNow) {
+      const target = sendNow ? Number(Boolean(active)) : Number(value) - 1;
+      if (!Number.isInteger(target) || target < 0 || target >= queue.length || locked(queue[target]))
+        throw new Error('Select another waiting message position.');
+      if (sendNow && (queue[0].review || live.session.undoInProgress))
+        throw new Error('Finish the pending review or undo before sending a different message.');
+      queue.splice(index, 1);
+      queue.splice(target, 0, job);
+    } else {
+      throw new Error('Use /queue edit, move, drop or send.');
+    }
+
+    try {
+      await this.persist(live);
+    } catch (error) {
+      if (live.active === active) {
+        job.prompt = oldPrompt;
+        queue.splice(0, queue.length, ...previous);
+      }
+      throw error;
+    }
+    if (sendNow && live.active === active) {
+      live.held = false;
+      if (active) this.stop(live, true);
+      else this.pump(live)?.catch(error => this.notify(live, { type: 'error', error }));
     }
   }
 
