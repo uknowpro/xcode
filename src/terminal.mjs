@@ -87,3 +87,24 @@ export function pageKey(name, pageSize, rows) {
     end: rows,
   }[name];
 }
+
+export function wrapTerminal(text, width) {
+  const rows = [];
+  let row = '', used = 0;
+  const limit = Math.max(1, width);
+  for (const part of columns(text)) {
+    if (used && used + part.width > limit) {
+      rows.push(row);
+      row = '';
+      used = 0;
+    }
+    if (part.width > limit) {
+      rows.push('…');
+      continue;
+    }
+    row += part.text;
+    used += part.width;
+  }
+  rows.push(row);
+  return rows;
+}

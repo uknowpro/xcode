@@ -29,6 +29,7 @@ export function configureEditor(config, options) {
 const composeCommands = {
   '/send': 'Submit draft',
   '/preview': 'Preview draft',
+  '/draft-edit': 'Edit draft lines or undo and redo',
   '/outgoing': 'Preview outgoing paths and context',
   '/cancel': 'Discard draft',
   '/exit': 'Save and exit',

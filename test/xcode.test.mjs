@@ -1568,3 +1568,27 @@ test('session listing can be filtered by title without opening the session', asy
   assert.doesNotMatch(listed.stdout, /Read another note/);
   assert.match((await cli('sessions', 'missing title')).stdout, /No sessions match/);
 });
+
+test('response view renders Markdown, finds matches across turns and preserves terminal width', async () => {
+  const { answerRows, matchingAnswers } = await import('../src/answer-view.mjs');
+  const { terminalWidth } = await import('../src/terminal.mjs');
+  const text = '# Heading\n- [x] Complete\n| A | B |\n| --- | --- |\n~~~sh\necho ok\n~~~';
+  const result = answerRows(text, 12, true);
+  assert.deepEqual(result.outline.map(item => item.title), ['Heading', 'Code · sh']);
+  assert.ok(result.rows.every(row => terminalWidth(row.text) <= 12));
+  assert.ok(result.rows.some(row => row.text.includes('[✓]')));
+  assert.deepEqual(matchingAnswers([{ answer: 'latest match' }, { answer: text }], 'COMPLETE').map(item => item.turn), [1]);
+});
+
+test('draft editing supports inserting, dedenting, undo and redo and validates key bindings', async () => {
+  const { DraftEdits, keyBindings } = await import('../src/draft-edits.mjs');
+  const edits = new DraftEdits();
+  const base = ['  start', '    next'];
+  const inserted = edits.change(base, 'insert', '2', '  mid');
+  const shorter = edits.change(inserted, 'dedent');
+  assert.deepEqual(shorter, ['start', 'mid', '  next']);
+  assert.deepEqual(edits.change(shorter, 'undo'), inserted);
+  assert.deepEqual(edits.change(inserted, 'redo'), shorter);
+  assert.deepEqual(keyBindings({ 'alt+p': '/answer outline' }), { 'alt+p': '/answer outline' });
+  assert.throws(() => keyBindings({ 'ctrl+c': '/answer' }), /available Alt keys/);
+});

@@ -30,6 +30,8 @@ import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntri
 import { copyClipboard, responseSelection } from './clipboard.mjs';
 import { openLocation } from './editor.mjs';
 import { shellCompletion } from './completion.mjs';
+import { answerRows, matchingAnswers } from './answer-view.mjs';
+import { DraftEdits, keyBindings } from './draft-edits.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
@@ -150,6 +152,8 @@ const chatHelp = [
   '/switch                        Switch to the previous session (Alt+J)',
   '/paste, /send, /cancel         Compose or paste a multi-line message',
   '/preview                       Show draft line count and a bounded preview',
+  '/answer [number|find|outline|live]    Browse or search responses',
+  '/draft-edit <action> [line] [text]    Edit, preview dedent, undo or redo draft lines',
   'Tab after /                    Complete a chat command',
   'Tab after @                    Complete a workspace path',
   '/history [before] [count]      Browse recent turns and page backward',
@@ -871,8 +875,11 @@ async function chat(root, base, defaults, options, prefix) {
   let draftNotice;
   let pager = null;
   let bracketedPaste = false;
+  let liveAnswer = '', redraw;
+  let edits = new DraftEdits();
   const terminalConfig = (await settings()).terminal;
   const keys = editorKeys(terminalConfig);
+  const bindings = keyBindings(terminalConfig?.bindings ?? {});
   const style = terminalStyle(terminalConfig);
   let previousSession;
   let recalled = [];
@@ -955,7 +962,32 @@ async function chat(root, base, defaults, options, prefix) {
     print(terminalClip('↑/↓ Select session · Enter Switch · Esc Close', width));
   }
 
+  function answerPage(move = 0) {
+    clearTimeout(redraw);
+    redraw = undefined;
+    const width = Math.max(6, (stdout.columns || 80) - 1);
+    const height = Math.max(1, (stdout.rows || 24) - 4);
+    const text = pager.live ? liveAnswer : pager.answer;
+    const { rows, outline } = answerRows(text, width, pager.numbered);
+    pager.outline = outline;
+    pager.rowCount = rows.length;
+    const last = Math.max(0, rows.length - height);
+    if (pager.target !== undefined) {
+      pager.offset = Math.max(0, rows.findIndex(row => row.source >= pager.target));
+      pager.target = undefined;
+    }
+    pager.offset = pager.follow ? last : Math.max(0, Math.min(last, pager.offset + move));
+    cursorTo(stdout, 0, 0);
+    clearScreenDown(stdout);
+    print(terminalClip((pager.live ? 'Live response' : 'Response · turn ' + pager.turn) +
+      (pager.live && !pager.follow ? ' · ' + Math.max(0, rows.length - (pager.seen ?? rows.length)) + ' new lines' : '') +
+      (pager.hits ? ' · match ' + (pager.hit + 1) + '/' + pager.hits.length : ''), width));
+    for (const row of rows.slice(pager.offset, pager.offset + height)) print(row.text);
+    print(terminalClip('↑/↓ Scroll · Tab Outline · n/p Match · l Numbers · End Follow · Esc Close', width));
+  }
+
   function drawReview(move = 0) {
+    if (pager.kind === 'answer') return answerPage(move);
     if (pager.kind === 'sessions') return drawSessions();
     const rows = Math.max(1, (stdout.rows || 24) - 4);
     const { review, mode, picked, conflicts } = pager;
@@ -983,6 +1015,7 @@ async function chat(root, base, defaults, options, prefix) {
   function closeReview() {
     if (!pager) return;
     pager = null;
+    clearTimeout(redraw);
     stdout.write('\x1b[?1049l');
     for (const notice of notices.splice(0)) print(notice);
     prompt();
@@ -1004,6 +1037,27 @@ async function chat(root, base, defaults, options, prefix) {
       clearInput();
       closeReview();
       return;
+    }
+    if (pager.kind === 'answer') {
+      clearInput();
+      if ((text === 'n' || text === 'p') && pager.hits) {
+        pager.hit = (pager.hit + (text === 'n' ? 1 : pager.hits.length - 1)) % pager.hits.length;
+        const entry = pager.hits[pager.hit];
+        pager.target = entry.line;
+        pager.turn = entry.turn + 1;
+        pager.answer = selected.session.turns[entry.turn].answer;
+      } else if (text === 'l') pager.numbered = !pager.numbered;
+      else if (key.name === 'tab') {
+        const next = pager.outline.find(entry => entry.row > pager.offset) ?? pager.outline[0];
+        if (next) { pager.follow = false; pager.offset = next.row; }
+      } else if (key.name === 'end' && pager.live) pager.follow = true;
+      else {
+        const step = pageKey(key.name, Math.max(1, (stdout.rows || 24) - 4), pager.rowCount);
+        if (step === undefined) return;
+        if (pager.follow) { pager.follow = false; pager.seen = pager.rowCount; }
+        return answerPage(step);
+      }
+      return answerPage();
     }
     if (pager.kind === 'sessions') {
       if (key.name === 'return' || key.name === 'enter') {
@@ -1084,7 +1138,12 @@ async function chat(root, base, defaults, options, prefix) {
       }
       return;
     }
+    if (event.type === 'attempt') liveAnswer = '';
     if (event.type === 'text') {
+      if (!event.intermediate) liveAnswer = (liveAnswer + event.text).slice(-256000);
+      if (pager?.kind === 'answer' && pager.live && !redraw) {
+        redraw = setTimeout(() => { if (pager?.kind === 'answer') answerPage(); }, 80);
+      }
       if (pager) {
         pager.responseHidden = true;
         return;
@@ -1158,6 +1217,7 @@ async function chat(root, base, defaults, options, prefix) {
     }
     if (selected && selected.session.id !== live.session.id) previousSession = selected.session.id;
     selected = live;
+    edits = new DraftEdits();
     sessionUpdates.delete(live.session.id);
     recalled = [];
     attachments = draft?.attachments ?? [];
@@ -1238,10 +1298,11 @@ async function chat(root, base, defaults, options, prefix) {
     if (pasteLength + raw.length + 1 > maxPrompt)
       throw new Error('Draft exceeds 32,000 characters. Use /send or /cancel.');
     pasteLength += raw.length + 1;
+    edits.remember(paste);
     paste.push(raw);
   }
   function startDraft() {
-    if (!paste) { paste = []; pasteLength = 0; }
+    if (!paste) { paste = []; pasteLength = 0; edits = new DraftEdits(); }
   }
   async function submitDraft(tail) {
     const lines = tail ? [...paste, tail] : paste;
@@ -1268,6 +1329,17 @@ async function chat(root, base, defaults, options, prefix) {
         show('Draft discarded.');
       } else if (line === '/send') {
         await submitDraft('');
+      } else if (line.startsWith('/draft-edit ')) {
+        const [kind, index, ...words] = splitArgs(line.slice(12));
+        const value = words.join(' ');
+        if (kind === 'dedent' && index !== 'apply') {
+          const preview = new DraftEdits().change(paste, 'dedent');
+          show(previewDraft(preview, stdout.columns || 80, terminalClip) + '\nUse /draft-edit dedent apply to accept.');
+        } else {
+          paste = edits.change(paste, kind, index, value);
+          pasteLength = paste.join('\n').length + Number(Boolean(paste.length));
+          show(previewDraft(paste, stdout.columns || 80, terminalClip));
+        }
       } else if (line === '/preview') {
         show(previewDraft(paste, stdout.columns || 80, terminalClip));
       } else if (line === '/outgoing') {
@@ -1352,6 +1424,24 @@ async function chat(root, base, defaults, options, prefix) {
           show(recalled.map((text, index) => (index + 1) + '  ' + terminalClip(text.replace(/\s+/g, ' '), 95)).join('\n') ||
             'No recent entries match.');
         }
+        break;
+      }
+      case '/answer': {
+        const turns = session.turns;
+        const hits = arg === 'find' ? matchingAnswers(turns, args.slice(1).join(' ')) : undefined;
+        if (hits && !hits.length) return show('No matching response text.');
+        const live = arg === 'live';
+        const turn = hits ? hits[0].turn + 1 : /^\d+$/.test(arg ?? '') ? Number(arg) :
+          turns.findLastIndex(entry => entry.answer) + 1;
+        const response = live ? liveAnswer : turns[turn - 1]?.answer;
+        if (!live && !response) throw new Error('No response for that turn.');
+        if (arg === 'outline') return show(answerRows(response, 80).outline.map(item => item.title).join('\n') || 'No headings or code blocks.');
+        if (style.plain) return show(response || 'The response has not started.');
+        endStream();
+        pager = { kind: 'answer', answer: response, turn, offset: 0, live, follow: live, hits,
+          hit: 0, target: hits?.[0].line };
+        stdout.write('\x1b[?1049h');
+        answerPage();
         break;
       }
       case '/copy': {
@@ -1667,6 +1757,8 @@ async function chat(root, base, defaults, options, prefix) {
       bracketedPaste = false;
       const tail = takeInput();
       if (tail) queueInput(tail, 'insert');
+    } else if (!bracketedPaste && !paste && key.meta && !rl.line && Object.hasOwn(bindings, 'alt+' + key.name)) {
+      queueInput(bindings['alt+' + key.name]);
     } else if (!bracketedPaste && !paste && key.meta && key.name === 'j') {
       if (!rl.line) queueInput('/switch');
     } else if (!bracketedPaste && paste && key.ctrl) {
@@ -1964,6 +2056,16 @@ async function main() {
     ].join('\n'));
   }
   if (command === 'terminal') {
+    if (rest[0] === 'keys') {
+      if (rest[1] === 'import') {
+        if (!rest[2]) throw new Error('Use xcode terminal keys import <file>.');
+        const bindings = keyBindings(JSON.parse((await loadBytes(resolve(rest[2]), 32 * 1024)).toString('utf8')));
+        await updateSettings(config => { config.terminal = { ...config.terminal, bindings }; });
+        return print('Imported ' + Object.keys(bindings).length + ' bindings.');
+      }
+      if (rest[1] !== 'export') throw new Error('Use xcode terminal keys export or import <file>.');
+      return print(JSON.stringify(keyBindings((await settings()).terminal?.bindings ?? {}), null, 2));
+    }
     if (values['send-key'] !== undefined || values['newline-key'] !== undefined || values.theme !== undefined ||
         values.accessible || values['no-accessible']) {
       if (values.accessible && values['no-accessible']) throw new Error('Choose one accessibility mode.');
