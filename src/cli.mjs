@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { attach, attachmentSize, explicitReferences, inspectAttachment, maxAttachmentBytes, maxAttachments, splitArgs } from './attachments.mjs';
-import { checksForHarness, harnessFor, presets, roles, skillsAt, stageTools } from './harness.mjs';
+import { checksForHarness, composeHarness, harnessFor, presets, roles, skillsAt, stageTools } from './harness.mjs';
 import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
@@ -19,7 +19,7 @@ import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
 import { readSession, readSessionPage, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
-import { projectRoot, Workspace } from './workspace.mjs';
+import { loadBytes, projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
 import { executionLimits, setLimits } from './limits.mjs';
@@ -63,7 +63,7 @@ const help = [
   '  xcode profile list|show|use|set|tune|test|models|capabilities|compare|eval [name]',
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
   '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>] [--json]',
-  '  xcode harness list|show|effective|import [name] [file]',
+  '  xcode harness list|show|effective|import|compose|export [name] [file]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|remove [name]',
@@ -354,6 +354,16 @@ async function harnessCommand(root, action, name, args, options) {
     showHarness(config, name || 'default', root);
   } else if (action === 'effective') {
     print(effectiveHarness(config, name || 'default', root, options));
+  } else if (action === 'export' && name) {
+    print(JSON.stringify(harnessFor(config, name), null, 2));
+  } else if (action === 'compose' && name) {
+    validName(name);
+    if (!args[0]) throw new Error('Use xcode harness compose <name> <recipe.json>.');
+    const recipe = JSON.parse((await loadBytes(resolve(root, args[0]), 256 * 1024)).toString('utf8'));
+    await updateSettings(value => {
+      value.harnesses[name] = composeHarness(value, recipe);
+    });
+    showHarness(await settings(), name, root);
   } else if (action === 'checks' && name) {
     validName(name);
     const harness = harnessFor(config, name);

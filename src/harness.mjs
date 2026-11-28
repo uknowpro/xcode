@@ -139,6 +139,68 @@ export const presets = {
       step('Validate', 'Run enabled rendering or validation checks and describe the tested scope.', verification),
     ],
   },
+  'design-review': {
+    description: 'Compare architecture alternatives and document evidence and tradeoffs',
+    stages: [
+      step('Requirements', 'Extract requirements and constraints. Separate observed evidence from assumptions.'),
+      step('Alternatives', 'Compare at least two viable approaches against migration, runtime and maintenance constraints.'),
+      step('Decision', 'Recommend one option, cite supporting evidence and describe rollout, rollback and open questions.'),
+    ],
+  },
+  'backend-change': {
+    description: 'Trace API behavior, implement a reviewed change and verify its contract',
+    role: 'backend',
+    stages: [
+      step('Contract', 'Trace callers, persistence and API compatibility. Identify contracts and error cases.'),
+      step('Change', 'Propose a patch that keeps the existing contract or makes the transition explicit.', [...readTools, ...changeTools]),
+      step('Verify', 'Run registered API and persistence checks. Check error handling, retries and confidentiality.', verification),
+    ],
+  },
+  'frontend-change': {
+    description: 'Check responsive UI, accessibility and interaction states',
+    role: 'frontend',
+    stages: [
+      step('Inspect', 'Trace the user flow, then record breakpoints, focus order and loading and error states.'),
+      step('Change', 'Prepare a focused UI patch with keyboard and narrow-layout behavior.', [...readTools, ...changeTools]),
+      step('Verify', 'Run registered accessibility and UI checks. List manual states still needing inspection.', verification),
+    ],
+  },
+  'full-stack-change': {
+    description: 'Trace a user flow from the client through persistence',
+    role: 'full-stack',
+    stages: [
+      step('Trace', 'Map the UI, API contract, transaction and data migration steps. Identify test boundaries.'),
+      step('Change', 'Propose a reviewable cross-layer patch. Keep error behavior and compatibility consistent.', [...readTools, ...changeTools]),
+      step('Verify', 'Run registered tests across server and client, including an end-to-end scenario.', verification),
+    ],
+  },
+  'data-pipeline-review': {
+    description: 'Review schema evolution, lineage, quality and idempotent reprocessing',
+    role: 'data',
+    stages: [
+      step('Lineage', 'Trace inputs, transforms, ownership and output contracts. Identify schema evolution points.'),
+      step('Quality', 'Evaluate nulls, duplicates, late data and failed batches. Specify rerun inputs and expected results.'),
+      step('Verify', 'Run registered data quality checks. Report replay safety and migration evidence.', verification),
+    ],
+  },
+  'delivery-review': {
+    description: 'Review infrastructure delivery, deployment order and rollback',
+    role: 'devops',
+    stages: [
+      step('Plan', 'Inspect Terraform, Helm, manifests and pipeline inputs. Identify rollout dependencies and approval steps.'),
+      step('Verify', 'Run registered rendering or plan checks. Separate immutable resources from safe in-place changes.', verification),
+      step('Rollback', 'Record rollback commands or steps as documentation, along with triggers and recovery limits.'),
+    ],
+  },
+  'reliability-review': {
+    description: 'Review cloud failure domains, Kubernetes rollout and incident readiness',
+    role: 'sre',
+    stages: [
+      step('Impact', 'Map cloud regions, network boundaries and workload dependencies to user-facing symptoms.'),
+      step('Signals', 'Check how monitoring, probes and deployment settings detect and contain failure.'),
+      step('Recovery', 'Verify registered recovery checks. Define the rollback decision, action owner and success criteria.', verification),
+    ],
+  },
   documentation: {
     description: 'Read source material and draft documentation',
     role: 'writer',
@@ -169,6 +231,27 @@ export function harnessFor(config, name) {
     harness.skills.some(name => typeof name !== 'string')))
     throw new Error('Harness skills must be a list of skill names.');
   return harness;
+}
+
+export function composeHarness(config, recipe) {
+  if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe) || !Array.isArray(recipe.stages) ||
+      recipe.stages.length < 1 || recipe.stages.length > 8)
+    throw new Error('Provide a recipe with 1–8 stages.');
+  const result = {
+    description: recipe.description ?? 'Composed harness',
+    ...(recipe.role !== undefined ? { role: recipe.role } : {}),
+    ...(recipe.skills !== undefined ? { skills: recipe.skills } : {}),
+    stages: recipe.stages.map(item => {
+      if (!item?.use) return item;
+      const reference = /^([a-z0-9_-]+):(.+)$/i.exec(item.use);
+      if (!reference) throw new Error('Stage references use harness:stage.');
+      const [, name, stage] = reference;
+      const original = harnessFor(config, name).stages.find((entry, index) => entry.name === stage || String(index + 1) === stage);
+      if (!original) throw new Error('Unknown source stage: ' + item.use);
+      return { ...original, ...item.set };
+    }),
+  };
+  return harnessFor({ harnesses: { recipe: result } }, 'recipe');
 }
 
 export function stageTools(stage, profile, session, checks) {

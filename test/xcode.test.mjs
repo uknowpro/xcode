@@ -1105,6 +1105,24 @@ test('stream first-event and idle limits are independent', async () => {
   await assert.rejects(events.next(), /idle/);
 });
 
+test('domain harness stages can be composed, customized and exported', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const env = { ...process.env, XCODE_HOME: state };
+  const cli = (...args) => exec(process.execPath, [cliPath, ...args], { cwd: root, env });
+  const recipe = { role: 'data', stages: [
+    { use: 'data-pipeline-review:Lineage', set: { name: 'Count sources', tools: ['read'] } },
+    { use: 'design-review:3', set: { done: 'Write the data migration decision.' } },
+  ] };
+  await writeFile(join(root, 'recipe.json'), JSON.stringify(recipe));
+  await cli('harness', 'compose', 'migration', 'recipe.json');
+  const exported = JSON.parse((await cli('harness', 'export', 'migration')).stdout);
+  assert.equal(exported.role, 'data');
+  assert.deepEqual(exported.stages.map(stage => stage.name), ['Count sources', 'Decision']);
+  assert.deepEqual(exported.stages[0].tools, ['read']);
+  assert.match(exported.stages[1].done, /data migration/);
+});
+
 test('profile comparison and effective model-specific harnesses respect permissions', async t => {
   const api = await server(t, (_body, res) => reply(res, 'OK'));
   const { cli } = await profile(t, api);
