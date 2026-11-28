@@ -12,9 +12,9 @@ import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } 
 import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
-import { checkEvidence } from './repair.mjs';
+import { checkEvidence, checkLocations, compareCheckRuns } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
-import { chooseHunks, conflictSummary, fileOperation, inverseReview, overrideReviewFile, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
+import { appliedReviewFiles, asGitPatch, chooseHunks, conflictSummary, fileOperation, inverseReview, overrideReviewFile, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
@@ -69,7 +69,10 @@ const help = [
   '  xcode symbol <identifier> [--path <dir>]',
   '  xcode open <path[:line]>       Open a verified workspace file in XCODE_EDITOR',
   '  xcode harness checks <name> [check...] [--clear]',
-  '  xcode check add <name> -- <command> [args...]',
+  '  xcode check add <name> [--in <directory>] -- <command> [args...]',
+  '  xcode check suggest|compare [session]',
+  '  xcode review patch [session] > changes.patch',
+  '  xcode changes [session] [change] --patch > applied.patch',
   '  xcode check list|remove [name]',
   '  xcode check run <name> [--json]',
   '  xcode review show|check|hunks|recovery|apply|reject [session] [paths...]',
@@ -118,7 +121,8 @@ const chatHelp = [
   '/hunks <path> [number …|all]     List or select edit hunks',
   '/recovery                     Inspect files in an interrupted apply or undo',
   '/guides, /packages [path]       Show folder instructions and package dependencies',
-  '/verification                  View test outcomes for the current or last turn',
+  '/verification [compare|open <number>]  Inspect results, reruns or an error location',
+  '/suggest-tests                 Find tests related to changed files',
   '/reject, /changes, /undo [preview] [id]  Reject, see history, or undo',
   '/review-edit <path> <file>     Substitute local replacement text in a pending review',
   '/context [query]               Inspect the compacted session context',
@@ -505,8 +509,30 @@ function checkSummary(result) {
     ' · ' + (result.durationMs / 1000).toFixed(1) + 's';
 }
 
+async function suggestChecks(root, session, signal) {
+  const workspace = new Workspace(root);
+  const { files } = await workspace.files(signal);
+  const changed = [...new Set([...(await workspace.changed(signal)), ...(session?.changes?.at(-1)?.files ?? []).map(file => file.path)])];
+  const stem = value => value.split('/').at(-1).replace(/\.[^.]+$/, '').replace(/(?:[._-](?:spec|test)|Tests?)$/i, '');
+  const names = new Set(changed.map(stem));
+  const candidates = files.filter(file => /(?:^|[./_-])(?:tests?|specs?)(?:[./_-]|$)/i.test(file) && names.has(stem(file))).slice(0, 20);
+  const checks = projectChecks(await settings(), root);
+  const commands = Object.keys(checks).filter(name => !checks[name].directory ||
+    changed.some(file => file.startsWith(checks[name].directory.replaceAll('\\', '/') + '/')));
+  return ['Changed files · ' + changed.length, ...candidates.map(file => 'Test candidate · ' + file),
+    ...commands.map(name => 'Registered check · xcode check run ' + name)].join('\n');
+}
+
 async function checkCommand(root, action, name, argv, options) {
   if (!action || action === 'list') return print(checkList(projectChecks(await settings(), root)));
+  if (action === 'suggest' || action === 'compare') {
+    const sessions = new Sessions(root);
+    const item = name ? await sessions.find(name) : (await sessions.list())[0];
+    const session = item ? await readSession(item.id) : null;
+    if (action === 'suggest') return print(await suggestChecks(root, session));
+    const results = compareCheckRuns(session?.queue[0]?.checks ?? session?.turns.at(-1)?.checks ?? []);
+    return print(results.join('\n') || 'No repeated checks in this turn.');
+  }
   if (action === 'run') {
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -531,7 +557,7 @@ async function checkCommand(root, action, name, argv, options) {
   validName(name);
   await updateSettings(config => {
     const checks = { ...projectChecks(config, root) };
-    if (action === 'add') checks[name] = defineCheck(argv, options.timeout === undefined ? undefined : Number(options.timeout));
+    if (action === 'add') checks[name] = defineCheck(argv, options.timeout === undefined ? undefined : Number(options.timeout), options.in);
     else {
       if (!Object.hasOwn(checks, name)) throw new Error('Unknown project check: ' + name);
       delete checks[name];
@@ -593,13 +619,14 @@ async function undoPreview(root, session, id) {
 }
 
 async function reviewCommand(root, action, prefix, paths) {
-  if (!['show', 'check', 'hunks', 'recovery', 'edit', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
+  if (!['show', 'check', 'hunks', 'recovery', 'edit', 'patch', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     if (action === 'recovery') return print(await recoveryText(root, live.session));
     const review = live.session.queue[0]?.review;
     if (!review) throw new Error('There is no pending change set.');
+    if (action === 'patch') return outputPatch(appliedReviewFiles(review, paths));
     if (action === 'edit') {
       await editReviewFile(root, review, paths[0], paths[1]);
       await sessions.persist(live);
@@ -651,12 +678,22 @@ function changeHistory(session) {
     '\n  ' + change.files.map(file => file.path).join(', ')).join('\n') || 'No undoable changes recorded in this session.';
 }
 
-async function historyCommand(root, action, prefix, id, preview) {
+function outputPatch(files) {
+  if (stdout.isTTY) throw new Error('Redirect patch output to a file.');
+  stdout.write(asGitPatch(files));
+}
+
+async function historyCommand(root, action, prefix, id, options) {
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
-    if (action === 'changes') return print(changeHistory(live.session));
-    if (preview) return print(await undoPreview(root, live.session, id));
+    if (action === 'changes') {
+      if (!options.patch) return print(changeHistory(live.session));
+      const change = id ? live.session.changes?.find(item => item.id === id) : live.session.changes?.at(-1);
+      if (!change) throw new Error('No matching recorded change.');
+      return outputPatch(change.files);
+    }
+    if (options.preview) return print(await undoPreview(root, live.session, id));
     const result = await sessions.undo(live, id);
     print('Undid change ' + result.id + ' (' + result.files.length + ' files).');
   } finally {
@@ -1253,7 +1290,22 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       }
       case '/changes': show(changeHistory(session)); break;
-      case '/verification': show(verificationLines(session).join('\n')); break;
+      case '/suggest-tests': show(await suggestChecks(root, session, terminalSignal.signal)); break;
+      case '/verification': {
+        const checks = session.queue[0]?.checks ?? session.turns.at(-1)?.checks ?? [];
+        if (arg === 'compare') show(compareCheckRuns(checks).join('\n') || 'No repeated checks in this turn.');
+        else {
+          const locations = checks.slice(-8).flatMap(check => checkLocations(check).map(location =>
+            (check.directory ? check.directory.replaceAll('\\', '/') + '/' : '') + location.replace(/(:\d+):\d+$/, '$1')));
+          if (arg === 'open') {
+            const location = locations[Number(value) - 1];
+            if (!location) throw new Error('Select an error location listed by /verification.');
+            await openLocation(root, location);
+          } else show([...verificationLines(session), ...locations.map((location, index) =>
+            (index + 1) + ' · ' + location)].join('\n'));
+        }
+        break;
+      }
       case '/undo': {
         if (arg === 'preview') return show(await undoPreview(root, session, value));
         const result = await sessions.undo(selected, arg);
@@ -1666,7 +1718,8 @@ async function main() {
       'model-jobs': { type: 'string' }, 'check-jobs': { type: 'string' },
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
-      clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' },
+      clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' }, patch: { type: 'boolean' },
+      in: { type: 'string' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
@@ -1693,7 +1746,7 @@ async function main() {
   const defaults = { profile: values.profile, harness: values.harness };
   if (command === 'check') return checkCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
-  if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values.preview);
+  if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
   if (command === 'storage') {

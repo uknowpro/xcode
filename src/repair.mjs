@@ -6,6 +6,24 @@ export function latestChecks(checks) {
   return [...latest.values()];
 }
 
+export function checkLocations(check) {
+  const text = (check.stderr ?? '') + '\n' + (check.stdout ?? '');
+  return [...new Set(text.match(/(?:^|[\s(])([\w./\\-]+\.[\w-]+:\d+(?::\d+)?)/gm)
+    ?.map(value => value.trim().replace(/^\(/, '')) ?? [])].slice(0, 8);
+}
+
+export function compareCheckRuns(checks) {
+  const pairs = new Map();
+  for (const check of checks) {
+    const previous = pairs.get(check.name)?.at(-1);
+    pairs.set(check.name, previous ? [previous, check] : [check]);
+  }
+  return [...pairs].filter(([_name, pair]) => pair.length === 2).map(([name, [before, after]]) =>
+    name + ' · ' + before.status + ' → ' + after.status +
+    (after.exitCode == null ? '' : ' · exit ' + after.exitCode) +
+    ' · ' + checkLocations(after).slice(0, 3).join(', ')).map(line => line.replace(/ · $/, ''));
+}
+
 export function checkEvidence(check, limit = 1200) {
   const lines = ((check.stderr ?? '') + '\n' + (check.stdout ?? '')).split(/\r?\n/).map(text => text.trim()).filter(Boolean);
   const paths = [...new Set(lines.flatMap(line => line.match(/(?:[\w./\\-]+\.[\w-]+):\d+(?::\d+)?/g) ?? []))].slice(0, 4);
@@ -57,7 +75,7 @@ export async function recheck(stage, job, session, configured, { signal, save, e
   for (const original of stage.recheck.checks) {
     const check = Object.hasOwn(configured, original.name) ? configured[original.name] : null;
     const same = check && (original.commandKey
-      ? checkKey(check.argv, check.timeout) === original.commandKey
+      ? checkKey(check.argv, check.timeout, check.directory) === original.commandKey
       : JSON.stringify(check.argv) === JSON.stringify(original.command) &&
         (original.timeout === undefined || original.timeout === check.timeout));
     if (!same)

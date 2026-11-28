@@ -208,6 +208,19 @@ test('CLI reviews a multi-file change before applying it and runs the authorized
   assert.match(result.stderr, /validate · passed · exit 0/);
 });
 
+test('Git patch export preserves file bytes and review check options validate directory paths', async t => {
+  const { asGitPatch } = await import('../src/changes.mjs');
+  const { defineCheck } = await import('../src/checks.mjs');
+  const root = await temp(t);
+  await writeFile(join(root, 'space name.txt'), 'before\r\n');
+  const patch = asGitPatch([{ path: 'space name.txt', before: 'before\r\n', after: 'after\r\n' }]);
+  await writeFile(join(root, 'edit.patch'), patch);
+  await exec('git', ['apply', 'edit.patch'], { cwd: root });
+  assert.equal(await readFile(join(root, 'space name.txt'), 'utf8'), 'after\r\n');
+  assert.equal(defineCheck(['node', '-v'], 15, 'packages/api').directory, 'packages/api');
+  assert.throws(() => defineCheck(['node'], 15, '../outside'), /relative to the workspace/);
+});
+
 test('review edits report newline and workspace changes and do not affect workspace files', async () => {
   const { overrideReviewFile, reviewDiff, fileOperation } = await import('../src/changes.mjs');
   const file = { path: 'sample.txt', before: 'first\r\n', after: 'second\r\n', workspaceChanged: true };

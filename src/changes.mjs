@@ -410,7 +410,7 @@ function diffRanges(ops) {
   return ranges;
 }
 
-function hunks(ops) {
+function hunks(ops, raw = false) {
   const ranges = diffRanges(ops);
   const output = [];
   let index = 0, oldBase = 0, newBase = 0;
@@ -425,7 +425,8 @@ function hunks(ops) {
     output.push('@@ -' + (oldBase + Number(oldCount > 0)) + ',' + oldCount +
       ' +' + (newBase + Number(newCount > 0)) + ',' + newCount + ' @@');
     for (const [prefix, line] of rows) {
-      output.push(prefix + line.replace(/\n$/, '').replace(/\r/g, '␍'));
+      const text = line.replace(/\n$/, '');
+      output.push(prefix + (raw ? text : text.replace(/\r/g, '␍')));
       if (!line.endsWith('\n')) output.push('\\ No newline at end of file');
     }
   }
@@ -469,6 +470,24 @@ export function overrideReviewFile(review, path, bytes) {
   if (total > maxReview) throw new Error('The combined before-and-after contents exceed 1 MiB.');
   file.after = text;
   if (ownHunks(review, path)) delete review.hunkSelections[path];
+}
+
+export function asGitPatch(files) {
+  const quote = path => JSON.stringify(path);
+  const mode = input => '100' + (input != null && input & 0o111 ? '755' : '644');
+  return files.flatMap(file => {
+    const left = quote('a/' + file.path), right = quote('b/' + file.path);
+    const before = side(file, 'before'), after = side(file, 'after');
+    const rows = ['diff --git ' + left + ' ' + right];
+    if (before.text === null) rows.push('new file mode ' + mode(after.mode));
+    else if (after.text === null) rows.push('deleted file mode ' + mode(before.mode));
+    else if (mode(before.mode) !== mode(after.mode)) rows.push('old mode ' + mode(before.mode), 'new mode ' + mode(after.mode));
+    if (before.text !== after.text && (before.text || after.text)) {
+      rows.push('--- ' + (before.text === null ? '/dev/null' : left), '+++ ' + (after.text === null ? '/dev/null' : right),
+        ...hunks(diffOperations(textLines(before.text), textLines(after.text)), true));
+    }
+    return rows;
+  }).join('\n') + '\n';
 }
 
 export function reviewDiff(review, filePath) {

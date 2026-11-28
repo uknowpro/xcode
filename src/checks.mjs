@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { realpath, stat } from 'node:fs/promises';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
+import { Workspace } from './workspace.mjs';
 import { checkLimit } from './limits.mjs';
 
 const defaultTimeout = 120;
@@ -13,13 +15,15 @@ export function projectChecks(config, root) {
   return checks && typeof checks === 'object' && !Array.isArray(checks) ? checks : {};
 }
 
-export function defineCheck(argv, timeout = defaultTimeout) {
+export function defineCheck(argv, timeout = defaultTimeout, directory = '.') {
   if (!Array.isArray(argv) || !argv.length || argv.length > 32 ||
     argv.some(arg => typeof arg !== 'string' || arg.length > 1024 || arg.includes('\0')) || !argv[0]?.trim())
     throw new Error('Provide an executable and up to 31 arguments.');
   if (!Number.isInteger(timeout) || timeout < 1 || timeout > 600)
     throw new Error('Check timeout must be 1–600 seconds.');
-  return { argv, timeout };
+  if (typeof directory !== 'string' || !directory || directory.includes('\0') || isAbsolute(directory) ||
+      directory.split(/[\\/]/).includes('..')) throw new Error('Check directory must be relative to the workspace.');
+  return { argv, timeout, ...(directory !== '.' ? { directory } : {}) };
 }
 
 function kill(child, signal = 'SIGTERM') {
@@ -46,8 +50,8 @@ function resolveCommand(argv) {
   return argv;
 }
 
-export function checkKey(argv, timeout) {
-  return createHash('sha256').update(JSON.stringify([argv, timeout])).digest('hex');
+export function checkKey(argv, timeout, directory) {
+  return createHash('sha256').update(JSON.stringify([argv, timeout, ...(directory && directory !== '.' ? [directory] : [])])).digest('hex');
 }
 
 function scrub(value, secrets) {
@@ -66,7 +70,9 @@ export async function runCheck(root, checks, name, signal, options = {}) {
 async function runRegisteredCheck(root, checks, name, signal, { secrets = [] } = {}) {
   if (typeof name !== 'string' || !checkName.test(name) || !Object.hasOwn(checks, name))
     throw new Error('Unknown project check. Configure it with xcode check add.');
-  const { argv, timeout } = defineCheck(checks[name]?.argv, checks[name]?.timeout);
+  const { argv, timeout, directory } = defineCheck(checks[name]?.argv, checks[name]?.timeout, checks[name]?.directory);
+  const cwd = new Workspace(root).scope(directory);
+  if (await realpath(cwd) !== cwd || !(await stat(cwd)).isDirectory()) throw new Error('Check directory is unavailable or is a symbolic link.');
   signal?.throwIfAborted();
   const [file, ...args] = resolveCommand(argv);
   const started = Date.now();
@@ -74,7 +80,7 @@ async function runRegisteredCheck(root, checks, name, signal, { secrets = [] } =
   delete env.XCODE_API_TOKEN;
   return new Promise((resolve, reject) => {
     const child = spawn(file, args, {
-      cwd: root, env, shell: false, windowsHide: true, detached: process.platform !== 'win32',
+      cwd, env, shell: false, windowsHide: true, detached: process.platform !== 'win32',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const output = { stdout: '', stderr: '' };
@@ -116,8 +122,8 @@ async function runRegisteredCheck(root, checks, name, signal, { secrets = [] } =
       cleanup();
       if (signal?.aborted) return reject(signal.reason);
       resolve({
-        name, command: argv.map(arg => scrub(arg, protectedValues)), commandKey: checkKey(argv, timeout),
-        timeout, durationMs: Date.now() - started, exitCode, exitSignal,
+        name, command: argv.map(arg => scrub(arg, protectedValues)), commandKey: checkKey(argv, timeout, directory),
+        timeout, ...(directory ? { directory } : {}), durationMs: Date.now() - started, exitCode, exitSignal,
         status: stopReason ?? (exitCode === 0 ? 'passed' : 'failed'),
         stdout: scrub(output.stdout, protectedValues).slice(-outputLimit),
         stderr: scrub(output.stderr, protectedValues).slice(-outputLimit),
