@@ -1,5 +1,6 @@
 import { complete } from './model.mjs';
 import { modelPolicy } from './model-profile.mjs';
+import { modelFailure } from './model-transport.mjs';
 
 const probe = {
   type: 'function',
@@ -62,7 +63,7 @@ export async function diagnose(profile, token, { timeout = 15000, only, onResult
       result = detail ? { name, status: 'pass', detail } :
         { name, status: 'skip', detail: 'Tools are disabled in this profile.' };
     } catch (error) {
-      result = { name, status: 'fail', detail: error.name === 'TimeoutError' ? 'Probe timed out.' : error.message };
+      result = { name, status: 'fail', ...modelFailure(error) };
     }
     results.push(result);
     onResult(result);

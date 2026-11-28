@@ -5,12 +5,37 @@ export class ModelError extends Error {
     super(message);
     this.retryable = Boolean(options.retryable);
     this.status = options.status;
+    this.phase = options.phase;
+    this.code = options.code;
   }
 }
 
-export function failed(status, detail = '') {
+const failureLabels = {
+  request: 'Request',
+  dns: 'DNS',
+  connect: 'Connection',
+  tls: 'TLS',
+  auth: 'Authentication',
+  http: 'HTTP response',
+  response: 'Model response',
+  stream: 'Response stream',
+};
+
+export function modelFailure(error) {
+  if (!(error instanceof ModelError)) return { detail: error.message };
+  const label = failureLabels[error.phase];
+  return {
+    detail: label ? label + ' · ' + error.message : error.message,
+    ...(label ? { phase: error.phase } : {}),
+    ...(error.code ? { code: error.code } : {}),
+    ...(error.status ? { httpStatus: error.status } : {}),
+  };
+}
+
+export function failed(status, detail = '', phase) {
+  if (status === 401 || status === 403) phase = 'auth';
   if (status === 429 || status === 402 || /quota|insufficient.{0,20}(?:credit|balance)|resource.exhausted|rate.limit|usage.{0,20}(?:limit|exceed)|billing/i.test(detail))
-    return new ModelError('Model rate or usage limit reached' + (status ? ' (HTTP ' + status + ')' : '') + '.', { status });
+    return new ModelError('Model rate or usage limit reached' + (status ? ' (HTTP ' + status + ')' : '') + '.', { status, phase });
   const explanation = {
     400: /reasoning_content|(?:thinking|reasoning).{0,50}(?:unsupported|required|invalid|not supported)/i.test(detail)
       ? 'The server rejected reasoning settings or conversation state. Run the profile tool probe and check the serving backend.'
@@ -20,21 +45,26 @@ export function failed(status, detail = '') {
     404: 'Check the API URL, protocol, and model ID.',
   }[status] ?? 'Check the endpoint and model server.';
   return new ModelError((status ? 'HTTP ' + status + '. ' : 'Model request failed. ') + explanation, {
-    status,
+    status, phase,
     retryable: status === 408 || status >= 500,
   });
 }
 
-function networkError(error, signal) {
-  if (signal?.aborted) throw signal.reason;
-  const code = error.cause?.code ?? '';
+function networkError(error, signal, phase = 'connect') {
+  if (signal?.aborted) {
+    if (signal.reason?.name !== 'TimeoutError') throw signal.reason;
+    return new ModelError('The request timed out.', { phase, code: 'TIMEOUT', retryable: true });
+  }
+  const rawCode = error.cause?.code;
+  const code = typeof rawCode === 'string' && /^[A-Z0-9_]{1,64}$/.test(rawCode) ? rawCode : undefined;
   if (error.cause?.message === 'unexpected redirect')
-    return new ModelError('The server redirected this request. Configure its final API URL.');
-  if (/CERT|TLS|SSL/.test(code))
-    return new ModelError('The model endpoint certificate could not be verified (' + code + ').');
-  return new ModelError('Model connection failed' + (/^[A-Z0-9_]+$/.test(code) ? ' (' + code + ')' : '') + '.', {
-    retryable: true,
-  });
+    return new ModelError('The server redirected this request. Configure its final API URL.', { phase: 'http' });
+  if (code && /CERT|TLS|SSL/.test(code))
+    return new ModelError('The TLS connection could not be verified (' + code + ').', { phase: 'tls', code });
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN' || code === 'EAI_FAIL')
+    return new ModelError('Could not resolve the model hostname (' + code + ').', { phase: 'dns', code, retryable: true });
+  const message = phase === 'connect' ? 'Model connection failed' : 'Connection closed while receiving the model response';
+  return new ModelError(message + (code ? ' (' + code + ')' : '') + '.', { phase, code, retryable: true });
 }
 
 async function responseText(response, limit, truncate = false) {
@@ -63,7 +93,7 @@ async function responseText(response, limit, truncate = false) {
 
 export async function fetchModel(url, headers, payload, signal) {
   const body = JSON.stringify(payload);
-  if (Buffer.byteLength(body) > 24 * 1024 * 1024) throw new ModelError('Model request exceeds 24 MiB.');
+  if (Buffer.byteLength(body) > 24 * 1024 * 1024) throw new ModelError('Model request exceeds 24 MiB.', { phase: 'request' });
   const response = await fetch(url, {
     method: 'POST', credentials: 'omit', redirect: 'error', signal,
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream, application/json', ...headers },
@@ -71,8 +101,8 @@ export async function fetchModel(url, headers, payload, signal) {
   }).catch(error => { throw networkError(error, signal); });
   if (!response.ok) {
     const detail = await responseText(response, 4096, true).catch(() => '');
-    signal?.throwIfAborted();
-    throw failed(response.status, detail);
+    if (signal?.aborted) throw networkError(signal.reason, signal, 'http');
+    throw failed(response.status, detail, 'http');
   }
   return response;
 }
@@ -83,7 +113,7 @@ export async function readJsonResponse(response, signal) {
     data = await responseText(response, maxResponse);
   } catch (error) {
     if (error instanceof ModelError) throw error;
-    throw networkError(error, signal);
+    throw networkError(error, signal, 'response');
   }
   try {
     const value = JSON.parse(data);
@@ -102,7 +132,7 @@ export async function* readEvents(body, signal) {
   let received = 0;
   try {
     for (;;) {
-      const { done, value } = await reader.read().catch(error => { throw networkError(error, signal); });
+      const { done, value } = await reader.read().catch(error => { throw networkError(error, signal, 'stream'); });
       received += value?.byteLength ?? 0;
       if (received > maxResponse) throw new ModelError('Model stream exceeds the size limit.');
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });

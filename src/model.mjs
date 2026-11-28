@@ -54,8 +54,16 @@ export async function complete(profile, token, messages, { tools = [], stream = 
   const response = await fetchModel(url, request.headers, request.payload, signal);
   const sse = response.headers.get('content-type')?.includes('text/event-stream');
   onFormat(sse ? 'sse' : 'json');
-  if (native) return nativeResponse(policy.protocol, response, { sse, signal, onText });
+  try {
+    return native ? await nativeResponse(policy.protocol, response, { sse, signal, onText }) :
+      await chatResponse(response, { policy, sse, signal, onText });
+  } catch (error) {
+    if (error instanceof ModelError) error.phase ??= sse ? 'stream' : 'response';
+    throw error;
+  }
+}
 
+async function chatResponse(response, { policy, sse, signal, onText }) {
   const result = { role: 'assistant', content: '', tool_calls: new Map() };
   if (sse) {
     let completed = false;

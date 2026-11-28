@@ -10,6 +10,7 @@ import { attach, attachmentSize, explicitReferences, maxAttachmentBytes, maxAtta
 import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
 import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
+import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
 import { checkEvidence } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
@@ -727,7 +728,7 @@ async function chat(root, base, defaults, options, prefix) {
     if (live !== selected) {
       if (['complete', 'error', 'review'].includes(event.type))
         show('[' + live.session.id.slice(0, 8) + '] ' + (event.type === 'complete' ? 'Response ready' :
-          event.type === 'review' ? 'Change set needs review' : event.error.message));
+          event.type === 'review' ? 'Change set needs review' : modelFailure(event.error).detail));
       return;
     }
     if (event.type === 'text') {
@@ -748,7 +749,7 @@ async function chat(root, base, defaults, options, prefix) {
     } else if (event.type === 'review') {
       show('Change set ' + event.id + ' · ' + event.files.length + ' files · /diff to review, /apply or /reject.');
     } else if (event.type === 'error' || event.type === 'note') {
-      show(event.error?.message ?? event.text);
+      show(event.error ? modelFailure(event.error).detail : event.text);
     } else if (event.type === 'complete') {
       endStream();
       if (pager?.responseHidden) show('Response ready · /history to view.');
@@ -1164,6 +1165,6 @@ async function main() {
 }
 
 main().catch(error => {
-  info(error.message);
+  info(modelFailure(error).detail);
   process.exitCode = error.name === 'AbortError' ? 130 : 1;
 });

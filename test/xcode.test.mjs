@@ -1050,6 +1050,27 @@ test('a broken one-shot model stream leaves stdout free of partial answers', asy
     error.code === 1 && error.stdout === '' && /stream ended early/.test(error.stderr));
 });
 
+test('connection diagnostics separate HTTP authentication and malformed model streams', async t => {
+  const api = await server(t, (_body, res, request) => {
+    if (request === 1) {
+      res.writeHead(401).end('private provider message');
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.end('data: malformed\n\n');
+  });
+  const { diagnose } = await import('../src/diagnostic.mjs');
+  const model = { endpoint: api.url, model: 'fixture' };
+  const [auth] = await diagnose(model, 'fixture-token', { only: 'chat' });
+  assert.equal(auth.phase, 'auth');
+  assert.equal(auth.httpStatus, 401);
+  assert.doesNotMatch(auth.detail, /private provider message/);
+  const [stream] = await diagnose(model, 'fixture-token', { only: 'sse' });
+  assert.equal(stream.phase, 'stream');
+  assert.equal(stream.status, 'fail');
+  assert.match(stream.detail, /Response stream/);
+});
+
 test('terminal views clip Korean and emoji on display columns without breaking graphemes', async () => {
   const { terminalClip, terminalWidth } = await import('../src/terminal.mjs');
   assert.equal(terminalWidth('가🙂e\u0301'), 5);
