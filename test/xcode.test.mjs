@@ -1076,6 +1076,35 @@ test('a broken one-shot model stream leaves stdout free of partial answers', asy
     error.code === 1 && error.stdout === '' && /stream ended early/.test(error.stderr));
 });
 
+test('model and check concurrency are limited independently and queued work can be cancelled', async () => {
+  const { modelLimit, checkLimit, executionLimits, setLimits } = await import('../src/limits.mjs');
+  setLimits(executionLimits({}, { 'model-jobs': '1', 'check-jobs': '2' }));
+  try {
+    let release;
+    const first = modelLimit.run(undefined, () => new Promise(resolve => { release = resolve; }));
+    const controller = new AbortController();
+    const pending = modelLimit.run(controller.signal, () => assert.fail('cancelled work ran'));
+    assert.equal(await checkLimit.run(undefined, async () => 'available'), 'available');
+    controller.abort();
+    await assert.rejects(pending, { name: 'AbortError' });
+    release('done');
+    assert.equal(await first, 'done');
+    assert.equal(await modelLimit.run(undefined, async () => 'next'), 'next');
+  } finally {
+    setLimits();
+  }
+});
+
+test('stream first-event and idle limits are independent', async () => {
+  const { readEvents } = await import('../src/model-transport.mjs');
+  const empty = new ReadableStream();
+  await assert.rejects(readEvents(empty, undefined, { firstEventTimeout: 0.03 }).next(), /first event/);
+  const stream = new ReadableStream({ start(controller) { controller.enqueue(Buffer.from('data: {"ready":true}\n\n')); } });
+  const events = readEvents(stream, undefined, { firstEventTimeout: 0.03, idleTimeout: 0.03 });
+  assert.deepEqual((await events.next()).value, { ready: true });
+  await assert.rejects(events.next(), /idle/);
+});
+
 test('connection diagnostics separate HTTP authentication and malformed model streams', async t => {
   const api = await server(t, (_body, res, request) => {
     if (request === 1) {
@@ -1158,6 +1187,30 @@ test('terminal views clip Korean and emoji on display columns without breaking g
   assert.equal(terminalClip('가🙂e\u0301', 3), '가…');
   assert.equal(terminalClip('가🙂e\u0301', 4, 2), '…🙂e\u0301');
   assert.equal(terminalWidth('a\t가'), 6);
+});
+
+test('session listing and the recent page avoid loading a large archived transcript', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const module = new URL('../src/store.mjs', import.meta.url).href;
+  const program = [
+    'import assert from "node:assert/strict";',
+    'import { mkdir, readFile, rm } from "node:fs/promises";',
+    'import { join } from "node:path";',
+    'const store = await import(' + JSON.stringify(module) + ');',
+    'await mkdir(store.sessionsDir);',
+    'const id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";',
+    'const chunk = "x".repeat(128 * 1024);',
+    'const turns = Array.from({ length: 140 }, (_, index) => ({ answer: chunk + index, prompt: String(index), status: "complete" }));',
+    'await store.writeSession({ id, root: process.cwd(), title: "Large", updated: "2026-01-01", turns, queue: [] });',
+    'const main = JSON.parse(await readFile(store.sessionPath(id), "utf8"));',
+    'await rm(join(store.sessionsDir, id + ".records"), { recursive: true });',
+    'assert.equal((await store.listSessions(process.cwd())).length, 1);',
+    'assert.equal((await store.readSessionPage(id, undefined, 1)).entries[0].number, 140);',
+    'assert.equal(main.turns.length, 12);',
+    'assert.equal(main.olderTurns.length, 128);',
+  ].join('\n');
+  await exec(process.execPath, ['--max-old-space-size=64', '--input-type=module', '-e', program], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
 });
 
 test('long session history reads a bounded page without hydrating archived turns or model state', async t => {

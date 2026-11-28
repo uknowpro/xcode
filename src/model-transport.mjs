@@ -91,14 +91,17 @@ async function responseText(response, limit, truncate = false) {
 }
 
 
-export async function fetchModel(url, headers, payload, signal) {
+export async function fetchModel(url, headers, payload, signal, headerTimeout) {
   const body = JSON.stringify(payload);
   if (Buffer.byteLength(body) > 24 * 1024 * 1024) throw new ModelError('Model request exceeds 24 MiB.', { phase: 'request' });
+  const controller = headerTimeout ? new AbortController() : null;
+  const attempt = controller && signal ? AbortSignal.any([signal, controller.signal]) : controller?.signal ?? signal;
+  const clock = controller ? setTimeout(() => controller.abort(new DOMException('Connection deadline', 'TimeoutError')), headerTimeout * 1000) : undefined;
   const response = await fetch(url, {
-    method: 'POST', credentials: 'omit', redirect: 'error', signal,
+    method: 'POST', credentials: 'omit', redirect: 'error', signal: attempt,
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream, application/json', ...headers },
     body,
-  }).catch(error => { throw networkError(error, signal); });
+  }).catch(error => { throw networkError(error, attempt); }).finally(() => clearTimeout(clock));
   if (!response.ok) {
     const detail = await responseText(response, 4096, true).catch(() => '');
     if (signal?.aborted) throw networkError(signal.reason, signal, 'http');
@@ -124,15 +127,26 @@ export async function readJsonResponse(response, signal) {
   throw new ModelError('Expected a JSON or SSE model response.');
 }
 
-export async function* readEvents(body, signal) {
+export async function* readEvents(body, signal, timeouts = {}) {
   const reader = body?.getReader();
   if (!reader) throw new ModelError('The model sent an empty stream.');
   const decoder = new TextDecoder();
   let buffer = '';
   let received = 0;
+  let eventSeen = false;
+  let last = Date.now();
+  let timer;
   try {
     for (;;) {
-      const { done, value } = await reader.read().catch(error => { throw networkError(error, signal, 'stream'); });
+      const bound = eventSeen ? timeouts.idleTimeout : timeouts.firstEventTimeout;
+      const read = reader.read().catch(error => { throw networkError(error, signal, 'stream'); });
+      const { done, value } = bound ? await Promise.race([read, new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new ModelError(eventSeen ? 'The model stream went idle.' :
+          'The model did not send its first event in time.', { phase: 'stream', code: 'TIMEOUT', retryable: true })),
+        Math.max(0, last + bound * 1000 - Date.now()));
+      })]) : await read;
+      clearTimeout(timer);
+      if (eventSeen && value) last = Date.now();
       received += value?.byteLength ?? 0;
       if (received > maxResponse) throw new ModelError('Model stream exceeds the size limit.');
       buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
@@ -146,6 +160,8 @@ export async function* readEvents(body, signal) {
         const lines = event.split('\n');
         const data = lines.filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
         if (!data.trim()) continue;
+        eventSeen = true;
+        last = Date.now();
         if (data.trim() === '[DONE]') { yield null; return; }
         let part;
         try { part = JSON.parse(data); }
@@ -158,6 +174,7 @@ export async function* readEvents(body, signal) {
       if (done) return;
     }
   } finally {
+    clearTimeout(timer);
     await reader.cancel().catch(() => {});
   }
 }

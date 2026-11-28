@@ -67,8 +67,11 @@ export function modelPolicy(profile) {
   const requestTimeout = integer(profile.requestTimeout, 'Request timeout seconds', 5, 1800) ?? 180;
   if (contextWindow && maxTokens && maxTokens >= contextWindow)
     throw new Error('Output tokens must be smaller than the context window.');
+  const headerTimeout = integer(profile.headerTimeout, 'Connection timeout seconds', 1, 600);
+  const firstEventTimeout = integer(profile.firstEventTimeout, 'First event timeout seconds', 1, 600);
+  const idleTimeout = integer(profile.idleTimeout, 'Stream idle timeout seconds', 1, 600);
   const replay = protocol !== 'chat-completions' || ['deepseek-flash', 'qwen', 'kimi', 'gemini'].includes(adapter);
-  return { adapter, selected, protocol, selection, preset, thinking, effort, contextWindow, maxTokens, requestTimeout, replay };
+  return { adapter, selected, protocol, selection, preset, thinking, effort, contextWindow, maxTokens, requestTimeout, headerTimeout, firstEventTimeout, idleTimeout, replay };
 }
 
 export function modelEndpoint(profile, policy, stream = false) {
@@ -96,7 +99,8 @@ export function configureModel(profile, options) {
   ]) {
     if (options[flag] !== undefined) value[key] = options[flag];
   }
-  for (const [flag, key] of [['context-window', 'contextWindow'], ['max-tokens', 'maxTokens'], ['request-timeout', 'requestTimeout']]) {
+  for (const [flag, key] of [['context-window', 'contextWindow'], ['max-tokens', 'maxTokens'], ['request-timeout', 'requestTimeout'],
+    ['header-timeout', 'headerTimeout'], ['first-event-timeout', 'firstEventTimeout'], ['idle-timeout', 'idleTimeout']]) {
     const input = options[flag];
     if (input === undefined) continue;
     if (input === 'default') delete value[key];
@@ -139,6 +143,9 @@ export function modelTuning(profile) {
     'Protocol · ' + policy.protocol + (policy.selection === 'auto' ? ' (auto)' : ''),
     'Adapter · ' + policy.adapter + (policy.selected === 'auto' ? ' (auto)' : ''),
     'Request timeout · ' + policy.requestTimeout + 's',
+    ...(policy.headerTimeout ? ['Connection timeout · ' + policy.headerTimeout + 's'] : []),
+    ...(policy.firstEventTimeout ? ['First event timeout · ' + policy.firstEventTimeout + 's'] : []),
+    ...(policy.idleTimeout ? ['Stream idle timeout · ' + policy.idleTimeout + 's'] : []),
     ...(policy.adapter === 'compatible' ? [] : [
       'Model preset · ' + (policy.preset === 'default' ? 'server defaults' : policy.preset),
       'Thinking · ' + (policy.thinking === 'default' ? 'server default' : policy.thinking),

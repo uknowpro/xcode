@@ -251,9 +251,9 @@ function modelReply(protocol, value) {
   return { role: 'assistant', content, providerState, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) };
 }
 
-export async function nativeResponse(protocol, response, { sse, signal, onText }) {
+export async function nativeResponse(protocol, response, { sse, signal, onText, timeouts }) {
   const parse = { responses: responsesBody, anthropic: anthropicBody, gemini: geminiBody }[protocol];
-  const body = sse ? await parse(readEvents(response.body, signal), onText) : await readJsonResponse(response, signal);
+  const body = sse ? await parse(readEvents(response.body, signal, timeouts), onText) : await readJsonResponse(response, signal);
   const message = modelReply(protocol, body);
   if (!sse && message.content) onText(message.content);
   return message;

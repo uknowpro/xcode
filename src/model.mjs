@@ -1,6 +1,7 @@
 import { modelEndpoint, modelPolicy, requestOptions } from './model-profile.mjs';
 import { failed, fetchModel, ModelError, readEvents, readJsonResponse } from './model-transport.mjs';
 import { nativeRequest, nativeResponse } from './provider-api.mjs';
+import { modelLimit } from './limits.mjs';
 
 export { ModelError } from './model-transport.mjs';
 
@@ -43,7 +44,11 @@ function applyChoice(result, part, onText) {
   if (choice?.finish_reason) result.finished = choice.finish_reason;
 }
 
-export async function complete(profile, token, messages, { tools = [], stream = true, signal, onText = () => {}, onFormat = () => {} } = {}) {
+export async function complete(profile, token, messages, options = {}) {
+  return modelLimit.run(options.signal, () => completeRequest(profile, token, messages, options));
+}
+
+async function completeRequest(profile, token, messages, { tools = [], stream = true, signal, onText = () => {}, onFormat = () => {} } = {}) {
   const policy = modelPolicy(profile);
   const url = modelEndpoint(profile, policy, stream);
   const native = policy.protocol !== 'chat-completions';
@@ -51,11 +56,11 @@ export async function complete(profile, token, messages, { tools = [], stream = 
     headers: token ? { Authorization: 'Bearer ' + token } : {},
     payload: { model: profile.model, messages, stream, ...(tools.length ? { tools } : {}), ...requestOptions(policy) },
   };
-  const response = await fetchModel(url, request.headers, request.payload, signal);
+  const response = await fetchModel(url, request.headers, request.payload, signal, policy.headerTimeout);
   const sse = response.headers.get('content-type')?.includes('text/event-stream');
   onFormat(sse ? 'sse' : 'json');
   try {
-    return native ? await nativeResponse(policy.protocol, response, { sse, signal, onText }) :
+    return native ? await nativeResponse(policy.protocol, response, { sse, signal, onText, timeouts: policy }) :
       await chatResponse(response, { policy, sse, signal, onText });
   } catch (error) {
     if (error instanceof ModelError) error.phase ??= sse ? 'stream' : 'response';
@@ -67,7 +72,7 @@ async function chatResponse(response, { policy, sse, signal, onText }) {
   const result = { role: 'assistant', content: '', tool_calls: new Map() };
   if (sse) {
     let completed = false;
-    for await (const part of readEvents(response.body, signal)) {
+    for await (const part of readEvents(response.body, signal, policy)) {
       if (!part) { completed = true; break; }
       applyChoice(result, part, onText);
       if (result.finished) break;

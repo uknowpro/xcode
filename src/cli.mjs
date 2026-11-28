@@ -22,6 +22,8 @@ import { readSession, readSessionPage, settings, setToken, storage, tokenFor, up
 import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
+import { executionLimits, setLimits } from './limits.mjs';
+import { cleanStorage, storageUsage } from './storage-inspect.mjs';
 import { formatHistoryPage, historyText, sessionMarkdown } from './session-history.mjs';
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
@@ -69,6 +71,8 @@ const help = [
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
+  '  xcode limits [--model-jobs <n>] [--check-jobs <n>]',
+  '  xcode storage [--json] [--clean cache|draft|attachments|archive --session <id>]',
   '  xcode terminal [--send-key ctrl+g|ctrl+x] [--newline-key enter|ctrl+o]',
   '                 [--theme auto|light|dark|plain] [--accessible|--no-accessible]',
   '  xcode report [session] [--probe] Export a private-data-free diagnostic report',
@@ -233,11 +237,19 @@ async function profileCommand(action, name, options) {
     const timeout = options.timeout === undefined
       ? (modelPolicy(profile).adapter === 'deepseek-flash' ? 60 : 15) : Number(options.timeout);
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 600) throw new Error('Probe timeout must be 1–600 seconds.');
-    const results = await diagnose(profile, await tokenFor(name), {
+    const token = await tokenFor(name);
+    const endpoint = modelEndpoint(profile, modelPolicy(profile), options.only !== 'chat');
+    const redact = value => {
+      if (!token) return value;
+      return value.replaceAll(token, '[redacted]').replaceAll(encodeURIComponent(token), '[redacted]');
+    };
+    const address = redact(endpoint.origin + endpoint.pathname);
+    if (!options.json) print('Request URL · ' + address);
+    const results = await diagnose(profile, token, {
       only: options.only, timeout: timeout * 1000,
       onResult: options.json ? undefined : item => print(item.name.toUpperCase() + ' ' + item.status.toUpperCase() + ' · ' + item.detail),
     });
-    if (options.json) print(JSON.stringify({ profile: name, results }, null, 2));
+    if (options.json) print(JSON.stringify({ profile: name, endpoint: address, results }, null, 2));
     if (results.some(item => item.status === 'fail')) process.exitCode = 1;
   } else {
     throw new Error('Use profile list, show, set, tune, use, test or eval.');
@@ -1363,6 +1375,9 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      'model-jobs': { type: 'string' }, 'check-jobs': { type: 'string' },
+      'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
+      clean: { type: 'string' }, session: { type: 'string' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
@@ -1373,6 +1388,14 @@ async function main() {
   const [command, ...rest] = positionals;
   if (values.help || command === 'help') return print(help);
   if (values.version) return print(JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
+  const initial = await settings().catch(() => null);
+  setLimits(initial?.execution);
+  if (command === 'limits') {
+    if (values['model-jobs'] !== undefined || values['check-jobs'] !== undefined)
+      await updateSettings(config => { config.execution = executionLimits(config.execution, values); });
+    const limits = executionLimits((await settings()).execution);
+    return print('Model requests · ' + limits.modelJobs + '\nProject checks · ' + limits.checkJobs + '\nLimits apply per xcode process.');
+  }
   if (command === 'setup') return setup(rest[0] || (await settings()).defaultProfile || 'default');
   if (command === 'profile') return profileCommand(rest[0], rest[1] || (await settings()).defaultProfile || 'default', values);
   const base = resolve(values.cwd || process.cwd());
@@ -1383,6 +1406,22 @@ async function main() {
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1]);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
+  if (command === 'storage') {
+    if (values.clean) {
+      if (!values.session) throw new Error('Provide --session <id> for cleanup.');
+      const found = await new Sessions(root).find(values.session);
+      const removed = await cleanStorage(root, values.clean, found.id);
+      return print(removed === undefined ? 'Storage cleaned.' : 'Removed ' + removed + ' pending attachments.');
+    }
+    const usage = await storageUsage(root);
+    return print(values.json ? JSON.stringify(usage, null, 2) : [
+      'Sessions · ' + usage.sessions + ' (' + usage.archived + ' archived)',
+      'Conversation · ' + usage.conversationBytes + ' bytes',
+      'Pending attachments · ' + usage.pendingAttachmentBytes + ' bytes (included in conversation)',
+      'Drafts · ' + usage.draftBytes + ' bytes',
+      'Index cache · ' + usage.cacheBytes + ' bytes',
+    ].join('\n'));
+  }
   if (command === 'terminal') {
     if (values['send-key'] !== undefined || values['newline-key'] !== undefined || values.theme !== undefined ||
         values.accessible || values['no-accessible']) {

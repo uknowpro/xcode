@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { checkLimit } from './limits.mjs';
 
 const defaultTimeout = 120;
 const outputLimit = 12000;
@@ -58,7 +59,11 @@ function scrub(value, secrets) {
     '[redacted]');
 }
 
-export async function runCheck(root, checks, name, signal, { secrets = [] } = {}) {
+export async function runCheck(root, checks, name, signal, options = {}) {
+  return checkLimit.run(signal, () => runRegisteredCheck(root, checks, name, signal, options));
+}
+
+async function runRegisteredCheck(root, checks, name, signal, { secrets = [] } = {}) {
   if (typeof name !== 'string' || !checkName.test(name) || !Object.hasOwn(checks, name))
     throw new Error('Unknown project check. Configure it with xcode check add.');
   const { argv, timeout } = defineCheck(checks[name]?.argv, checks[name]?.timeout);

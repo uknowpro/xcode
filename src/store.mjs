@@ -147,7 +147,7 @@ const wireRefs = new WeakMap();
 const isReference = ref => typeof ref === 'string' && /^[0-9a-f-]{36}$/.test(ref);
 const recordsDir = id => sessionPath(id).replace(/\.json$/, '.records');
 
-async function readSessionRecord(id) {
+export async function readSessionRecord(id) {
   const path = sessionPath(id);
   const info = await lstat(path).catch(missing);
   if (!info) return null;
@@ -275,9 +275,9 @@ async function indexProject(session) {
   }
 }
 
-export async function writeSession(session) {
+export async function writeSession(session, { separated = false } = {}) {
   const path = sessionPath(session.id);
-  await saveJson(path, await separateTurnRecords(session));
+  await saveJson(path, separated ? session : await separateTurnRecords(session));
   const info = await lstat(path).catch(() => null);
   if (info) await writeSummary(session.id, info, summarizeSession(session));
   await indexProject(session).catch(() => {});
