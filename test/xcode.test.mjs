@@ -188,6 +188,18 @@ test('CLI reviews a multi-file change before applying it and runs the authorized
   assert.match(diff, /-before/);
   assert.match(diff, /\+after/);
   assert.match(diff, /new\/path\/b\.txt/);
+  await writeFile(join(work, 'a.txt'), 'outside edit\n');
+  await mkdir(join(work, 'new', 'path'), { recursive: true });
+  await writeFile(join(work, 'new', 'path', 'b.txt'), 'existing target\n');
+  await assert.rejects(cli('review', 'check'), error =>
+    error.code === 1 && /a\.txt · Contents changed/.test(error.stderr) &&
+    /new\/path\/b\.txt · Target already exists/.test(error.stderr));
+  await assert.rejects(cli('review', 'apply'), /Files changed after the proposal was prepared/);
+  assert.equal(await readFile(join(work, 'a.txt'), 'utf8'), 'outside edit\n');
+  assert.equal(await readFile(join(work, 'new', 'path', 'b.txt'), 'utf8'), 'existing target\n');
+  await writeFile(join(work, 'a.txt'), 'before\n');
+  await rm(join(work, 'new', 'path', 'b.txt'));
+  assert.match((await cli('review', 'check')).stdout, /No conflicts/);
   await cli('review', 'apply');
   assert.equal(await readFile(join(work, 'a.txt'), 'utf8'), 'after\n');
   assert.equal(await readFile(join(work, 'new', 'path', 'b.txt'), 'utf8'), 'created\n');
@@ -374,7 +386,7 @@ test('partial approval preserves paired moves, and undo refuses to overwrite sub
   await assert.rejects(readFile(join(work, 'old.txt')), { code: 'ENOENT' });
   await assert.rejects(readFile(join(work, 'retired.txt')), { code: 'ENOENT' });
   await writeFile(join(work, 'docs', 'renamed.txt'), 'User edit');
-  await assert.rejects(cli('undo', 'latest', id), error => error.code === 1 && /File changed/.test(error.stderr));
+  await assert.rejects(cli('undo', 'latest', id), error => error.code === 1 && /docs\/renamed\.txt · Contents changed/.test(error.stderr));
   await assert.rejects(readFile(join(work, 'retired.txt')), { code: 'ENOENT' });
   assert.equal(await readFile(join(work, 'docs', 'renamed.txt'), 'utf8'), 'User edit');
   await writeFile(join(work, 'docs', 'renamed.txt'), 'Moved text\n');

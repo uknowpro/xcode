@@ -32,7 +32,7 @@ To propose edits and run project verification, use
     xcode --harness implement --write --checks
 
 1. Describe the change. xcode can propose edits, new files, moves, or deletions.
-2. Open /diff and scroll using the arrow or page keys. Close with Esc. Use /apply for the full proposal, /apply path1 path2 to accept selected paths and decline the rest, or /reject to decline everything. Either path of a move selects both.
+2. Open /diff and scroll using the arrow or page keys. Close with Esc. Use /apply for the full proposal, /apply path1 path2 to accept selected paths and decline the rest, or /reject to decline everything. Either path of a move selects both. Run xcode review check to list conflicts before applying.
 3. The verify stage can run a linked check and show its exit code. /check unit runs it manually. Use xcode check run unit --json in scripts. xcode ask and xcode continue exit with code 4 when the latest result of a check is a failure.
 4. Use /changes and /undo <id> to inspect or reverse changes applied with version 0.1.2 or later. Undo stops if a file was changed after approval.
 

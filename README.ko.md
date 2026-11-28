@@ -32,7 +32,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
     xcode --harness implement --write --checks
 
 1. 변경 요청을 입력하면 파일 수정·생성·이동·삭제안을 준비합니다.
-2. /diff에서 검토합니다. /apply는 전체 적용, /apply 경로1 경로2는 선택한 파일만 적용, /reject는 전체 거절입니다. 이동은 원래 경로와 새 경로를 함께 적용합니다.
+2. /diff에서 검토합니다. /apply는 전체 적용, /apply 경로1 경로2는 선택한 파일만 적용, /reject는 전체 거절입니다. 이동은 원래 경로와 새 경로를 함께 적용합니다. 적용 전 xcode review check로 충돌 위치를 확인할 수 있습니다.
 3. 적용 후 검증 단계에서 연결한 테스트와 종료 코드를 확인합니다. /check unit으로 직접 실행할 수 있고, 스크립트에서는 xcode check run unit --json으로 결과를 읽을 수 있습니다. 마지막 검사 결과에 실패가 남아 있으면 xcode ask와 xcode continue는 종료 코드 4를 반환합니다.
 4. /changes에서 이력을 확인하고 /undo <ID>로 0.1.2부터 적용한 변경을 되돌립니다. 적용 이후의 수정이 감지되면 충돌을 표시합니다.
 

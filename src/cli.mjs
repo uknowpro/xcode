@@ -14,12 +14,12 @@ import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
 import { checkEvidence } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
-import { reviewDiff, selectedFiles } from './changes.mjs';
+import { conflictSummary, reviewConflicts, reviewDiff, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
 import { settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
-import { projectRoot } from './workspace.mjs';
+import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
@@ -59,7 +59,7 @@ const help = [
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|remove [name]',
   '  xcode check run <name> [--json]',
-  '  xcode review show|apply|reject [session] [paths...]',
+  '  xcode review show|check|apply|reject [session] [paths...]',
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
@@ -398,13 +398,24 @@ async function describeSettings(root, session) {
 }
 
 async function reviewCommand(root, action, prefix, paths) {
-  if (!['show', 'apply', 'reject'].includes(action)) throw new Error('Use review show, apply or reject [session].');
+  if (!['show', 'check', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     const review = live.session.queue[0]?.review;
     if (!review) throw new Error('There is no pending change set.');
-    if (action === 'show') return print(reviewDiff(review, paths[0]).join('\n'));
+    if (action === 'show' || action === 'check') {
+      if (action === 'show') print(reviewDiff(review, paths[0]).join('\n'));
+      const chosen = paths.length || review.state === 'applying' ? paths : review.markedPaths ?? paths;
+      if (action === 'check' && review.markedPaths && !chosen.length && review.state !== 'applying')
+        throw new Error('Select at least one file in /diff or pass paths to check.');
+      const conflicts = await reviewConflicts(new Workspace(root), review, action === 'show' ? [] : chosen);
+      if (conflicts.length) {
+        info(conflictSummary(conflicts));
+        if (action === 'check') process.exitCode = 1;
+      } else if (action === 'check') print('No conflicts in the selected files.');
+      return;
+    }
     if (action === 'reject' && paths.length) throw new Error('Reject the entire proposal, or apply only the paths you approve.');
     const files = await sessions.review(live, action, paths);
     print(action === 'apply' ? reviewDecision(files, review) : 'Rejected the change set.');
@@ -620,10 +631,11 @@ async function chat(root, base, defaults, options, prefix) {
   function drawReview(move = 0) {
     if (pager.kind === 'sessions') return drawSessions();
     const rows = Math.max(6, (stdout.rows || 24) - 4);
-    const { review, mode, picked } = pager;
+    const { review, mode, picked, conflicts } = pager;
     const lines = mode === 'files' ? review.files.map((file, index) =>
       (index === pager.focus ? '› ' : '  ') + (picked.has(file.path) ? '[x] ' : '[ ] ') + file.path +
-      (file.move?.to ? ' → ' + file.move.to : file.after === null ? ' · delete' : file.before === null ? ' · new' : ' · edit')
+      (conflicts.has(file.path) ? ' · conflict · ' + conflicts.get(file.path) :
+        file.move?.to ? ' → ' + file.move.to : file.after === null ? ' · delete' : file.before === null ? ' · new' : ' · edit')
     ) : mode === 'tests' ? verificationLines(selected.session) : pager.lines;
     const last = Math.max(0, lines.length - rows);
     pager.offset = Math.max(0, Math.min(last, pager.offset + move));
@@ -633,7 +645,7 @@ async function chat(root, base, defaults, options, prefix) {
     clearScreenDown(stdout);
     const width = Math.max(16, (stdout.columns || 80) - 1);
     print(terminalClip('Review ' + review.id + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
-      (mode === 'diff' && pager.file ? ' · ' + pager.file : ''), width));
+      (conflicts.size ? ' · ' + conflicts.size + ' conflicts' : '') + (mode === 'diff' && pager.file ? ' · ' + pager.file : ''), width));
     for (const line of lines.slice(pager.offset, pager.offset + rows))
       print(terminalClip(line, width, mode === 'files' ? 0 : pager.column));
     print(mode === 'files'
@@ -914,11 +926,16 @@ async function chat(root, base, defaults, options, prefix) {
         const review = session.queue[0]?.review;
         if (!review) throw new Error('There is no pending change set.');
         const lines = reviewDiff(review, arg);
-        if (process.env.TERM === 'dumb') { show(lines.join('\n')); break; }
+        const conflicts = await reviewConflicts(new Workspace(root), review);
+        if (process.env.TERM === 'dumb') {
+          show([conflictSummary(conflicts), lines.join('\n')].filter(Boolean).join('\n\n'));
+          break;
+        }
         endStream();
         const picked = new Set(review.state !== 'applying' && review.markedPaths ? review.markedPaths :
           selectedFiles(review).map(file => file.path));
-        pager = { review, picked, file: arg, mode: 'diff', lines, focus: 0, offset: 0, column: 0 };
+        pager = { review, picked, conflicts: new Map(conflicts.map(({ path, reason }) => [path, reason])),
+          file: arg, mode: 'diff', lines, focus: 0, offset: 0, column: 0 };
         stdout.write('\x1b[?1049h');
         drawReview();
         break;

@@ -201,21 +201,52 @@ async function write(project, file, target, expected, created) {
   }
 }
 
+async function inspectReview(project, files, recovery) {
+  const applied = [];
+  const conflicts = [];
+  for (const file of files) {
+    const before = side(file, 'before');
+    let current;
+    try {
+      current = await snapshot(project, file.path);
+    } catch {
+      conflicts.push({ path: file.path, reason: 'File cannot be read as a regular workspace file' });
+      continue;
+    }
+    if (matches(current, before)) continue;
+    if (recovery && matches(current, side(file, 'after'))) {
+      applied.push(file);
+      continue;
+    }
+    const reason = current.text === null ? 'File was removed' :
+      before.text === null ? 'Target already exists' :
+      current.text !== before.text ? 'Contents changed' : 'Permissions changed';
+    conflicts.push({ path: file.path, reason });
+  }
+  return { applied, conflicts };
+}
+
+export async function reviewConflicts(project, review, paths = []) {
+  return (await inspectReview(project, selectedFiles(review, paths), review.state === 'applying')).conflicts;
+}
+
+export function conflictSummary(conflicts) {
+  if (!conflicts.length) return '';
+  return 'Files changed after the proposal was prepared:\n' +
+    conflicts.map(({ path, reason }) => '  ' + path + ' · ' + reason).join('\n');
+}
+
 export async function applyReview(project, review, save, paths = []) {
   const key = createHash('sha256').update(process.platform === 'win32' ? project.root.toLowerCase() : project.root).digest('hex').slice(0, 24);
   const files = selectedFiles(review, paths);
   const unlock = await lock(sessionsDir, 'workspace-' + key);
   const recovery = review.state === 'applying';
-  const applied = [];
+  let applied;
   const created = [];
   try {
-    for (const file of files) {
-      const current = await snapshot(project, file.path);
-      if (matches(current, side(file, 'before'))) continue;
-      if (!recovery || !matches(current, side(file, 'after')))
-        throw new Error('File changed after the proposal was prepared: ' + file.path);
-      applied.push(file);
-    }
+    const inspection = await inspectReview(project, files, recovery);
+    if (inspection.conflicts.length) throw new Error(conflictSummary(inspection.conflicts));
+    applied = inspection.applied;
     review.state = 'applying';
     review.selection = files.map(file => file.path);
     await save();
@@ -226,6 +257,7 @@ export async function applyReview(project, review, save, paths = []) {
     }
     return review.selection;
   } catch (error) {
+    if (!applied) throw error;
     const failures = [];
     for (const file of applied.reverse()) {
       try {
