@@ -63,7 +63,9 @@ const help = [
   '  xcode profile list|show|use|set|tune|test|models|capabilities|compare|eval [name]',
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
   '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>] [--json]',
-  '  xcode harness list|show|effective|import|compose|export [name] [file]',
+  '  xcode harness list|show|effective|validate|eval|import|compose|export [name] [file]',
+  '  xcode search <query> [--path <dir>] [--pattern <glob>] [--regex]',
+  '  xcode symbol <identifier> [--path <dir>]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|remove [name]',
@@ -94,6 +96,8 @@ const chatHelp = [
   '/model [name]                  View or select a model profile',
   '/model fallback <name> [apply] Preview a new session using another endpoint',
   '/harness effective             Show active stages, model tuning and tools',
+  '/search <query>                Search with optional --regex, --path, --pattern or --type',
+  '/symbol <name>                 Find JavaScript and TypeScript definitions and references',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
   '/attach <path[#L10-L20]>, /clear   Add files or text ranges for the next message',
@@ -354,6 +358,38 @@ async function harnessCommand(root, action, name, args, options) {
     showHarness(config, name || 'default', root);
   } else if (action === 'effective') {
     print(effectiveHarness(config, name || 'default', root, options));
+  } else if (action === 'validate') {
+    const selected = name ?? 'default';
+    const profileName = options.profile ?? config.defaultProfile ?? 'default';
+    const model = profileFor(config, profileName);
+    const cache = await savedCapabilities(profileName);
+    const harness = harnessFor(config, selected);
+    const skills = await skillsAt(root);
+    const binding = checksForHarness(config, root, selected);
+    const issues = [];
+    for (const skill of harness.skills ?? []) if (!skills.has(skill)) issues.push('Missing skill: ' + skill);
+    if (harness.stages.some(stage => stage.tools?.length) && model.tools === false) issues.push('Tool calling disabled in the model profile.');
+    if (cache?.key === diagnosticKey(model) && cache.tests?.tools?.status === 'fail') issues.push('The last tool-calling probe failed.');
+    for (const check of binding.names ?? []) if (!Object.hasOwn(binding.checks, check)) issues.push('Unknown registered check: ' + check);
+    if (harness.stages.some(stage => stage.tools?.includes('run_check')) && !Object.keys(binding.checks).length)
+      issues.push('No registered checks for the verification stage.');
+    print(options.json ? JSON.stringify({ harness: selected, issues }, null, 2) : issues.join('\n') || 'Harness prerequisites satisfied.');
+    if (issues.length) process.exitCode = 1;
+  } else if (action === 'eval') {
+    const profileName = options.profile ?? config.defaultProfile ?? 'default';
+    const profile = profileFor(config, profileName);
+    const token = await tokenFor(profileName);
+    const names = [name ?? 'default', ...(options.against ? [options.against] : [])];
+    const results = [];
+    for (const name of names) {
+      const { metrics, durationMs, error, search, read, resume, check, citation } =
+        await evaluateProfile(profile, token, { harness: harnessFor(config, name) });
+      const passed = [search, read, resume, check, citation].filter(Boolean).length;
+      results.push({ harness: name, passed, total: 5, durationMs, metrics, ...(error ? { error } : {}) });
+    }
+    print(options.json ? JSON.stringify(results, null, 2) : results.map(item => item.harness + ' · ' + item.passed + '/' +
+      item.total + ' · ' + item.durationMs + ' ms · ' + item.metrics.toolCalls + ' tool calls · ' +
+      item.metrics.requestMessageBytes + ' message bytes').join('\n'));
   } else if (action === 'export' && name) {
     print(JSON.stringify(harnessFor(config, name), null, 2));
   } else if (action === 'compose' && name) {
@@ -1078,6 +1114,12 @@ async function chat(root, base, defaults, options, prefix) {
           keys.send.toUpperCase() + ' sends · ' + keys.newline.toUpperCase() + ' adds a line.');
         break;
       case '/settings': show(await describeSettings(root, session)); break;
+      case '/search':
+      case '/symbol': {
+        const parsed = parseArgs({ args, options: searchOptions, allowPositionals: true });
+        show(await workspaceQuery(root, command.slice(1), parsed.positionals.join(' '), parsed.values));
+        break;
+      }
       case '/status':
         show(session.profile + ' · ' + session.harness + ' · ' + (session.write ? 'proposals allowed' : 'read-only') +
           ' · checks ' + (session.checks ? 'on' : 'off'));
@@ -1432,6 +1474,28 @@ async function chat(root, base, defaults, options, prefix) {
   }
 }
 
+const searchOptions = {
+  path: { type: 'string' }, pattern: { type: 'string' }, type: { type: 'string' }, regex: { type: 'boolean' },
+  offset: { type: 'string' }, line: { type: 'string' }, json: { type: 'boolean' },
+};
+const sourceTypes = { js: '*.{js,jsx,mjs,cjs}', ts: '*.{ts,tsx,mts,cts}', python: '*.py', json: '*.json', yaml: '*.{yaml,yml}' };
+
+async function workspaceQuery(root, action, query, options) {
+  const workspace = new Workspace(root);
+  if (options.type && !Object.hasOwn(sourceTypes, options.type)) throw new Error('Unknown file type: ' + options.type);
+  const params = { query, path: options.path, pattern: options.pattern ?? sourceTypes[options.type],
+    offset: options.offset === undefined ? undefined : Number(options.offset), start: options.line === undefined ? undefined : Number(options.line) };
+  const signal = AbortSignal.timeout(30000);
+  const result = action === 'symbol' ? await workspace.symbol({ name: query, path: options.path }, signal) :
+    options.regex ? await workspace.searchRegex(params, signal) : await workspace.search(params, signal);
+  if (options.json) return JSON.stringify(result, null, 2);
+  const lines = items => items.map(item => item.path + ':' + item.line + '  ' + item.text);
+  const rows = action === 'symbol' ? ['Definitions', ...lines(result.definitions), 'References', ...lines(result.references)] : lines(result.matches);
+  if (result.next) rows.push('Continue with --offset ' + result.next.offset + ' --line ' + result.next.start);
+  else if (result.truncated) rows.push('Results limited. Narrow the query or scope.');
+  return rows.join('\n') || 'No matching source lines.';
+}
+
 async function reportCommand(root, prefix, options) {
   if (options.only && (!options.probe || !['chat', 'sse', 'tools'].includes(options.only)))
     throw new Error('Use --probe --only chat, sse or tools.');
@@ -1455,6 +1519,7 @@ async function main() {
   const { positionals, values } = parseArgs({
     allowPositionals: true,
     options: {
+      ...searchOptions,
       cwd: { type: 'string' }, profile: { type: 'string' }, harness: { type: 'string' },
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
@@ -1522,6 +1587,7 @@ async function main() {
     return print('Send · ' + keys.send + '\nLine break · ' + keys.newline +
       '\nTheme · ' + style.theme + '\nAccessible output · ' + (style.accessible ? 'on' : 'off'));
   }
+  if (command === 'search' || command === 'symbol') return print(await workspaceQuery(root, command, rest.join(' '), values));
   if (command === 'report') return reportCommand(root, rest[0], values);
   if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'draft') {

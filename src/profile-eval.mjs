@@ -5,14 +5,17 @@ import { runJob } from './agent.mjs';
 
 class EvaluationCheckpoint extends Error {}
 
-export async function evaluateProfile(profile, token, { timeout = 120000 } = {}) {
+export async function evaluateProfile(profile, token, { timeout = 120000, harness } = {}) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'xcode-profile-eval-')));
   const start = performance.now();
   const results = { search: false, read: false, resume: false, check: false, citation: false };
   let job = {
     prompt: 'Use grep to locate the fixture constant invoiceLimit, then use read on its source, and run the registered unit check. Cite the exact filename and line where invoiceLimit is exported. Complete the three tool actions before answering.',
     attachments: [], completed: [], changed: [], tools: [],
-    harness: { stages: [{ name: 'Fixture', instruction: 'Use grep, read, and run_check. The unit check is named unit.', tools: ['grep', 'read', 'run_check'] }] },
+    harness: { ...(harness ? { role: harness.role } : {}), stages: [
+      ...(harness?.stages ?? []),
+      { name: 'Fixture', instruction: 'Use grep, read, and run_check. The unit check is named unit.', tools: ['grep', 'read', 'run_check'] },
+    ] },
   };
   const test = 'import assert from "node:assert/strict";\nimport { invoiceLimit } from "./invoice.mjs";\nassert.equal(invoiceLimit, 7);\n';
   const config = {
@@ -24,10 +27,13 @@ export async function evaluateProfile(profile, token, { timeout = 120000 } = {})
   let error;
   let checkpoint = false;
   let answer = '';
+  let requestBytes = 0, requests = 0;
   try {
     await writeFile(join(root, 'invoice.mjs'), '// Profile evaluation fixture\n\nexport const invoiceLimit = 7;\n');
     await writeFile(join(root, 'fixture.test.mjs'), test);
-    const run = save => runJob({ session, job, config, profile, token, signal, emit: () => {}, save, isolated: true });
+    const run = save => runJob({ session, job, config, profile, token, signal, emit: event => {
+      if (event.type === 'request-size') { requestBytes += event.bytes; requests++; }
+    }, save, isolated: true });
     try {
       answer = await run(async () => {
         if (job.stageHistory?.length) {
@@ -53,7 +59,7 @@ export async function evaluateProfile(profile, token, { timeout = 120000 } = {})
   return {
     ...results, checkpoint, durationMs: Math.round(performance.now() - start),
     metrics: {
-      toolCalls: job.tools.length,
+      toolCalls: job.tools.length, requests, requestMessageBytes: requestBytes,
       checkMs: (job.checks ?? []).reduce((sum, check) => sum + check.durationMs, 0),
     },
     ...(error ? { error } : {}),

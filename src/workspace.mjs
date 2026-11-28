@@ -148,12 +148,24 @@ async function walk(root, signal) {
 }
 
 async function inventory(root, signal) {
+  const result = stdout => {
+    const paths = [...new Set(stdout.split('\0').filter(Boolean).map(slash))]
+      .filter(path => !blocked(path) && !isStatePath(resolve(root, path))).sort();
+    return { files: paths.slice(0, 25000), truncated: paths.length > 25000 };
+  };
+  try {
+    const options = { cwd: root, signal, maxBuffer: 4 * 1024 * 1024 };
+    const listed = await exec('git', ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--', '.'], options);
+    const deleted = new Set((await exec('git', ['ls-files', '-z', '--deleted', '--', '.'], options)).stdout.split('\0'));
+    return result(listed.stdout.split('\0').filter(path => !deleted.has(path)).join('\0'));
+  } catch (error) {
+    signal?.throwIfAborted();
+  }
   try {
     const { stdout } = await exec('rg', ['--files', '--null', '--no-config', '--no-messages', '--no-require-git'], {
       cwd: root, signal, maxBuffer: 4 * 1024 * 1024,
     });
-    const paths = stdout.split('\0').filter(Boolean).map(slash).filter(path => !blocked(path) && !isStatePath(resolve(root, path))).sort();
-    return { files: paths.slice(0, 25000), truncated: paths.length > 25000 };
+    return result(stdout);
   } catch (error) {
     signal?.throwIfAborted();
     if (error.code === 1) return { files: [], truncated: false };
@@ -230,6 +242,45 @@ export class Workspace {
       if (matches.length === 60) break;
     }
     return { matches, scanned, truncated: truncated || Boolean(next), ...(next ? { next } : {}) };
+  }
+
+  async searchRegex({ query, pattern = '**', path = '.' }, signal) {
+    if (typeof query !== 'string' || !query.trim() || query.length > 300) throw new Error('Enter a regex up to 300 characters.');
+    const scope = this.scope(path);
+    if (await realpath(scope) !== scope) throw new Error('Search scope must be a regular workspace directory.');
+    let stdout;
+    try {
+      ({ stdout } = await exec('rg', ['--json', '--no-config', '--no-messages', '-i', '--glob', pattern, '--', query, '.'],
+        { cwd: scope, signal, maxBuffer: 2 * 1024 * 1024, timeout: 15000 }));
+    } catch (error) {
+      signal?.throwIfAborted();
+      if (error.code === 1) return { matches: [], truncated: false };
+      if (error.code === 'ENOENT') throw new Error('Regex and symbol search require ripgrep (rg).');
+      throw new Error('Regex search failed. Check the pattern or narrow its scope.');
+    }
+    const matches = [];
+    for (const line of stdout.split('\n')) {
+      if (!line.includes('"type":"match"')) continue;
+      const row = JSON.parse(line).data;
+      if (!row?.path?.text || !row?.lines?.text) continue;
+      const file = slash(relative(this.root, resolve(scope, row.path.text)));
+      if (blocked(file) || !within(this.root, resolve(this.root, file)) || isStatePath(resolve(this.root, file))) continue;
+      matches.push({ path: file, line: row.line_number, text: row.lines.text.trimEnd().slice(0, 320) });
+      if (matches.length === 60) return { matches, truncated: true };
+    }
+    return { matches, truncated: false };
+  }
+
+  async symbol({ name, path }, signal) {
+    if (typeof name !== 'string' || !/^[A-Za-z_$][\w$]{0,80}$/.test(name)) throw new Error('Enter a JavaScript or TypeScript identifier.');
+    const escape = name.replaceAll('$', '\\$');
+    const search = await this.searchRegex({ query: '(^|[^A-Za-z0-9_$])' + escape + '([^A-Za-z0-9_$]|$)',
+      path, pattern: '*.{js,ts,jsx,tsx,mjs,cjs,mts,cts}' }, signal);
+    const declaration = new RegExp('\\b(?:function|class|const|let|var|interface|type|enum|namespace)\\s+' + escape + '(?![\\w$])');
+    const exact = new RegExp('(^|[^A-Za-z0-9_$])' + escape + '([^A-Za-z0-9_$]|$)');
+    const matches = search.matches.filter(item => exact.test(item.text));
+    return { definitions: matches.filter(item => declaration.test(item.text)),
+      references: matches.filter(item => !declaration.test(item.text)), truncated: search.truncated };
   }
 
   scope(path = '.') {

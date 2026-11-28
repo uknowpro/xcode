@@ -231,6 +231,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       const wire = replay ? wireStage(session, job, policy, stage) : null;
       const messages = [...context(wire), ...(job.stageHistory ?? [])];
       emit({ type: 'request', stage: stage.name });
+      if (isolated) emit({ type: 'request-size', bytes: Buffer.byteLength(JSON.stringify(messages)) });
       const message = await request(requestProfile, token, messages, tools, session, signal,
         event => emit({ ...event, intermediate: index < stagePlan(job).length - 1 }));
       if (!message.tool_calls?.length) {

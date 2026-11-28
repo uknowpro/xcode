@@ -1019,6 +1019,21 @@ test('session listing rebuilds a missing or invalid summary without changing the
   assert.equal(JSON.parse(await readFile(session, 'utf8')).turns[0].answer, 'Keep this reply.');
 });
 
+test('workspace queries distinguish definitions and references and honor file filters', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  await writeFile(join(root, 'example.ts'), 'export function invoiceTotal() { return 4; }\nconsole.log(invoiceTotal());\n');
+  await writeFile(join(root, 'sample.txt'), 'invoiceTotal should not be here');
+  const args = { cwd: root, env: { ...process.env, XCODE_HOME: state } };
+  try { await exec('rg', ['--version']); } catch { return t.skip('ripgrep is not installed'); }
+  const symbol = JSON.parse((await exec(process.execPath, [cliPath, 'symbol', 'invoiceTotal', '--json'], args)).stdout);
+  assert.deepEqual(symbol.definitions.map(item => item.line), [1]);
+  assert.deepEqual(symbol.references.map(item => item.line), [2]);
+  const result = JSON.parse((await exec(process.execPath, [cliPath, 'search', 'invoiceT.*', '--regex', '--type', 'ts', '--json'], args)).stdout);
+  assert.equal(result.matches.length, 2);
+  assert.ok(result.matches.every(item => item.path === 'example.ts'));
+});
+
 test('search resumes at the next line and attachments load only selected text ranges', async t => {
   const root = await temp(t);
   await writeFile(join(root, 'notes.txt'), Array.from({ length: 70000 }, (_, index) => 'needle ' + (index + 1)).join('\n'));
