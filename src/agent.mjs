@@ -156,8 +156,11 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
       if (job.review) throw new Error('Check execution waits until the proposed changes are reviewed.');
       const result = await runCheck(project.root, checks, args.name, signal, { secrets: [token] });
       job.checks ??= [];
-      job.checks.push({ ...result, stageIndex });
-      return { ...result, stdout: clipped(result.stdout, 5000), stderr: clipped(result.stderr, 5000) };
+      const approvalRevision = job.approvals?.length ?? 0;
+      const repeated = job.checks.some(check => check.name === result.name && check.commandKey === result.commandKey &&
+        (check.approvalRevision ?? 0) === approvalRevision);
+      job.checks.push({ ...result, stageIndex, approvalRevision, ...(repeated ? { repeated: true } : {}) });
+      return { ...result, ...(repeated ? { repeated: true } : {}), stdout: clipped(result.stdout, 5000), stderr: clipped(result.stderr, 5000) };
     }
     case 'verify_edits': return verify(project.root, job.changed, signal);
   }
@@ -275,7 +278,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
           stage: stage.name, name: call.function.name, path,
           ...(Array.isArray(result?.matches) ? { matches: result.matches.length } : {}),
           ...(call.function.name === 'read' && Number.isInteger(input?.start) ? { line: input.start } : {}),
-          ...(call.function.name === 'run_check' && result?.name ? { check: result.name, exitCode: result.exitCode } : {}),
+          ...(call.function.name === 'run_check' && result?.name ? { check: result.name, exitCode: result.exitCode, ...(result.repeated ? { repeated: true } : {}) } : {}),
           error: result?.error,
         };
         job.tools.push(record);

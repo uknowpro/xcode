@@ -819,6 +819,20 @@ test('a failed test prompts a reviewed repair and only then repeats the original
   assert.deepEqual(checks.map(check => [check.status, Boolean(check.automatic)]), [['failed', false], ['passed', true]]);
 });
 
+test('one-shot JSON and event streams keep verification and completion machine readable', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'OK'));
+  const { cli } = await profile(t, api);
+  const output = JSON.parse((await cli('ask', 'Build report', '--json')).stdout);
+  assert.equal(output.answer, 'OK');
+  assert.equal(output.verification, 'not-run');
+  assert.equal(output.status, 'complete');
+  assert.match(output.sessionId, /^[0-9a-f-]{36}$/);
+  const events = (await cli('ask', 'Build events', '--events')).stdout.trim().split('\n').map(JSON.parse);
+  assert.ok(events.some(event => event.type === 'stage'));
+  assert.equal(events.at(-1).type, 'result');
+  assert.equal(events.at(-1).verification, 'not-run');
+});
+
 test('failed verification is visible in sessions and scripts can read check JSON with its exit code', async t => {
   const api = await server(t, (body, res, request) => {
     if (request === 1) return tool(res, 'run_check', '{"name":"unit"}');

@@ -12,7 +12,7 @@ import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } 
 import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
-import { checkEvidence, checkLocations, compareCheckRuns } from './repair.mjs';
+import { checkEvidence, checkLocations, compareCheckRuns, latestChecks } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
 import { appliedReviewFiles, asGitPatch, chooseHunks, conflictSummary, fileOperation, inverseReview, overrideReviewFile, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
@@ -54,7 +54,7 @@ const help = [
   '',
   '  xcode setup [name]             Save API URL, model ID and token',
   '  xcode                          Start interactive chat',
-  '  xcode ask "prompt"             Run a single prompt, or pipe text to xcode ask',
+  '  xcode ask "prompt" [--json|--events]  Run one request or read from standard input',
   '  xcode sessions [search] [--status <filter>]',
   '  xcode session rename|pin|unpin|archive|restore <id|latest> [title]',
   '  xcode session history|fork|export <id|latest> [turn] [count]',
@@ -724,8 +724,15 @@ async function collectAttachments(root, base, profile, prompt, paths) {
   return results;
 }
 
-function streamSession(root) {
-  return new Sessions(root, (_live, event) => {
+function streamSession(root, options) {
+  return new Sessions(root, (live, event) => {
+    if (options.events) {
+      if (!['text', 'stage', 'tool', 'queue', 'review', 'note', 'error'].includes(event.type)) return;
+      const data = event.type === 'error' ? { type: 'error', ...modelFailure(event.error) } : event;
+      print(JSON.stringify({ sessionId: live.session.id, ...data }));
+      return;
+    }
+    if (options.json) return;
     if (event.type === 'text' && !event.intermediate && stdout.isTTY) stdout.write(clean(event.text));
     else if (event.type === 'stage' && event.total > 1) info('[' + (event.index + 1) + '/' + event.total + '] ' + event.stage);
     else if (event.type === 'note') info(event.text);
@@ -734,24 +741,40 @@ function streamSession(root) {
   });
 }
 
-async function oneMessage(sessions, live, start) {
+async function oneMessage(sessions, live, start, options) {
   live.holdAfterCurrent = true;
   const interrupt = () => sessions.stop(live);
   process.on('SIGINT', interrupt);
   try {
     const { run } = await start();
     const result = await run;
+    if (options.json || options.events) {
+      const session = live.session;
+      const evidence = result?.review || result?.error ? session.queue[0] : session.turns.at(-1);
+      const checks = latestChecks(evidence?.checks);
+      const failed = checks.filter(check => check.status !== 'passed');
+      const verification = !checks.length ? 'not-run' : failed.length ? 'failed' : 'passed';
+      const status = result?.error ? 'error' : result?.review ? 'awaiting-review' :
+        result?.failedChecks?.length ? 'verification-failed' : 'complete';
+      print(JSON.stringify({
+        ...(options.events ? { type: 'result' } : {}), sessionId: session.id, status, verification,
+        answer: result?.answer ?? null, changedPaths: evidence?.changed ?? [],
+        checks: checks.map(check => ({ name: check.name, status: check.status, exitCode: check.exitCode })),
+        ...(result?.review ? { reviewId: result.review.id } : {}),
+        ...(result?.error ? { error: modelFailure(result.error) } : {}),
+      }));
+    }
     if (result?.error) throw result.error;
-    if (result?.answer) {
+    if (result?.answer && !options.json && !options.events) {
       if (stdout.isTTY) stdout.write('\n');
       else print(result.answer);
     }
     if (result?.review) {
       const id = live.session.id.slice(0, 8);
-      info('Change set awaiting approval. Run xcode review show ' + id + ' or xcode resume ' + id + '.');
+      if (!options.events && !options.json) info('Change set awaiting approval. Run xcode review show ' + id + ' or xcode resume ' + id + '.');
       process.exitCode = 3;
     } else if (result?.failedChecks?.length) {
-      info('Verification failed · ' + result.failedChecks.join(', '));
+      if (!options.events && !options.json) info('Verification failed · ' + result.failedChecks.join(', '));
       process.exitCode = 4;
     }
   } finally {
@@ -764,26 +787,26 @@ async function ask(root, base, defaults, options, prompt) {
   const profile = profileFor(config, defaults.profile || config.defaultProfile || 'default');
   harnessFor(config, defaults.harness || 'default');
   const attachments = await collectAttachments(root, base, profile, prompt, options.attach ?? []);
-  const sessions = streamSession(root);
+  const sessions = streamSession(root, options);
   try {
     const live = await sessions.select(undefined, defaults);
     live.session.write = Boolean(options.write);
     live.session.checks = Boolean(options.checks);
-    await oneMessage(sessions, live, () => sessions.enqueue(live, prompt, attachments));
+    await oneMessage(sessions, live, () => sessions.enqueue(live, prompt, attachments), options);
   } finally {
     await sessions.close();
   }
 }
 
-async function continueMessage(root, prefix) {
-  const sessions = streamSession(root);
+async function continueMessage(root, prefix, options) {
+  const sessions = streamSession(root, options);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     if (live.session.undoInProgress) throw new Error('Run xcode undo to finish the interrupted undo first.');
     if (!live.session.queue.length) throw new Error('Queue is empty.');
     if (live.session.queue[0].review) throw new Error('Show and decide the pending change set first with xcode review.');
     live.held = false;
-    await oneMessage(sessions, live, () => ({ run: sessions.pump(live) }));
+    await oneMessage(sessions, live, () => ({ run: sessions.pump(live) }), options);
   } finally {
     await sessions.close();
   }
@@ -1719,7 +1742,7 @@ async function main() {
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
       clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' }, patch: { type: 'boolean' },
-      in: { type: 'string' },
+      in: { type: 'string' }, events: { type: 'boolean' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
@@ -1729,6 +1752,7 @@ async function main() {
   });
   const [command, ...rest] = positionals;
   if (values.help || command === 'help') return print(help);
+  if (values.events && values.json) throw new Error('Choose either --events or --json.');
   if (values.version) return print(JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
   const initial = await settings().catch(() => null);
   setLimits(initial?.execution);
@@ -1784,7 +1808,7 @@ async function main() {
   if (command === 'open') return openLocation(root, rest[0]);
   if (command === 'search' || command === 'symbol') return print(await workspaceQuery(root, command, rest.join(' '), values));
   if (command === 'report') return reportCommand(root, rest[0], values);
-  if (command === 'continue') return continueMessage(root, rest[0]);
+  if (command === 'continue') return continueMessage(root, rest[0], values);
   if (command === 'draft') {
     const session = await new Sessions(root).find(rest[0] || 'latest');
     const draft = await readDraft(session.id);

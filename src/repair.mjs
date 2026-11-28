@@ -28,7 +28,7 @@ export function checkEvidence(check, limit = 1200) {
   const lines = ((check.stderr ?? '') + '\n' + (check.stdout ?? '')).split(/\r?\n/).map(text => text.trim()).filter(Boolean);
   const paths = [...new Set(lines.flatMap(line => line.match(/(?:[\w./\\-]+\.[\w-]+):\d+(?::\d+)?/g) ?? []))].slice(0, 4);
   const message = lines.slice(-12).join('\n').slice(-limit);
-  return check.name + ' · ' + check.status + (check.exitCode == null ? '' : ' · exit ' + check.exitCode) +
+  return check.name + ' · ' + check.status + (check.repeated ? ' · repeated at same approval state' : '') + (check.exitCode == null ? '' : ' · exit ' + check.exitCode) +
     (paths.length ? '\nLocations: ' + paths.join(', ') : '') +
     (check.truncated ? '\nShowing the end of limited output.' : '') + (message ? '\n' + message : '');
 }

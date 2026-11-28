@@ -47,6 +47,10 @@ Read-only mode is the default. /write on allows proposals, and /checks on allows
 
 File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.
 
+## Automation
+
+Use xcode ask --json for one result or --events for newline-delimited progress. The result distinguishes verification not run, passed and failed. Exit 3 waits for a change review, 4 reports failed registered verification and 1 reports an execution error. A [CI example](docs/ci-example.md) shows how to preserve the result and exit status.
+
 ## Model profiles
 
 Use xcode profile show to see the detected adapter, protocol and effective settings.
