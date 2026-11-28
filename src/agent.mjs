@@ -134,7 +134,16 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
       }
       job.readPaths ??= [];
       if (!job.readPaths.includes(result.path)) job.readPaths.push(result.path);
-      if (result.unchanged) {
+      const available = result.unchanged && job.stageHistory?.some(message => {
+        if (message.role !== 'tool') return false;
+        try {
+          const saved = JSON.parse(message.content);
+          return saved.path === result.path && saved.lines === result.lines;
+        } catch {
+          return false;
+        }
+      });
+      if (available) {
         const { lines, ...reference } = result;
         return { ...reference, note: 'The content is unchanged. Reuse the earlier read of this range.' };
       }

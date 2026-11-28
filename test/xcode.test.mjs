@@ -1226,6 +1226,22 @@ test('stream first-event and idle limits are independent', async () => {
   await assert.rejects(events.next(), /idle/);
 });
 
+test('cached excerpts remain available when a new harness stage reads the same file', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1 || request === 3) return tool(res, 'read', '{"path":"sample.txt","start":1,"count":1}');
+    const content = JSON.parse(body.messages.at(-1).content);
+    assert.match(content.lines, /stage fixture/);
+    return reply(res, request === 2 ? 'First stage complete.' : 'Second stage complete.');
+  });
+  const { work, cli } = await profile(t, api);
+  await writeFile(join(work, 'sample.txt'), 'stage fixture');
+  await writeFile(join(work, 'harness.json'), JSON.stringify({ stages: ['First', 'Second'].map(name =>
+    ({ name, instruction: 'Read sample.txt.', tools: ['read'] })) }));
+  await cli('harness', 'import', 'two-stage', 'harness.json');
+  const result = await cli('ask', 'Read both stages', '--harness', 'two-stage');
+  assert.match(result.stdout, /Second stage complete/);
+});
+
 test('domain harness stages can be composed, customized and exported', async t => {
   const root = await temp(t);
   const state = await temp(t);
