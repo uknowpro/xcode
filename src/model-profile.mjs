@@ -98,7 +98,7 @@ export function configureModel(profile, options) {
   for (const [flag, key] of [
     ['adapter', 'adapter'], ['protocol', 'protocol'], ['preset', 'modelPreset'],
     ['thinking', 'thinking'], ['effort', 'reasoningEffort'],
-    ['stream-fallback', 'streamFallback'], ['retry-limited', 'retryLimited'],
+    ['stream-fallback', 'streamFallback'], ['retry-limited', 'retryLimited'], ['usage-reporting', 'usageReporting'],
   ]) {
     if (options[flag] !== undefined) value[key] = options[flag];
   }
@@ -112,6 +112,7 @@ export function configureModel(profile, options) {
       value[key] = Number(input);
     }
   }
+  if (value.usageReporting !== undefined && !['on', 'off'].includes(value.usageReporting)) throw new Error('Use on or off for usage reporting.');
   modelEndpoint(value, modelPolicy(value));
   return value;
 }

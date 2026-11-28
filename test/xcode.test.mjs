@@ -1621,3 +1621,28 @@ test('explicit queue holds do not start model work while state is paused', async
   assert.equal(manager.pump(live), undefined);
   assert.equal(started, 0);
 });
+
+test('provider usage distinguishes cached input, traces requests and validates answer contracts', async t => {
+  const api = await server(t, (_body, res) => {
+    res.setHeader('x-request-id', 'usage-1');
+    res.end(JSON.stringify({ choices: [{ message: { content: '{"answer":1}' } }],
+      usage: { prompt_tokens: 120, completion_tokens: 8, prompt_tokens_details: { cached_tokens: 70 } } }));
+  });
+  const { cli, work } = await profile(t, api);
+  await writeFile(join(work, 'answer.json'), JSON.stringify({ type: 'object', required: ['answer'], properties: { answer: { type: 'integer' } } }));
+  await cli('ask', 'Output JSON', '--response-schema', 'answer.json');
+  const usage = JSON.parse((await cli('usage', 'latest', '--input-price', '2')).stdout);
+  assert.equal(usage.fixture.input, 120);
+  assert.equal(usage.fixture.uncached, 50);
+  assert.equal(usage.fixture.output, 8);
+  const [attempt] = JSON.parse((await cli('attempts')).stdout);
+  assert.equal(attempt.requestId, 'usage-1');
+});
+
+test('request budgets stop additional model calls before sending', async t => {
+  const api = await server(t, (_body, res) => tool(res, 'read', '{"path":"sample.txt"}'));
+  const { cli, work } = await profile(t, api);
+  await writeFile(join(work, 'sample.txt'), 'Budget sample');
+  await assert.rejects(cli('ask', 'Use the file', '--request-budget', '1'), /Request budget exhausted/);
+  assert.equal(api.requests.length, 1);
+});

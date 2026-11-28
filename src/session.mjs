@@ -106,7 +106,8 @@ export class Sessions {
     if (attachments.length > maxAttachments ||
       1 + attachments.reduce((bytes, item) => bytes + attachmentSize(item), 0) > maxAttachmentBytes)
       throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
-    const job = { prompt, attachments, completed: [], changed: [], tools: [], ...(manual ? { manual: true } : {}) };
+    const job = { prompt, attachments, completed: [], changed: [], tools: [], ...(manual ? { manual: true } : {}),
+      ...(live.session.responseSchema !== undefined ? { responseSchema: live.session.responseSchema } : {}) };
     if (!live.session.customTitle && live.session.title === 'New session') live.session.title = prompt.replace(/\s+/g, ' ').slice(0, 72);
     live.session.queue.push(job);
     try {
@@ -195,7 +196,7 @@ export class Sessions {
     const turns = live.session.turns;
     const item = {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
-      checks: job.checks ?? [], attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
+      checks: job.checks ?? [], ...(job.usage ? { usage: job.usage } : {}), attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
       ...(failedChecks.length ? { verificationFailed: true } : {}),
       ...(status !== 'complete' && job.partial ? { partial: job.partial } : {}),
       ...(status === 'complete' && job.wire ? { wire: completedWire(job) } : {}),

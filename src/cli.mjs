@@ -34,6 +34,7 @@ import { answerRows, matchingAnswers } from './answer-view.mjs';
 import { DraftEdits, keyBindings } from './draft-edits.mjs';
 import { randomUUID } from 'node:crypto';
 import { note, portableTurn, retentionCandidates, retentionPolicy } from './session-organize.mjs';
+import { requestedBudget, usageSummary, requestFootprint } from './model-usage.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
@@ -68,6 +69,8 @@ const help = [
   '  xcode session history|fork|export|link <id|latest> [turn] [count]',
   '  xcode session tag|untag|goal|done|trash|restore-trash <id> [value]',
   '  xcode session combine <id:turn...> | import <backup.json>',
+  '  xcode usage|attempts [session]  Show measured use, estimated input and request history',
+  '  xcode session fit <id> <attachments|summary|new>  Prepare a smaller draft',
   '  xcode session-filter list|save|remove [name] [query]',
   '  xcode retention [--days n] [--count n] [--mib n] [--trash-days n] [--apply]',
   '  xcode resume <id|latest>       Resume a project session',
@@ -159,6 +162,8 @@ const chatHelp = [
   '/paste, /send, /cancel         Compose or paste a multi-line message',
   '/preview                       Show draft line count and a bounded preview',
   '/answer [number|find|outline|live]    Browse or search responses',
+  '/route <stage> <profile> [task|visible]  Select a stage model and content scope',
+  '/usage, /attempts              Review request usage and timings',
   '/draft-edit <action> [line] [text]    Edit, preview dedent, undo or redo draft lines',
   'Tab after /                    Complete a chat command',
   'Tab after @                    Complete a workspace path',
@@ -855,6 +860,8 @@ async function ask(root, base, defaults, options, prompt) {
     const live = await sessions.select(undefined, defaults);
     live.session.write = Boolean(options.write);
     live.session.checks = Boolean(options.checks);
+    live.session.requestBudget = requestedBudget({}, options);
+    if (options['response-schema']) live.session.responseSchema = JSON.parse((await loadBytes(resolve(base, options['response-schema']), 64 * 1024)).toString('utf8'));
     await oneMessage(sessions, live, () => sessions.enqueue(live, prompt, attachments), options);
   } finally {
     await sessions.close();
@@ -1291,7 +1298,9 @@ async function chat(root, base, defaults, options, prefix) {
     const token = await tokenFor(session.profile);
     const workspace = new Workspace(root, config.transmitExclusions?.[root]);
     const paths = [...new Set([...attachments, ...explicitReferences(message).map(path => resolve(base, path))])];
+    const estimate = requestFootprint([{ role: 'user', content: message }]);
     const lines = [
+      'Draft estimate · ' + estimate.tokens + ' tokens before adding conversation and tools',
       'Destination · ' + visibleEndpoint(profile, await tokenFor(session.profile)) + ' · ' + profile.model,
       'Conversation · ' + session.turns.length + ' prior turns available to the context builder',
       'Pinned context · ' + (session.pins?.length ?? 0) + ' items',
@@ -1460,6 +1469,21 @@ async function chat(root, base, defaults, options, prefix) {
         stdout.write('\x1b[?1049h');
         answerPage();
         break;
+      }
+      case '/usage':
+        return show(JSON.stringify(usageSummary([...session.turns, ...(session.queue[0] ? [session.queue[0]] : [])]), null, 2));
+      case '/attempts':
+        return show(JSON.stringify((session.queue[0] ?? session.turns.at(-1))?.usage?.attempts ?? [], null, 2));
+      case '/route': {
+        if (selected.active || session.queue.length) throw new Error('Finish pending requests before changing stage routes.');
+        if (!arg || !value || !['task', 'visible'].includes(args[2] ?? 'task')) throw new Error('Use /route "stage" profile [task|visible].');
+        const config = await settings();
+        const target = profileFor(config, value);
+        const scope = args[2] ?? 'task';
+        if (!harnessFor(config, session.harness).stages.some(stage => stage.name === arg)) throw new Error('Unknown stage for this session.');
+        session.stageRoutes = { ...session.stageRoutes, [arg]: { profile: value, scope, key: diagnosticKey(target) } };
+        await sessions.persist(selected);
+        return show('Route · ' + arg + ' → ' + visibleEndpoint(target, await tokenFor(value)) + ' · ' + scope);
       }
       case '/copy': {
         const answer = session.turns.findLast(turn => turn.status === 'complete' && turn.answer)?.answer;
@@ -1997,6 +2021,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      'usage-reporting': { type: 'string' }, 'request-budget': { type: 'string' }, 'tool-budget': { type: 'string' },
+      'token-budget': { type: 'string' }, 'response-schema': { type: 'string' }, 'input-price': { type: 'string' }, 'output-price': { type: 'string' },
       days: { type: 'string' }, count: { type: 'string' }, mib: { type: 'string' }, 'trash-days': { type: 'string' },
       apply: { type: 'boolean' },
       'model-jobs': { type: 'string' }, 'check-jobs': { type: 'string' },
@@ -2125,6 +2151,19 @@ async function main() {
     const sessions = new Sessions(root);
     return describeSessions(sessions, undefined, rest.join(' '), values.status);
   }
+  if (command === 'usage' || command === 'attempts') {
+    const entry = await new Sessions(root).find(rest[0] ?? 'latest');
+    const session = await readSession(entry.id);
+    const turns = [...session.turns, ...session.queue];
+    const price = key => {
+      if (values[key] === undefined) return undefined;
+      const amount = Number(values[key]);
+      if (!Number.isFinite(amount) || amount < 0) throw new Error('Prices must be nonnegative numbers per million tokens.');
+      return amount;
+    };
+    return print(JSON.stringify(command === 'usage' ? usageSummary(turns, price('input-price'), price('output-price')) :
+      turns.flatMap(turn => turn.usage?.attempts ?? []).slice(-100), null, 2));
+  }
   if (command === 'session-filter') {
     const [action = 'list', name, ...query] = rest;
     if (action !== 'list') {
@@ -2209,7 +2248,19 @@ async function main() {
     }
     try {
       const live = await sessions.select(prefix, defaults);
-      if (action === 'fork') {
+      if (action === 'fit') {
+        const source = live.session.queue[0]?.prompt;
+        if (!source || !['attachments', 'summary', 'new'].includes(turn)) throw new Error('Use session fit <id> attachments|summary|new on a held request.');
+        const fork = await sessions.fork(live, turn === 'attachments' ? live.session.turns.length : 0, { visibleOnly: true });
+        if (turn === 'summary') {
+          const entries = live.session.memory?.entries ?? [];
+          const previous = entries.slice(-4).map(item => typeof item.result === 'string' ? item.result.slice(0, 400) : '').filter(Boolean);
+          fork.session.pins = previous.map(text => ({ kind: 'decision', text }));
+          await sessions.persist(fork);
+        }
+        await writeDraft(fork.session.id, { line: '', paste: source.split('\n'), attachments: [] });
+        print(fork.session.id);
+      } else if (action === 'fork') {
         const fork = await sessions.fork(live, turn);
         print(fork.session.id);
       } else {
