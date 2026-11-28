@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { attach, attachmentSize, explicitReferences, inspectAttachment, maxAttachmentBytes, maxAttachments, splitArgs } from './attachments.mjs';
-import { checksForHarness, composeHarness, harnessFor, presets, roles, skillsAt, stageTools } from './harness.mjs';
+import { checksForHarness, composeHarness, harnessFor, presets, roles, skillRead, skillsAt, stageTools } from './harness.mjs';
 import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
@@ -29,6 +29,8 @@ import { formatHistoryPage, historyText, sessionMarkdown } from './session-histo
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
 import { openLocation } from './editor.mjs';
+import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
+import { extractDocument, queryLocalDatabase } from './local-data.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -68,6 +70,10 @@ const help = [
   '  xcode search <query> [--path <dir>] [--pattern <glob>] [--regex]',
   '  xcode symbol <identifier> [--path <dir>]',
   '  xcode open <path[:line]>       Open a verified workspace file in XCODE_EDITOR',
+  '  xcode skills list|show|enable|disable [name]',
+  '  xcode mcp add|list|tools|call|remove [name]',
+  '  xcode extract <document> [--part tables|paragraphs] [--sheet <name>] [--rows <n>]',
+  '  xcode db <sqlite-file> list|table [name] [--where column=value] [--rows <n>]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> [--in <directory>] -- <command> [args...]',
   '  xcode check suggest|compare [session]',
@@ -112,7 +118,7 @@ const chatHelp = [
   '/pin [file|decision|constraint|drop]  Keep context across long sessions',
   '/outgoing [prompt]             Preview destination, attachments and pinned context',
   '/harness [name]                View or select a staged workflow',
-  '/skills                        List discovered local skills',
+  '/skills [show|enable|disable] [name]   Inspect or control local skills',
   '/attach <path[#L10-L20]>, /clear   Add files or text ranges for the next message',
   '/inputs image|pdf|tools on|off Change these capabilities in the current model profile',
   '/queue [edit|move|drop|send <number> …]   Manage pending messages',
@@ -386,7 +392,7 @@ async function harnessCommand(root, action, name, args, options) {
     const model = profileFor(config, profileName);
     const cache = await savedCapabilities(profileName);
     const harness = harnessFor(config, selected);
-    const skills = await skillsAt(root);
+    const skills = await skillsAt(root, undefined, config.skillPolicy?.[root]);
     const binding = checksForHarness(config, root, selected);
     const issues = [];
     for (const skill of harness.skills ?? []) if (!skills.has(skill)) issues.push('Missing skill: ' + skill);
@@ -1582,11 +1588,7 @@ async function chat(root, base, defaults, options, prefix) {
         show('Automatic retry ' + (session.retrySeconds ? 'every ' + retry + 's on transient failures.' : 'off.'));
         break;
       }
-      case '/skills': {
-        const skills = await skillsAt(root);
-        show(skills.size ? [...skills.values()].map(skill => skill.name + ' · ' + skill.description).join('\n') : 'No local skills found.');
-        break;
-      }
+      case '/skills': show(await skillCommand(root, arg, value)); break;
       case '/history': show(historyText(session.turns, arg, value)); break;
       case '/fork': {
         const fork = await sessions.fork(selected, arg);
@@ -1753,6 +1755,57 @@ async function workspaceQuery(root, action, query, options) {
   return rows.join('\n') || 'No matching source lines.';
 }
 
+async function skillCommand(root, action = 'list', name) {
+  const skills = await skillsAt(root);
+  if (action === 'show') {
+    const skill = skills.get(name);
+    if (!skill) throw new Error('Unknown local skill.');
+    const preview = await skillRead(skills, name);
+    return skill.name + ' · ' + skill.origin + (skill.shadowed.length ? '\nLower priority · ' + skill.shadowed.join(', ') : '') +
+      '\n\n' + preview.content;
+  }
+  if (action === 'enable' || action === 'disable') {
+    if (!skills.has(name)) throw new Error('Unknown local skill.');
+    await updateSettings(config => {
+      const policy = { ...config.skillPolicy?.[root], [name]: action === 'enable' };
+      config.skillPolicy = { ...config.skillPolicy, [root]: policy };
+    });
+  } else if (action !== 'list') throw new Error('Use skills list, show, enable or disable.');
+  const policy = (await settings()).skillPolicy?.[root] ?? {};
+  return [...skills.values()].map(skill => skill.name + ' · ' + skill.origin +
+    (policy[skill.name] === false ? ' · disabled' : ' · enabled') +
+    (skill.shadowed.length ? ' · shadows ' + skill.shadowed.join(', ') : '') +
+    (skill.description ? ' · ' + skill.description : '')).join('\n') || 'No local skills found.';
+}
+
+async function localMcpCommand(root, action = 'list', name, args, options) {
+  const config = await settings();
+  const servers = config.localMcp?.[root] ?? {};
+  if (action === 'list') return print(Object.keys(servers).join('\n') || 'No local MCP servers registered.');
+  validName(name);
+  if (action === 'add' || action === 'remove') {
+    await updateSettings(next => {
+      const project = { ...next.localMcp?.[root] };
+      if (action === 'add') project[name] = mcpCommand(args);
+      else delete project[name];
+      next.localMcp = { ...next.localMcp, [root]: project };
+    });
+    return print(action === 'add' ? 'Registered ' + name + '. Local processes run with your OS permissions.' : 'Removed ' + name + '.');
+  }
+  const argv = own(servers, name);
+  if (!argv || !['tools', 'call'].includes(action)) throw new Error('Register the local MCP server first.');
+  const result = await withMcp(root, argv, async request => {
+    const list = await mcpTools(request);
+    if (action === 'tools') return { scope: 'explicit local commands; server annotations are advisory', ...list };
+    const tool = args[0];
+    if (!list.tools.some(item => item.name === tool)) throw new Error('Select a tool listed by xcode mcp tools.');
+    const input = options.input ? JSON.parse((await loadBytes(resolve(options.input), 128 * 1024)).toString('utf8')) : {};
+    if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Tool input must be a JSON object.');
+    return request('tools/call', { name: tool, arguments: input });
+  });
+  print(JSON.stringify(result, null, 2));
+}
+
 async function transmissionRules(root, action, pattern) {
   if (action === 'add' || action === 'remove') {
     if (!pattern || pattern.length > 240 || /[\x00-\x1f\\]/.test(pattern) || pattern.startsWith('/') || pattern.split('/').includes('..'))
@@ -1828,7 +1881,8 @@ async function main() {
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
       clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' }, patch: { type: 'boolean' },
-      in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
+      input: { type: 'string' }, rows: { type: 'string' }, part: { type: 'string' }, sheet: { type: 'string' },
+      where: { type: 'string' }, in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
       'stop-on-failure': { type: 'boolean' }, 'include-tokens': { type: 'boolean' }, 'include-history': { type: 'boolean' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
@@ -1860,6 +1914,10 @@ async function main() {
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return rest[0] === 'export' ? exportSettings(root, values) : print(await describeSettings(root));
+  if (command === 'skills') return print(await skillCommand(root, rest[0], rest[1]));
+  if (command === 'mcp') return localMcpCommand(root, rest[0], rest[1], rest.slice(2), values);
+  if (command === 'extract') return print(JSON.stringify(await extractDocument(root, rest[0], values), null, 2));
+  if (command === 'db') return print(JSON.stringify(await queryLocalDatabase(root, rest[0], rest[1], rest[2], values), null, 2));
   if (command === 'exclusions') return transmissionRules(root, rest[0], rest[1]);
   if (command === 'storage') {
     if (values.clean) {

@@ -1058,6 +1058,33 @@ test('listing many sessions retains only status summaries while reopening loads 
   });
 });
 
+test('local skill controls and MCP enumeration stay scoped to the selected project', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const cli = (...args) => exec(process.execPath, [cliPath, ...args], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+  for (const dir of ['.claude', '.xcode']) {
+    await mkdir(join(root, dir, 'skills', 'sample'), { recursive: true });
+    await writeFile(join(root, dir, 'skills', 'sample', 'SKILL.md'), '---\nname: sample\n---\n' + dir);
+  }
+  assert.match((await cli('skills', 'list')).stdout, /project \.claude[\s\S]*shadows project \.xcode/);
+  assert.match((await cli('skills', 'disable', 'sample')).stdout, /disabled/);
+  const server = [
+    'import readline from "node:readline";',
+    'readline.createInterface({ input: process.stdin }).on("line", line => {',
+    '  const msg = JSON.parse(line);',
+    '  if (msg.id == null) return;',
+    '  const result = msg.method === "initialize" ? {protocolVersion:"2025-06-18"} :',
+    '      {tools:[{name:"echo",inputSchema:{type:"object"},annotations:{readOnlyHint:true}}]};',
+    '  console.log(JSON.stringify({jsonrpc:"2.0",id:msg.id,result}));',
+    '});',
+  ].join('\n');
+  await writeFile(join(root, 'server.mjs'), server);
+  await cli('mcp', 'add', 'fixture', '--', process.execPath, 'server.mjs');
+  const output = JSON.parse((await cli('mcp', 'tools', 'fixture')).stdout);
+  assert.equal(output.tools[0].name, 'echo');
+  assert.equal(output.tools[0].annotations.readOnlyHint, true);
+});
+
 test('custom harness imports, project skills and native PDF attachments retain their boundaries', async t => {
   const root = await temp(t);
   const state = await temp(t);

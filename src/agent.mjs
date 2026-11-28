@@ -212,7 +212,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   const project = new Workspace(session.root, config.transmitExclusions?.[session.root]);
   if (job.attachments.some(item => item.source && project.excluded(resolve(session.root, item.source))))
     throw new Error('A queued attachment is now excluded. Discard the pending message and attach an allowed file.');
-  const skills = isolated ? new Map() : await skillsAt(session.root, signal);
+  const skills = isolated ? new Map() : await skillsAt(session.root, signal, config.skillPolicy?.[session.root]);
   const { checks } = checksForHarness(config, session.root, job.harnessName);
   const policy = modelPolicy(profile);
   const replay = startWire(job, profile, policy);

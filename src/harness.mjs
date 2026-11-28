@@ -292,11 +292,13 @@ function skillField(text, field) {
   return value.replace(/^(['"])(.*)\1$/, '$2');
 }
 
-export async function skillsAt(root, signal) {
+export async function skillsAt(root, signal, policy = {}) {
   const skills = new Map();
-  for (const folder of [
-    join(root, '.claude', 'skills'), join(root, '.xcode', 'skills'),
-    join(storage, 'skills'), join(homedir(), '.claude', 'skills'),
+  for (const [folder, origin] of [
+    [join(root, '.claude', 'skills'), 'project .claude'],
+    [join(root, '.xcode', 'skills'), 'project .xcode'],
+    [join(storage, 'skills'), 'user xcode'],
+    [join(homedir(), '.claude', 'skills'), 'user .claude'],
   ]) {
     signal?.throwIfAborted();
     let base;
@@ -312,9 +314,10 @@ export async function skillsAt(root, signal) {
       const dir = join(base, entry.name);
       const content = await readText(dir, 'SKILL.md', signal, 128 * 1024).catch(() => '');
       const name = skillField(content, 'name') || entry.name;
-      if (content && /^[a-z0-9][a-z0-9-]{0,63}$/.test(name) && !skills.has(name)) {
-        skills.set(name, { name, dir, description: skillField(content, 'description').slice(0, 500) });
-      }
+      if (!content || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(name) || policy?.[name] === false) continue;
+      const primary = skills.get(name);
+      if (primary) primary.shadowed.push(origin);
+      else skills.set(name, { name, dir, origin, shadowed: [], description: skillField(content, 'description').slice(0, 500) });
     }
   }
   return skills;
