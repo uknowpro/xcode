@@ -70,15 +70,20 @@ export class Sessions {
     }
   }
 
-  async fork(live, number) {
+  async fork(live, number, { profile, visibleOnly = false } = {}) {
     const origin = live.session;
     const end = number === undefined ? origin.turns.length : Number(number);
     if (!Number.isInteger(end) || end < 0 || end > origin.turns.length)
       throw new Error('Choose a turn between 0 and ' + origin.turns.length + '.');
+    const turns = origin.turns.slice(0, end).map(turn => {
+      if (!visibleOnly) return turn;
+      const { wire, ...visible } = turn;
+      return visible;
+    });
     return this.openSession({
       id: randomUUID(), root: origin.root, title: ('Fork · ' + origin.title).slice(0, 120),
-      customTitle: true, profile: origin.profile, harness: origin.harness, write: false, retrySeconds: 0,
-      queue: [], turns: structuredClone(origin.turns.slice(0, end)), forkedFrom: { id: origin.id, turn: end },
+      customTitle: true, profile: profile ?? origin.profile, harness: origin.harness, write: false, retrySeconds: 0,
+      queue: [], turns: structuredClone(turns), forkedFrom: { id: origin.id, turn: end },
     });
   }
 

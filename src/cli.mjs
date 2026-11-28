@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
 import { attach, attachmentSize, explicitReferences, inspectAttachment, maxAttachmentBytes, maxAttachments, splitArgs } from './attachments.mjs';
-import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
+import { checksForHarness, harnessFor, presets, roles, skillsAt, stageTools } from './harness.mjs';
 import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
@@ -60,10 +60,10 @@ const help = [
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode draft [id|latest]        Read an unsent draft without opening the session',
   '  xcode continue [id|latest]    Run the pending message once',
-  '  xcode profile list|show|use|set|tune|test|models|capabilities|eval [name]',
+  '  xcode profile list|show|use|set|tune|test|models|capabilities|compare|eval [name]',
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
   '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>] [--json]',
-  '  xcode harness list|show|import [name] [file]',
+  '  xcode harness list|show|effective|import [name] [file]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|remove [name]',
@@ -92,6 +92,8 @@ const chatHelp = [
   '/session rename|pin|unpin|archive|restore [title]   Manage the current session',
   '/resume <id>                    Resume a session by ID',
   '/model [name]                  View or select a model profile',
+  '/model fallback <name> [apply] Preview a new session using another endpoint',
+  '/harness effective             Show active stages, model tuning and tools',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
   '/attach <path[#L10-L20]>, /clear   Add files or text ranges for the next message',
@@ -190,6 +192,27 @@ function showProfiles(config) {
   if (!Object.keys(config.profiles).length) print('No profiles. Run xcode setup.');
 }
 
+function visibleEndpoint(profile, token) {
+  const endpoint = modelEndpoint(profile, modelPolicy(profile));
+  const value = endpoint.origin + endpoint.pathname;
+  return token ? value.replaceAll(token, '[redacted]').replaceAll(encodeURIComponent(token), '[redacted]') : value;
+}
+
+async function compareProfiles(config, left, right, json) {
+  const fields = ['model', 'endpoint', 'adapter', 'protocol', 'preset', 'thinking', 'effort', 'contextWindow',
+    'maxTokens', 'requestTimeout', 'idleTimeout', 'streamFallback', 'retryLimited'];
+  const snapshots = [];
+  for (const name of [left, right]) {
+    const profile = profileFor(config, name);
+    snapshots.push({ ...modelPolicy(profile), model: profile.model, endpoint: visibleEndpoint(profile, await tokenFor(name)) });
+  }
+  const changes = fields.filter(name => snapshots[0][name] !== snapshots[1][name])
+    .map(field => ({ field, before: snapshots[0][field] ?? null, after: snapshots[1][field] ?? null }));
+  print(json ? JSON.stringify({ before: left, after: right, changes }, null, 2) :
+    changes.map(item => item.field + ' · ' + (item.before ?? 'default') + ' → ' + (item.after ?? 'default')).join('\n') ||
+    'No effective connection differences.');
+}
+
 async function profileCommand(action, name, options) {
   const config = await settings();
   if (action === 'list' || !action) return showProfiles(config);
@@ -217,6 +240,9 @@ async function profileCommand(action, name, options) {
   if (action === 'use') {
     await updateSettings(value => { value.defaultProfile = name; });
     print('Default profile: ' + name);
+  } else if (action === 'compare') {
+    if (!options.against) throw new Error('Use xcode profile compare <name> --against <name>.');
+    await compareProfiles(config, name, options.against, options.json);
   } else if (action === 'models') {
     const result = await modelDirectory(profile, await tokenFor(name), AbortSignal.timeout(15000));
     if (options.json) print(JSON.stringify(result, null, 2));
@@ -299,6 +325,20 @@ function showHarness(config, name, root) {
   });
 }
 
+function effectiveHarness(config, name, root, options) {
+  const profileName = options.profile ?? config.defaultProfile ?? 'default';
+  const profile = profileFor(config, profileName);
+  const harness = harnessFor(config, name);
+  const { checks } = checksForHarness(config, root, name);
+  const stages = harness.stages.map(stage => ({ name: stage.name, tools: stageTools(stage, profile, options, checks) }));
+  const result = { profile: profileName, harness: name, model: profile.model, policy: modelPolicy(profile), stages };
+  return options.json ? JSON.stringify(result, null, 2) : [
+    name + ' · ' + profileName + ' · ' + profile.model,
+    ...modelTuning(profile),
+    ...stages.map((stage, index) => (index + 1) + '. ' + stage.name + ' · ' + (stage.tools.join(', ') || 'no tools')),
+  ].join('\n');
+}
+
 function checkBinding({ names, checks }) {
   if (!names) return Object.keys(checks).join(', ') || 'none registered';
   return names.map(name => Object.hasOwn(checks, name) ? name : name + ' (missing)').join(', ') || 'none';
@@ -312,6 +352,8 @@ async function harnessCommand(root, action, name, args, options) {
     harnessList(config);
   } else if (action === 'show') {
     showHarness(config, name || 'default', root);
+  } else if (action === 'effective') {
+    print(effectiveHarness(config, name || 'default', root, options));
   } else if (action === 'checks' && name) {
     validName(name);
     const harness = harnessFor(config, name);
@@ -888,10 +930,10 @@ async function chat(root, base, defaults, options, prefix) {
     }, 250);
     draftTimer.unref();
   }
-  const select = async id => {
+  const select = async (id, applyOverrides = true) => {
     if (selected) await saveDraft();
     const live = await sessions.select(id, defaults);
-    if (options.profile || options.harness) {
+    if (applyOverrides && (options.profile || options.harness)) {
       const config = await settings();
       if (options.profile) profileFor(config, options.profile);
       if (options.harness) harnessFor(config, options.harness);
@@ -900,8 +942,8 @@ async function chat(root, base, defaults, options, prefix) {
         live.session.harness = options.harness || live.session.harness;
       }
     }
-    if (options.write) live.session.write = true;
-    if (options.checks) live.session.checks = true;
+    if (applyOverrides && options.write) live.session.write = true;
+    if (applyOverrides && options.checks) live.session.checks = true;
     await sessions.persist(live);
     let draft;
     try {
@@ -1198,6 +1240,18 @@ async function chat(root, base, defaults, options, prefix) {
       case '/clear': attachments = []; show('Attachments cleared.'); break;
       case '/model':
         if (!arg) return showProfiles(await settings());
+        if (arg === 'fallback') {
+          if (!value || (args[2] && args[2] !== 'apply')) throw new Error('Use /model fallback <profile> [apply].');
+          const profile = profileFor(await settings(), value);
+          show('Target · ' + visibleEndpoint(profile, await tokenFor(value)) + ' · ' + profile.model +
+            '\nScope · ' + session.turns.length + ' visible turns carried to a new session. Pending messages, attachments and provider replay stay in this session.');
+          if (args[2] === 'apply') {
+            const fork = await sessions.fork(selected, undefined, { profile: value, visibleOnly: true });
+            await select(fork.session.id, false);
+            banner();
+          }
+          break;
+        }
         editable();
         profileFor(await settings(), arg);
         session.profile = arg;
@@ -1205,6 +1259,7 @@ async function chat(root, base, defaults, options, prefix) {
         banner();
         break;
       case '/harness':
+        if (arg === 'effective') return show(effectiveHarness(await settings(), session.harness, root, session));
         if (!arg || arg === 'preview') return showHarness(await settings(), value || session.harness, root);
         if (arg === 'list') return harnessList(await settings());
         editable();

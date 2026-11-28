@@ -37,6 +37,22 @@ export const presets = {
       step('Answer', 'Use the evidence from the previous stage. Search again only when a missing fact could change the answer.', readTools, 'Cite the relevant paths and state what remains unverified.'),
     ],
   },
+  'deepseek-flash-code': {
+    description: 'Staged code changes with bounded exploration and reviewed verification',
+    role: 'backend',
+    stages: [
+      step('Locate', 'Identify the smallest set of files and related tests. Cite exact paths.', ['grep', 'read', 'project_guides']),
+      step('Edit', 'Propose a focused patch using the recorded evidence; keep reasoning and prior tool results intact.', ['read', 'project_guides', 'propose_changes']),
+      step('Verify', 'Run a registered check and report observed results and remaining risks.', ['read', 'verify_edits', 'run_check']),
+    ],
+  },
+  'small-model': {
+    description: 'Compact code investigation with two tools per stage',
+    stages: [
+      step('Find', 'Find only the closest match and read its relevant lines.', ['grep', 'read']),
+      step('Explain', 'Use the recorded evidence. Give a short answer with the path and line.', ['read']),
+    ],
+  },
   'code-review': {
     description: 'Investigate a change and report findings',
     role: 'backend',
@@ -153,6 +169,15 @@ export function harnessFor(config, name) {
     harness.skills.some(name => typeof name !== 'string')))
     throw new Error('Harness skills must be a list of skill names.');
   return harness;
+}
+
+export function stageTools(stage, profile, session, checks) {
+  return [...new Set(stage.tools ?? readTools)].filter(name => {
+    if (profile.tools === false) return false;
+    if (name === 'edit' || name === 'propose_changes') return Boolean(session.write);
+    if (name === 'run_check') return Boolean(session.checks && Object.keys(checks).length);
+    return true;
+  });
 }
 
 export function checksForHarness(config, root, name) {

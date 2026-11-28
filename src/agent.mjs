@@ -2,7 +2,7 @@ import { execFile } from 'node:child_process';
 import { setTimeout as wait } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { complete } from './model.mjs';
-import { checksForHarness, harnessFor, readTools, roleText, skillRead, skillsAt } from './harness.mjs';
+import { checksForHarness, harnessFor, roleText, skillRead, skillsAt, stageTools } from './harness.mjs';
 import { userMessage } from './attachments.mjs';
 import { Workspace } from './workspace.mjs';
 import { prepareReview, ReviewRequired } from './changes.mjs';
@@ -219,12 +219,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       await save();
       continue;
     }
-    const allowed = [...new Set(stage.tools ?? readTools)].filter(name => {
-      if (profile.tools === false) return false;
-      if (name === 'edit' || name === 'propose_changes') return session.write;
-      if (name === 'run_check') return session.checks && Object.keys(checks).length;
-      return true;
-    });
+    const allowed = stageTools(stage, profile, session, checks);
     const tools = allowed.map(name => {
       const tool = definitions[name];
       return { ...tool, function: { ...tool.function, name } };

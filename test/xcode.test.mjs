@@ -1105,6 +1105,21 @@ test('stream first-event and idle limits are independent', async () => {
   await assert.rejects(events.next(), /idle/);
 });
 
+test('profile comparison and effective model-specific harnesses respect permissions', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'OK'));
+  const { cli } = await profile(t, api);
+  await cli('profile', 'set', 'alt', '--endpoint', api.url, '--model', 'different');
+  await cli('profile', 'tune', 'alt', '--idle-timeout', '30');
+  const compare = JSON.parse((await cli('profile', 'compare', 'work', '--against', 'alt', '--json')).stdout);
+  assert.deepEqual(compare.changes.map(change => change.field), ['model', 'idleTimeout']);
+  const baseline = JSON.parse((await cli('harness', 'effective', 'deepseek-flash-code', '--json')).stdout);
+  const editor = JSON.parse((await cli('harness', 'effective', 'deepseek-flash-code', '--write', '--json')).stdout);
+  assert.ok(!baseline.stages[1].tools.includes('propose_changes'));
+  assert.ok(editor.stages[1].tools.includes('propose_changes'));
+  const small = JSON.parse((await cli('harness', 'effective', 'small-model', '--json')).stdout);
+  assert.ok(small.stages.every(stage => stage.tools.length <= 2));
+});
+
 test('model discovery, cached capabilities and streaming fallback use the configured endpoint', async t => {
   const api = await server(t, (body, res) => {
     if (!body) { res.end(JSON.stringify({ data: [{ id: 'fixture' }, { id: 'alternative' }] })); return; }
