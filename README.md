@@ -23,7 +23,7 @@ Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS 
     xcode ask "Where is the retry policy configured?"
     xcode sessions "retry policy"
 
-xcode searches the current worktree and returns paths and line numbers. Tool calling must be supported by the model endpoint. Type @ and press Tab to complete a file path. Use /paste followed by /send for multi-line input. xcode resume restores unsent text and attachment paths. Use xcode draft <id> to retrieve a saved draft without opening its session.
+xcode searches the current worktree and returns paths and line numbers. Tool calling must be supported by the model endpoint. Type @ and press Tab to complete a file path. Use /paste, /preview, and /send for multi-line input. Tab completes slash commands. Set editor shortcuts with xcode terminal --send-key ctrl+x --newline-key ctrl+o. xcode resume restores unsent text and attachment paths. Use xcode draft <id> to retrieve a saved draft without opening its session.
 
 To propose edits and run project verification, use
 

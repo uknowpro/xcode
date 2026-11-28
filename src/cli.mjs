@@ -22,6 +22,7 @@ import { readSession, settings, setToken, storage, tokenFor, updateSettings } fr
 import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
+import { completeCommand, configureEditor, editorKeys, previewDraft } from './chat-input.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -64,6 +65,7 @@ const help = [
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
+  '  xcode terminal [--send-key ctrl+g|ctrl+x] [--newline-key enter|ctrl+o]',
   '  xcode report [session] [--probe] Export a private-data-free diagnostic report',
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
@@ -95,6 +97,8 @@ const chatHelp = [
   '/check <name>                  Run a named project check manually',
   '/settings                      View model, harness and permissions for this session',
   '/paste, /send, /cancel         Compose or paste a multi-line message',
+  '/preview                       Show draft line count and a bounded preview',
+  'Tab after /                    Complete a chat command',
   'Tab after @                    Complete a workspace path',
   '/history, /tools                Show recent conversation or inspected paths',
   '/exit                          Save and exit',
@@ -560,10 +564,16 @@ async function chat(root, base, defaults, options, prefix) {
   let restoredLine = '';
   let draftNotice;
   let pager = null;
+  let bracketedPaste = false;
+  const keys = editorKeys((await settings()).terminal);
   const notices = [];
   const rl = createInterface({
     input: stdin, output: stdout, terminal: true,
-    completer: (line, callback) => completeReference(root, base, line).then(result => callback(null, result), callback),
+    completer: (line, callback) => {
+      const completion = completeCommand(line, chatHelp, Boolean(paste));
+      if (completion) return callback(null, completion);
+      completeReference(root, base, line).then(result => callback(null, result), callback);
+    },
   });
   function endStream() {
     if (!streamOpen) return;
@@ -593,7 +603,8 @@ async function chat(root, base, defaults, options, prefix) {
     if (closed || streamOpen || rendering || pager) return;
     const width = Math.min(42, (stdout.columns || 80) - 12);
     const status = terminalClip(statusLabel(), width);
-    rl.setPrompt((status ? status + ' · ' : '') + (paste ? '│ ' : '› '));
+    const count = paste?.length ? paste.length + (paste.length === 1 ? ' line · ' : ' lines · ') : '';
+    rl.setPrompt((status ? status + ' · ' : '') + (paste ? count + '│ ' : '› '));
     rl.prompt(true);
     if (restoredLine) {
       const text = restoredLine;
@@ -614,8 +625,8 @@ async function chat(root, base, defaults, options, prefix) {
     prompt();
   }
   function drawSessions() {
-    const rowCount = Math.max(4, (stdout.rows || 24) - 5);
-    const width = Math.max(16, (stdout.columns || 80) - 1);
+    const rowCount = Math.max(1, (stdout.rows || 24) - 5);
+    const width = Math.max(1, (stdout.columns || 80) - 1);
     pager.offset = Math.max(0, Math.min(pager.offset, pager.focus));
     if (pager.focus >= pager.offset + rowCount) pager.offset = pager.focus - rowCount + 1;
     cursorTo(stdout, 0, 0);
@@ -627,12 +638,12 @@ async function chat(root, base, defaults, options, prefix) {
       const line = pointer + (row.id === selected.session.id ? '* ' : '  ') + row.text;
       print(terminalClip(line, width));
     }
-    print('↑/↓ Select session · Enter Switch · Esc Close');
+    print(terminalClip('↑/↓ Select session · Enter Switch · Esc Close', width));
   }
 
   function drawReview(move = 0) {
     if (pager.kind === 'sessions') return drawSessions();
-    const rows = Math.max(6, (stdout.rows || 24) - 4);
+    const rows = Math.max(1, (stdout.rows || 24) - 4);
     const { review, mode, picked, conflicts } = pager;
     const lines = mode === 'files' ? review.files.map((file, index) =>
       (index === pager.focus ? '› ' : '  ') + (picked.has(file.path) ? '[x] ' : '[ ] ') + file.path +
@@ -645,14 +656,14 @@ async function chat(root, base, defaults, options, prefix) {
     if (mode === 'files' && pager.focus >= pager.offset + rows) pager.offset = pager.focus - rows + 1;
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
-    const width = Math.max(16, (stdout.columns || 80) - 1);
+    const width = Math.max(1, (stdout.columns || 80) - 1);
     print(terminalClip('Review ' + review.id + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
       (conflicts.size ? ' · ' + conflicts.size + ' conflicts' : '') + (mode === 'diff' && pager.file ? ' · ' + pager.file : ''), width));
     for (const line of lines.slice(pager.offset, pager.offset + rows))
       print(terminalClip(line, width, mode === 'files' ? 0 : pager.column));
-    print(mode === 'files'
+    print(terminalClip(mode === 'files'
       ? '↑/↓ Select file · Space Toggle · Enter Diff · Tab Tests · Esc Close'
-      : '↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Tab ' + (mode === 'diff' ? 'Files' : 'Diff') + ' · Esc/q Close');
+      : '↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Tab ' + (mode === 'diff' ? 'Files' : 'Diff') + ' · Esc/q Close', width));
   }
 
   function closeReview() {
@@ -681,7 +692,7 @@ async function chat(root, base, defaults, options, prefix) {
           finally { prompt(); }
         });
       } else {
-        const move = pageKey(key.name, Math.max(4, (stdout.rows || 24) - 5), pager.rows.length);
+        const move = pageKey(key.name, Math.max(1, (stdout.rows || 24) - 5), pager.rows.length);
         if (move !== undefined) {
           pager.focus = Math.max(0, Math.min(pager.rows.length - 1, pager.focus + move));
           drawSessions();
@@ -717,7 +728,7 @@ async function chat(root, base, defaults, options, prefix) {
         pager.offset = 0;
         pager.column = 0;
       } else {
-        const move = pageKey(key.name, Math.max(6, (stdout.rows || 24) - 4), pager.review.files.length);
+        const move = pageKey(key.name, Math.max(1, (stdout.rows || 24) - 4), pager.review.files.length);
         if (move === undefined) return;
         pager.focus = Math.max(0, Math.min(pager.review.files.length - 1, pager.focus + move));
       }
@@ -733,7 +744,7 @@ async function chat(root, base, defaults, options, prefix) {
       return;
     }
     const rows = pager.mode === 'tests' ? verificationLines(selected.session).length : pager.lines.length;
-    const move = pageKey(key.name, Math.max(6, (stdout.rows || 24) - 4), rows);
+    const move = pageKey(key.name, Math.max(1, (stdout.rows || 24) - 4), rows);
     if (move !== undefined) drawReview(move);
   }
 
@@ -845,13 +856,13 @@ async function chat(root, base, defaults, options, prefix) {
   const closeTerminal = () => rl.close();
   const interrupt = () => {
     if (pager) closeReview();
+    else if (manualCheck) manualCheck.abort();
+    else if (sessions.stop(selected)) show('Stopping…');
     else if (paste) {
       paste = null;
       show('Draft discarded.');
       scheduleDraft();
-    } else if (manualCheck) manualCheck.abort();
-    else if (!sessions.stop(selected)) rl.close();
-    else show('Stopping…');
+    } else rl.close();
   };
   async function send(message) {
     if (!message.trim()) throw new Error('Enter a message.');
@@ -863,11 +874,31 @@ async function chat(root, base, defaults, options, prefix) {
     attachments = [];
   }
 
-  async function input(raw) {
+  function addDraftLine(raw) {
+    if (pasteLength + raw.length + 1 > maxPrompt)
+      throw new Error('Draft exceeds 32,000 characters. Use /send or /cancel.');
+    pasteLength += raw.length + 1;
+    paste.push(raw);
+  }
+  function startDraft() {
+    if (!paste) { paste = []; pasteLength = 0; }
+  }
+  async function submitDraft(tail) {
+    const lines = tail ? [...paste, tail] : paste;
+    await send(lines.join('\n'));
+    paste = null;
+  }
+  async function input(raw, action) {
     if (pager) {
       drawReview();
       return;
     }
+    if (action === 'paste-start') return startDraft();
+    if (action === 'insert') {
+      startDraft();
+      return addDraftLine(raw);
+    }
+    if (action === 'send' && paste) return submitDraft(raw);
     const line = raw.trim();
     if (paste) {
       if (line === '/exit') {
@@ -876,13 +907,13 @@ async function chat(root, base, defaults, options, prefix) {
         paste = null;
         show('Draft discarded.');
       } else if (line === '/send') {
-        await send(paste.join('\n'));
-        paste = null;
+        await submitDraft('');
+      } else if (line === '/preview') {
+        show(previewDraft(paste, stdout.columns || 80, terminalClip));
+      } else if (keys.newline === 'ctrl+o') {
+        await submitDraft(raw);
       } else {
-        if (pasteLength + raw.length + 1 > maxPrompt)
-          throw new Error('Draft exceeds 32,000 characters. Use /send or /cancel.');
-        pasteLength += raw.length + 1;
-        paste.push(raw);
+        addDraftLine(raw);
       }
       return;
     }
@@ -901,7 +932,11 @@ async function chat(root, base, defaults, options, prefix) {
     const session = selected.session;
     switch (command) {
       case '/help': show(chatHelp); break;
-      case '/paste': paste = []; pasteLength = 0; show('Paste or type multiple lines. /send submits, /cancel discards.'); break;
+      case '/paste':
+        startDraft();
+        show('Paste or type multiple lines. /send submits, /preview previews, /cancel discards. ' +
+          keys.send.toUpperCase() + ' sends · ' + keys.newline.toUpperCase() + ' adds a line.');
+        break;
       case '/settings': show(await describeSettings(root, session)); break;
       case '/changes': show(changeHistory(session)); break;
       case '/verification': show(verificationLines(session).join('\n')); break;
@@ -1079,6 +1114,49 @@ async function chat(root, base, defaults, options, prefix) {
       default: throw new Error('Unknown command. Use /help.');
     }
   }
+  function queueInput(line, action) {
+    streamOpen = false;
+    chain = chain.then(async () => {
+      if (closed) return;
+      rendering = true;
+      try {
+        await input(line, action);
+      } catch (error) {
+        show(error.message);
+        if (action === 'send' && line && !rl.line) restoredLine = clean(line);
+      } finally {
+        await saveDraft();
+        rendering = false;
+        prompt();
+      }
+    });
+  }
+  function takeInput() {
+    const line = rl.line;
+    if (line) {
+      rl.write(null, { ctrl: true, name: 'a' });
+      rl.write(null, { ctrl: true, name: 'k' });
+    }
+    return line;
+  }
+  function editorKey(_value, key) {
+    if (!key || pager) return;
+    if (key.name === 'paste-start') {
+      bracketedPaste = true;
+      queueInput('', 'paste-start');
+    } else if (key.name === 'paste-end' && bracketedPaste) {
+      bracketedPaste = false;
+      const tail = takeInput();
+      if (tail) queueInput(tail, 'insert');
+    } else if (!bracketedPaste && paste && key.ctrl) {
+      if ('ctrl+' + key.name === keys.send) queueInput(takeInput(), 'send');
+      else if (keys.newline === 'ctrl+o' && key.name === 'o') queueInput(takeInput(), 'insert');
+    }
+  }
+  function resize() {
+    if (pager) drawReview();
+    else prompt();
+  }
   try {
     await select(prefix);
     if (options.attach?.length) attachments = [...new Set([...attachments, ...options.attach.map(path => resolve(base, path))])];
@@ -1086,25 +1164,13 @@ async function chat(root, base, defaults, options, prefix) {
     rl.on('SIGINT', interrupt);
     stdin.on('keypress', reviewKey);
     stdin.on('keypress', scheduleDraft);
+    stdin.on('keypress', editorKey);
+    stdout.on('resize', resize);
+    if (process.env.TERM !== 'dumb') stdout.write('\x1b[?2004h');
     process.once('SIGTERM', closeTerminal);
     const finished = new Promise(resolve => {
       rl.on('close', () => { closed = true; terminalSignal.abort(); resolve(); });
-      rl.on('line', line => {
-        streamOpen = false;
-        chain = chain.then(async () => {
-          if (closed) return;
-          rendering = true;
-          try {
-            await input(line);
-          } catch (error) {
-            show(error.message);
-          } finally {
-            await saveDraft();
-            rendering = false;
-            prompt();
-          }
-        });
-      });
+      rl.on('line', line => queueInput(line, bracketedPaste ? 'insert' : undefined));
     });
     rendering = true;
     banner();
@@ -1119,6 +1185,9 @@ async function chat(root, base, defaults, options, prefix) {
     process.off('SIGTERM', closeTerminal);
     stdin.off('keypress', reviewKey);
     stdin.off('keypress', scheduleDraft);
+    stdin.off('keypress', editorKey);
+    stdout.off('resize', resize);
+    if (process.env.TERM !== 'dumb') stdout.write('\x1b[?2004l');
     clearTimeout(draftTimer);
     closeReview();
     rl.close();
@@ -1157,6 +1226,7 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      'send-key': { type: 'string' }, 'newline-key': { type: 'string' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
       'context-window': { type: 'string' }, 'max-tokens': { type: 'string' }, 'request-timeout': { type: 'string' },
@@ -1175,6 +1245,12 @@ async function main() {
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1]);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
+  if (command === 'terminal') {
+    if (values['send-key'] || values['newline-key'])
+      await updateSettings(config => { config.terminal = configureEditor(config.terminal, values); });
+    const keys = editorKeys((await settings()).terminal);
+    return print('Send · ' + keys.send + '\nLine break · ' + keys.newline);
+  }
   if (command === 'report') return reportCommand(root, rest[0], values);
   if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'draft') {

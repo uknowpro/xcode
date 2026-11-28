@@ -25,6 +25,13 @@ class Model(BaseHTTPRequestHandler):
             return
         last = data["messages"][-1]
         if last["role"] == "user":
+            content = last["content"]
+            text = content if isinstance(content, str) else content[0]["text"]
+            if "slow-input" in text:
+                time.sleep(0.8)
+                self.send_response(503)
+                self.end_headers()
+                return
             time.sleep(0.2)
             assert "read this file" in last["content"][0]["text"]
             assert "fixture source" in last["content"][1]["text"]
@@ -104,8 +111,17 @@ def smoke(scratch, endpoint):
     chat = Terminal(command + ["--write"], root, env)
     try:
         chat.expect(b"Type a request")
-        chat.send(b"/settings\r")
+        chat.send(b"/set\t")
+        chat.expect(b"/settings ")
+        chat.send(b"\r")
         chat.expect(b"Change proposals")
+        chat.send(b"\x1b[200~temporary config\r/cancel\rlast line\x1b[201~")
+        chat.expect(b"3 lines")
+        chat.send(b"/preview\r")
+        chat.expect(b"3 lines in draft")
+        chat.expect(b" 2  /cancel")
+        chat.send(b"/cancel\r")
+        chat.expect(b"Draft discarded")
         chat.send(b'/attach "source doc.txt"\r')
         chat.expect(b"For the next message")
         chat.send(b"/paste\r")
@@ -171,7 +187,15 @@ def smoke(scratch, endpoint):
         resumed.expect(b"Enter Switch")
         resumed.send(b"\r")
         resumed.expect(b"xcode \xc2\xb7 New session")
-        resumed.send(b"/exit\r")
+        resumed.send(b"slow-input\r")
+        resumed.expect(b"Generating")
+        resumed.send(b"/paste\rkeep this draft\r")
+        resumed.expect(b"1 line")
+        resumed.send(b"\x03")
+        resumed.expect(b"Stopping")
+        resumed.send(b"/preview\r")
+        resumed.expect(b" 1  keep this draft")
+        resumed.send(b"/cancel\r/exit\r")
         assert resumed.process.wait(timeout=WAIT_SECONDS) == 0
     finally:
         resumed.close()

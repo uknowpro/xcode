@@ -1110,6 +1110,21 @@ test('diagnostic reports omit credentials, locations, and session contents and o
   assert.equal(await readFile(join(sessionDir, file), 'utf8'), before);
 });
 
+test('chat completion and compose options respect the current editor mode', async () => {
+  const { completeCommand, configureEditor, editorKeys, previewDraft } = await import('../src/chat-input.mjs');
+  const help = '/settings         View settings\n/sessions         Browse sessions\n/paste            Compose';
+  assert.deepEqual(completeCommand('/set', help, false), [['/settings '], '/set']);
+  assert.match(completeCommand('/s', help, false)[0].join(' '), /Browse sessions/);
+  assert.deepEqual(completeCommand('/set', help, true), [[], '/set']);
+  assert.deepEqual(completeCommand('/pre', help, true), [['/preview '], '/pre']);
+  assert.equal(completeCommand('use /set', help, false), null);
+  const config = configureEditor({ color: 'on' }, { 'send-key': 'ctrl+x', 'newline-key': 'ctrl+o' });
+  assert.deepEqual(editorKeys(config), { send: 'ctrl+x', newline: 'ctrl+o' });
+  assert.equal(config.color, 'on');
+  assert.throws(() => configureEditor(config, { 'send-key': 'ctrl+c' }), /Send key/);
+  assert.match(previewDraft(Array(14).fill('example'), 40, line => line), /2 more lines/);
+});
+
 test('terminal views clip Korean and emoji on display columns without breaking graphemes', async () => {
   const { terminalClip, terminalWidth } = await import('../src/terminal.mjs');
   assert.equal(terminalWidth('가🙂e\u0301'), 5);
