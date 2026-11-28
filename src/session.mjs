@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { lock, sessionsDir, listSessions, readSession, settings, tokenFor, writeSession } from './store.mjs';
 import { runJob } from './agent.mjs';
-import { applyReview, inverseReview, ReviewRequired } from './changes.mjs';
+import { appliedReviewFiles, applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
 import { refreshMemory } from './memory.mjs';
 import { attachmentSize, maxAttachmentBytes, maxAttachments } from './attachments.mjs';
@@ -255,7 +255,7 @@ export class Sessions {
         job.approvals = [...(approvals ?? []), { stageIndex: job.completed.length, files }];
         live.session.changes = [...(oldHistory ?? []), {
           id: review.id, prompt: job.prompt.slice(0, 160), appliedAt: new Date().toISOString(),
-          files: review.files.filter(file => files.includes(file.path)),
+          files: appliedReviewFiles(review).filter(file => files.includes(file.path)),
         }];
       }
       tool.content = JSON.stringify(decision === 'apply'

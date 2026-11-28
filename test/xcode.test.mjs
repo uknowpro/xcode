@@ -208,6 +208,22 @@ test('CLI reviews a multi-file change before applying it and runs the authorized
   assert.match(result.stderr, /validate · passed · exit 0/);
 });
 
+test('selected hunks preserve unselected lines and ambiguous edits report match locations', async () => {
+  const { appliedReviewFiles, chooseHunks, reviewHunks } = await import('../src/changes.mjs');
+  const lines = ['before', ...Array.from({ length: 20 }, (_, index) => 'Line ' + index), 'after'];
+  const before = lines.join('\n') + '\n';
+  lines[0] = 'updated first';
+  lines[21] = 'updated last';
+  const review = { files: [{ path: 'sample.txt', before, after: lines.join('\n') + '\n' }] };
+  assert.equal(reviewHunks(review, 'sample.txt').length, 2);
+  chooseHunks(review, 'sample.txt', ['2']);
+  assert.match(appliedReviewFiles(review)[0].after, /^before[\s\S]*updated last/);
+  assert.throws(() => chooseHunks(review, 'sample.txt', ['all', '3']), /hunk numbers/);
+  const text = Buffer.from('same\nother\nsame\n');
+  assert.throws(() => replaceText(text, 'same', 'new', 100), /Candidate lines: 1, 3/);
+  assert.equal(replaceText(text, 'same', 'new', 100, 3).output, 'same\nother\nnew\n');
+});
+
 test('a late file conflict rolls back earlier replacements and respects existing user changes', async t => {
   const root = await temp(t);
   const state = await temp(t);

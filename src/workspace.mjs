@@ -61,15 +61,27 @@ export function decodeText(bytes) {
   }
 }
 
-export function replaceText(bytes, oldText, newText, max) {
+export function replaceText(bytes, oldText, newText, max, startLine) {
   if (typeof oldText !== 'string' || !oldText || typeof newText !== 'string' || oldText === newText)
     throw new Error('Provide exact original and replacement text.');
   const original = decodeText(bytes);
   const normal = original.replace(/\r\n/g, '\n');
   const expected = oldText.replace(/\r\n/g, '\n');
-  const index = normal.indexOf(expected);
-  if (index < 0 || normal.indexOf(expected, index + 1) >= 0) throw new Error('Original text must match exactly once.');
-  const line = normal.slice(0, index).split('\n').length;
+  if (startLine !== undefined && (!Number.isSafeInteger(startLine) || startLine < 1)) throw new Error('startLine must be a positive line number.');
+  const locations = [];
+  const hints = [];
+  let line = 1, current = 0;
+  for (let match = normal.indexOf(expected); match >= 0; match = normal.indexOf(expected, match + 1)) {
+    while (current < match) if (normal[current++] === '\n') line++;
+    if (hints.length < 8) hints.push(line);
+    if (startLine === undefined || startLine === line) locations.push({ index: match, line });
+    if (locations.length >= 2 && hints.length >= 8) break;
+    if (startLine !== undefined && line > startLine) break;
+  }
+  if (locations.length !== 1) throw new Error('Original text must match exactly once' +
+    (hints.length ? '. Candidate lines: ' + [...new Set(hints)].join(', ') + '. Use a longer excerpt or startLine.' : '.'));
+  const index = locations[0].index;
+  line = locations[0].line;
   function sourceOffset(target) {
     let actual = 0;
     for (let normalized = 0; normalized < target; normalized++, actual++) {
@@ -352,15 +364,41 @@ export class Workspace {
     }
   }
 
-  async map({ query = '' }, signal) {
+  async packages(path = '.', signal) {
+    let directory = this.scope(path);
+    if (!(await lstat(directory)).isDirectory()) directory = dirname(directory);
+    let owner = directory, selected;
+    while (within(this.root, owner)) {
+      const file = join(owner, 'package.json');
+      try { selected = JSON.parse(await readText(this.root, file, signal, 128 * 1024)); break; }
+      catch { signal?.throwIfAborted(); }
+      if (owner === this.root) break;
+      owner = dirname(owner);
+    }
+    if (!selected) return { package: null, dependencies: [] };
+    const depends = new Set(Object.keys({ ...selected.dependencies, ...selected.devDependencies, ...selected.peerDependencies }));
+    const matches = [];
+    const { files } = await this.files(signal);
+    for (const file of files.filter(path => path.endsWith('/package.json')).slice(0, 300)) {
+      try {
+        const content = JSON.parse(await readText(this.root, file, signal, 128 * 1024));
+        if (depends.has(content.name)) matches.push({ name: content.name, path: file.slice(0, -'/package.json'.length) });
+      } catch { signal?.throwIfAborted(); }
+    }
+    return { package: { name: selected.name ?? null, path: slash(relative(this.root, owner)) || '.' }, dependencies: matches };
+  }
+
+  async map({ query = '', path }, signal) {
     const { files, truncated } = await this.files(signal);
     const terms = String(query).toLowerCase().match(/[\p{L}\p{N}_-]+/gu)?.filter(word => word.length > 1).slice(0, 12) ?? [];
     const rank = text => terms.filter(term => text.toLowerCase().includes(term)).length;
     const sources = files.filter(file => /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|cs|rb|php|swift)$/i.test(file));
+    const scope = path ? await this.packages(path, signal) : null;
+    const prefixes = scope?.package ? [scope.package.path, ...scope.dependencies.map(item => item.path)] : [];
     const changed = new Set(await this.changed(signal));
     const stem = path => path.split('/').at(-1).replace(/\.[^.]+$/, '').replace(/(?:[._-](?:spec|test)|Tests?)$/i, '').toLowerCase();
     const related = new Set([...changed].map(stem));
-    const selected = sources.map(file => ({ file, score: rank(file) * 4 + (changed.has(file) ? 3 : related.has(stem(file)) ? 1 : 0) }))
+    const selected = sources.map(file => ({ file, score: rank(file) * 4 + (prefixes.some(prefix => prefix === '.' || file.startsWith(prefix + '/')) ? 4 : 0) + (changed.has(file) ? 3 : related.has(stem(file)) ? 1 : 0) }))
       .sort((a, b) => b.score - a.score || a.file.split('/').length - b.file.split('/').length || a.file.localeCompare(b.file))
       .slice(0, 240);
     const seen = new Set(sources);

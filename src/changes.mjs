@@ -91,7 +91,7 @@ export async function prepareReview(project, operations, readPaths, signal) {
   const defaultMode = process.platform === 'win32' ? null : 0o666 & ~process.umask();
   for (const operation of operations) {
     signal?.throwIfAborted();
-    const { path, action, oldText, newText, to } = operation ?? {};
+    const { path, action, oldText, newText, to, startLine } = operation ?? {};
     const file = await find(path);
     switch (action) {
       case 'create':
@@ -103,7 +103,7 @@ export async function prepareReview(project, operations, readPaths, signal) {
         break;
       case 'replace':
         requireRead(file);
-        file.after = replaceText(Buffer.from(file.after), oldText, newText, maxFile).output;
+        file.after = replaceText(Buffer.from(file.after), oldText, newText, maxFile, startLine).output;
         break;
       case 'delete':
         requireRead(file);
@@ -201,6 +201,48 @@ async function write(project, file, target, expected, created) {
   }
 }
 
+export function ownHunks(review, path) {
+  return review.hunkSelections && Object.hasOwn(review.hunkSelections, path) ? review.hunkSelections[path] : undefined;
+}
+
+export function appliedReviewFiles(review, paths = []) {
+  return selectedFiles(review, paths).map(file => {
+    const chosen = ownHunks(review, file.path);
+    if (!chosen) return file;
+    const ops = diffOperations(textLines(file.before), textLines(file.after));
+    const ranges = diffRanges(ops);
+    const selected = new Set(chosen);
+    const output = [];
+    let current = 0;
+    for (const [index, [sign, text]] of ops.entries()) {
+      while (current < ranges.length && index >= ranges[current].end) current++;
+      const take = selected.has(current + 1) && index >= (ranges[current]?.start ?? Infinity);
+      if (sign === ' ' || (take ? sign === '+' : sign === '-')) output.push(text);
+    }
+    return { ...file, after: output.join('') };
+  });
+}
+
+export function reviewHunks(review, path) {
+  const file = review.files.find(file => file.path === path);
+  if (!file || file.before === null || file.after === null || file.move)
+    throw new Error('Select a modified text file. Created, deleted and moved files are selected as a whole.');
+  const ops = diffOperations(textLines(file.before), textLines(file.after));
+  return hunks(ops).filter(line => line.startsWith('@@ '));
+}
+
+export function chooseHunks(review, path, values) {
+  if (review.state === 'applying') throw new Error('Finish the interrupted apply before changing hunk selection.');
+  const count = reviewHunks(review, path).length;
+  const choices = [...new Set(values.map(Number))];
+  const reset = values.length === 1 && values[0] === 'all';
+  if (!reset && (!choices.length || choices.some(index => !Number.isInteger(index) || index < 1 || index > count)))
+    throw new Error('Select hunk numbers from 1 to ' + count + ', or all.');
+  const selections = { ...review.hunkSelections };
+  if (reset) delete selections[path];
+  review.hunkSelections = reset ? selections : { ...selections, [path]: choices };
+}
+
 async function inspectReview(project, files, recovery) {
   const applied = [];
   const conflicts = [];
@@ -227,7 +269,16 @@ async function inspectReview(project, files, recovery) {
 }
 
 export async function reviewConflicts(project, review, paths = []) {
-  return (await inspectReview(project, selectedFiles(review, paths), review.state === 'applying')).conflicts;
+  return (await inspectReview(project, appliedReviewFiles(review, paths), review.state === 'applying')).conflicts;
+}
+
+export async function reviewRecovery(project, review) {
+  const files = appliedReviewFiles(review);
+  const status = await inspectReview(project, files, review.state === 'applying');
+  const conflicts = new Map(status.conflicts.map(item => [item.path, item.reason]));
+  const applied = new Set(status.applied.map(file => file.path));
+  return files.map(file => ({ path: file.path, state: conflicts.has(file.path) ? 'conflict' : applied.has(file.path) ? 'applied' : 'pending',
+    ...(conflicts.has(file.path) ? { reason: conflicts.get(file.path) } : {}) }));
 }
 
 export function conflictSummary(conflicts) {
@@ -238,7 +289,7 @@ export function conflictSummary(conflicts) {
 
 export async function applyReview(project, review, save, paths = []) {
   const key = createHash('sha256').update(process.platform === 'win32' ? project.root.toLowerCase() : project.root).digest('hex').slice(0, 24);
-  const files = selectedFiles(review, paths);
+  const files = appliedReviewFiles(review, paths);
   const unlock = await lock(sessionsDir, 'workspace-' + key);
   const recovery = review.state === 'applying';
   let applied;
@@ -344,7 +395,7 @@ function diffOperations(before, after) {
   return ops;
 }
 
-function hunks(ops) {
+function diffRanges(ops) {
   const ranges = [];
   for (let at = 0; at < ops.length; at++) {
     if (ops[at][0] === ' ') continue;
@@ -354,6 +405,11 @@ function hunks(ops) {
     if (last && start <= last.end) last.end = end;
     else ranges.push({ start, end });
   }
+  return ranges;
+}
+
+function hunks(ops) {
+  const ranges = diffRanges(ops);
   const output = [];
   let index = 0, oldBase = 0, newBase = 0;
   for (const { start, end } of ranges) {

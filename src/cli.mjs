@@ -14,7 +14,7 @@ import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
 import { checkEvidence } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
-import { conflictSummary, reviewConflicts, reviewDiff, selectedFiles } from './changes.mjs';
+import { chooseHunks, conflictSummary, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
@@ -72,7 +72,8 @@ const help = [
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|remove [name]',
   '  xcode check run <name> [--json]',
-  '  xcode review show|check|apply|reject [session] [paths...]',
+  '  xcode review show|check|hunks|recovery|apply|reject [session] [paths...]',
+  '  xcode guides|packages [path]  Show scoped instructions or local package dependencies',
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
@@ -113,6 +114,9 @@ const chatHelp = [
   '/retry off|<seconds>            Retry transient failures while the session is running',
   '/write on|off                  Allow model change proposals. Applying still requires approval',
   '/diff [path], /apply [paths]    Review or approve all or selected files',
+  '/hunks <path> [number …|all]     List or select edit hunks',
+  '/recovery                     Inspect files in an interrupted apply or undo',
+  '/guides, /packages [path]       Show folder instructions and package dependencies',
   '/verification                  View test outcomes for the current or last turn',
   '/reject, /changes, /undo [id]  Reject a proposal, see history, or undo',
   '/context [query]               Inspect the compacted session context',
@@ -555,13 +559,36 @@ async function describeSettings(root, session) {
   ].filter(Boolean).join('\n');
 }
 
+function hunkList(review, path) {
+  const picked = ownHunks(review, path);
+  return reviewHunks(review, path).map((header, index) =>
+    (picked?.includes(index + 1) || !picked ? '[x] ' : '[ ] ') + (index + 1) + ' · ' + header).join('\n');
+}
+
+async function recoveryText(root, session) {
+  const review = session.undoInProgress ?? session.queue[0]?.review;
+  if (!review) return 'No saved apply or undo to inspect.';
+  const rows = await reviewRecovery(new Workspace(root), review);
+  return rows.map(row => row.path + ' · ' + row.state + (row.reason ? ' · ' + row.reason : '')).join('\n') +
+    '\n' + (session.undoInProgress ? 'Run xcode undo to resume after resolving conflicts.' :
+      'Run xcode review apply to resume after resolving conflicts.');
+}
+
 async function reviewCommand(root, action, prefix, paths) {
-  if (!['show', 'check', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
+  if (!['show', 'check', 'hunks', 'recovery', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
+    if (action === 'recovery') return print(await recoveryText(root, live.session));
     const review = live.session.queue[0]?.review;
     if (!review) throw new Error('There is no pending change set.');
+    if (action === 'hunks') {
+      if (paths.length > 1) {
+        chooseHunks(review, paths[0], paths.slice(1));
+        await sessions.persist(live);
+      }
+      return print(hunkList(review, paths[0]));
+    }
     if (action === 'show' || action === 'check') {
       if (action === 'show') print(reviewDiff(review, paths[0]).join('\n'));
       const chosen = paths.length || review.state === 'applying' ? paths : review.markedPaths ?? paths;
@@ -1222,6 +1249,19 @@ async function chat(root, base, defaults, options, prefix) {
           (notes.length ? '\n\n' + notes.join('\n\n') : ''));
         break;
       }
+      case '/guides': show(await guideText(new Workspace(root), arg)); break;
+      case '/packages': show(JSON.stringify(await new Workspace(root).packages(arg), null, 2)); break;
+      case '/recovery': show(await recoveryText(root, session)); break;
+      case '/hunks': {
+        const review = session.queue[0]?.review;
+        if (!review) throw new Error('There is no pending change set.');
+        if (args.length > 1) {
+          chooseHunks(review, arg, args.slice(1));
+          await sessions.persist(selected);
+        }
+        show(hunkList(review, arg));
+        break;
+      }
       case '/diff': {
         const review = session.queue[0]?.review;
         if (!review) throw new Error('There is no pending change set.');
@@ -1521,6 +1561,25 @@ async function chat(root, base, defaults, options, prefix) {
   }
 }
 
+async function guideText(workspace, path = '.') {
+  const guides = await workspace.guides(path);
+  const directions = new Map();
+  const warnings = [];
+  for (const guide of guides) {
+    for (const line of guide.lines.split('\n')) {
+      const instruction = /^\d+\s+\s*(?:[-*]\s*)?(do not|do|never|always)\s+(.+?)\.?$/i.exec(line);
+      if (!instruction) continue;
+      const rule = instruction[2].trim().toLowerCase();
+      const negative = /^(?:do not|never)$/i.test(instruction[1]);
+      const prior = directions.get(rule);
+      if (prior && prior.negative !== negative) warnings.push('Possible conflict · ' + prior.path + ' and ' + guide.path + ' · ' + rule);
+      directions.set(rule, { path: guide.path, negative });
+    }
+  }
+  return [...guides.map(guide => guide.path + ' · applies under ' + (guide.path.includes('/') ? guide.path.slice(0, guide.path.lastIndexOf('/')) : '.') +
+    '\n' + guide.lines), ...warnings].join('\n\n') || 'No scoped AGENTS.md found.';
+}
+
 const searchOptions = {
   path: { type: 'string' }, pattern: { type: 'string' }, type: { type: 'string' }, regex: { type: 'boolean' },
   offset: { type: 'string' }, line: { type: 'string' }, json: { type: 'boolean' },
@@ -1634,6 +1693,8 @@ async function main() {
     return print('Send · ' + keys.send + '\nLine break · ' + keys.newline +
       '\nTheme · ' + style.theme + '\nAccessible output · ' + (style.accessible ? 'on' : 'off'));
   }
+  if (command === 'guides') return print(await guideText(new Workspace(root), rest[0] ?? values.path));
+  if (command === 'packages') return print(JSON.stringify(await new Workspace(root).packages(rest[0] ?? values.path), null, 2));
   if (command === 'open') return openLocation(root, rest[0]);
   if (command === 'search' || command === 'symbol') return print(await workspaceQuery(root, command, rest.join(' '), values));
   if (command === 'report') return reportCommand(root, rest[0], values);

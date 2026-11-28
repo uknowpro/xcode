@@ -31,7 +31,7 @@ const definitions = {
   }, ['query']),
   read: schema('Read a bounded range of numbered UTF-8 lines. Use nextStart to continue.', { path: string, start: integer, count: integer }, ['path']),
   project_guides: schema('Read AGENTS.md files for a workspace file or directory, root first.', { path: string }),
-  repo_map: schema('Summarize source declarations and resolvable relative JavaScript and TypeScript imports.', { query: string }),
+  repo_map: schema('Summarize source declarations and resolvable relative JavaScript and TypeScript imports. Optional path prioritizes an affected package and its dependencies.', { query: string, path: string }),
   skill_read: schema('Read SKILL.md or a resource from a discovered local skill. Scripts are returned as text.', { name: string, path: string }, ['name']),
   propose_changes: schema('Propose up to 20 files in one review. Read existing files and scoped guides before editing, deleting or moving. Use create for new UTF-8 text and move with a new destination. Wait for user approval.', {
     changes: {
@@ -39,14 +39,14 @@ const definitions = {
       items: {
         type: 'object',
         properties: { path: string, action: { type: 'string', enum: ['create', 'replace', 'delete', 'move'] },
-          oldText: string, newText: string, to: string },
+          oldText: string, newText: string, to: string, startLine: integer },
         required: ['path', 'action'],
         additionalProperties: false,
       },
     },
   }, ['changes']),
   edit: schema('Propose one exact replacement for review. Prefer propose_changes for multiple lines or files.', {
-    path: string, oldText: string, newText: string,
+    path: string, oldText: string, newText: string, startLine: integer,
   }, ['path', 'oldText', 'newText']),
   run_check: schema('Run one exact, user-configured project check by name.', { name: string }, ['name']),
   verify_edits: schema('Check session-edited files for Git whitespace errors.', {}),
