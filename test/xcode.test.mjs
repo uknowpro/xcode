@@ -1146,6 +1146,19 @@ test('terminal views clip Korean and emoji on display columns without breaking g
   assert.equal(terminalWidth('a\t가'), 6);
 });
 
+test('session history pages by turn and forks or exports a saved conversation', async t => {
+  const api = await server(t, (_body, res, n) => reply(res, 'Reply ' + n));
+  const { cli } = await profile(t, api);
+  await cli('ask', 'Initial question');
+  const id = (await cli('session', 'fork', 'latest', '1')).stdout.trim();
+  assert.match(id, /^[0-9a-f-]{36}$/);
+  assert.match((await cli('session', 'history', id)).stdout, /#1 · complete/);
+  assert.match((await cli('session', 'export', id)).stdout, /## Turn 1[\s\S]*Initial question[\s\S]*Reply 1/);
+  const { historyPage } = await import('../src/session-history.mjs');
+  assert.deepEqual(historyPage(['one', 'two', 'three'], '3', '1'), { entries: [{ turn: 'two', number: 2 }], nextBefore: 2 });
+  assert.throws(() => historyPage([], '3'), /turn number/);
+});
+
 test('session metadata persists and archived sessions filter separately', async t => {
   const api = await server(t, (_body, res) => reply(res, 'OK'));
   const { cli } = await profile(t, api);

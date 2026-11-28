@@ -46,11 +46,16 @@ export class Sessions {
       turns: [],
       updated: new Date().toISOString(),
     };
+    return this.openSession(session, Boolean(found));
+  }
+
+  async openSession(session, reload = false) {
     await mkdir(sessionsDir, { recursive: true, mode: 0o700 });
-    const unlock = await lock(sessionsDir, session.id);
+    const id = session.id;
+    const unlock = await lock(sessionsDir, id);
     try {
-      if (found) {
-        session = await readSession(found.id);
+      if (reload) {
+        session = await readSession(id);
         if (!session || session.root !== this.root) throw new Error('Session is no longer available in this project.');
       }
       session.memory = refreshMemory(session);
@@ -59,10 +64,22 @@ export class Sessions {
       await this.persist(live);
       return live;
     } catch (error) {
-      this.open.delete(found?.id ?? session.id);
+      this.open.delete(id);
       await unlock();
       throw error;
     }
+  }
+
+  async fork(live, number) {
+    const origin = live.session;
+    const end = number === undefined ? origin.turns.length : Number(number);
+    if (!Number.isInteger(end) || end < 0 || end > origin.turns.length)
+      throw new Error('Choose a turn between 0 and ' + origin.turns.length + '.');
+    return this.openSession({
+      id: randomUUID(), root: origin.root, title: ('Fork · ' + origin.title).slice(0, 120),
+      customTitle: true, profile: origin.profile, harness: origin.harness, write: false, retrySeconds: 0,
+      queue: [], turns: structuredClone(origin.turns.slice(0, end)), forkedFrom: { id: origin.id, turn: end },
+    });
   }
 
   persist(live) {
@@ -124,6 +141,11 @@ export class Sessions {
       delete job.failureInfo;
       const answer = await runJob({ session, job, config, profile, token, signal,
         emit: event => {
+          if (event.type === 'attempt') active.partial = undefined;
+          if (event.type === 'text' && !event.intermediate) {
+            const combined = (active.partial?.text ?? '') + event.text;
+            active.partial = { text: combined.slice(-16000), truncated: Boolean(active.partial?.truncated || combined.length > 16000) };
+          }
           if (event.type === 'request' || event.type === 'stage') {
             active.stage = event.stage;
             active.tool = undefined;
@@ -142,6 +164,7 @@ export class Sessions {
         this.notify(live, { type: 'review', id: job.review.id, files: job.review.files.map(file => file.path) });
         return { review: job.review };
       }
+      if (active.partial?.text) job.partial = active.partial;
       if (signal.aborted && active.advance) {
         await this.finish(live, job, '', 'stopped');
         this.notify(live, { type: 'note', text: 'Stopped current message. Sending the next queued message.' });
@@ -166,6 +189,7 @@ export class Sessions {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
       checks: job.checks ?? [], attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
       ...(failedChecks.length ? { verificationFailed: true } : {}),
+      ...(status !== 'complete' && job.partial ? { partial: job.partial } : {}),
       ...(status === 'complete' && job.wire ? { wire: completedWire(job) } : {}),
     };
     const previousMemory = live.session.memory;

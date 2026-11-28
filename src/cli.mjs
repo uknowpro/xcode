@@ -22,6 +22,7 @@ import { readSession, settings, setToken, storage, tokenFor, updateSettings } fr
 import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
+import { historyText, sessionMarkdown } from './session-history.mjs';
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
 
@@ -52,6 +53,7 @@ const help = [
   '  xcode ask "prompt"             Run a single prompt, or pipe text to xcode ask',
   '  xcode sessions [search] [--status <filter>]',
   '  xcode session rename|pin|unpin|archive|restore <id|latest> [title]',
+  '  xcode session history|fork|export <id|latest> [turn] [count]',
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode draft [id|latest]        Read an unsent draft without opening the session',
   '  xcode continue [id|latest]    Run the pending message once',
@@ -108,7 +110,9 @@ const chatHelp = [
   '/preview                       Show draft line count and a bounded preview',
   'Tab after /                    Complete a chat command',
   'Tab after @                    Complete a workspace path',
-  '/history, /tools                Show recent conversation or inspected paths',
+  '/history [before] [count]      Browse recent turns and page backward',
+  '/fork [turn], /partial [line]   Branch a session or recover a partial response',
+  '/tools                        Show paths and tools from this turn',
   '/exit                          Save and exit',
 ].join('\n');
 
@@ -1186,9 +1190,35 @@ async function chat(root, base, defaults, options, prefix) {
         show(skills.size ? [...skills.values()].map(skill => skill.name + ' · ' + skill.description).join('\n') : 'No local skills found.');
         break;
       }
-      case '/history':
-        show(session.turns.slice(-8).map(turn => '> ' + turn.prompt + '\n' + (turn.answer || '[' + turn.status + ']')).join('\n\n') || 'No prior responses.');
+      case '/history': show(historyText(session.turns, arg, value)); break;
+      case '/fork': {
+        const fork = await sessions.fork(selected, arg);
+        await select(fork.session.id);
+        banner();
         break;
+      }
+      case '/partial': {
+        const source = session.queue[0]?.partial ? session.queue[0] : session.turns.at(-1);
+        if (!source?.partial?.text) throw new Error('No saved partial response for this session.');
+        const lines = source.partial.text.split('\n');
+        if (!arg) {
+          show((source.partial.truncated ? 'Retained tail · ' : '') + lines.length + ' lines · /partial <line> opens a continuation draft.' +
+            '\n' + lines.slice(0, 50).map((line, index) => (index + 1) + '  ' + line).join('\n') +
+            (lines.length > 50 ? '\n… ' + (lines.length - 50) + ' more lines' : ''));
+          break;
+        }
+        const end = Number(arg);
+        if (!Number.isInteger(end) || end < 1 || end > lines.length) throw new Error('Choose a line shown by /partial.');
+        const fork = await sessions.fork(selected);
+        await select(fork.session.id);
+        startDraft();
+        const text = 'Continue the interrupted answer from the following excerpt.\n\nOriginal request:\n' +
+          source.prompt.slice(0, 4000) + '\n\nExcerpt:\n' + lines.slice(0, end).join('\n');
+        for (const line of text.split('\n')) addDraftLine(line);
+        show('Opened a continuation draft in a new session. /preview, then /send.');
+        banner();
+        break;
+      }
       case '/tools':
         show((session.queue[0]?.tools ?? session.turns.at(-1)?.tools ?? [])
           .map(tool => tool.stage + ' · ' + tool.name + (tool.path ? ' ' + tool.path : '') +
@@ -1364,10 +1394,22 @@ async function main() {
   }
   if (command === 'session') {
     const sessions = new Sessions(root);
+    const [action, prefix = 'latest', turn, count] = rest;
+    if (action === 'export' || action === 'history') {
+      const entry = await sessions.find(prefix);
+      const session = await readSession(entry.id);
+      if (!session || session.root !== root) throw new Error('Session is no longer available in this project.');
+      return print(action === 'export' ? sessionMarkdown(session) : historyText(session.turns, turn, count));
+    }
     try {
-      const live = await sessions.select(rest[1] || 'latest', defaults);
-      const session = await sessions.updateMetadata(live, rest[0], rest.slice(2).join(' '));
-      print('Session updated · ' + session.title);
+      const live = await sessions.select(prefix, defaults);
+      if (action === 'fork') {
+        const fork = await sessions.fork(live, turn);
+        print(fork.session.id);
+      } else {
+        const session = await sessions.updateMetadata(live, action, rest.slice(2).join(' '));
+        print('Session updated · ' + session.title);
+      }
     } finally {
       await sessions.close();
     }

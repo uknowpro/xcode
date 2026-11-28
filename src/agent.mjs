@@ -160,6 +160,7 @@ async function request(profile, token, messages, tools, session, signal, emit) {
   for (;;) {
     signal.throwIfAborted();
     let visible = false;
+    emit({ type: 'attempt' });
     try {
       return await complete(profile, token, messages, {
         tools,

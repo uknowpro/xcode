@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
@@ -174,11 +174,29 @@ async function writeSummary(id, info, summary) {
   await saveJson(indexPath(id), { record: recordKey(info), summary }).catch(() => {});
 }
 
+function projectSessions(root) {
+  return join(sessionsDir, 'projects', createHash('sha256').update(root).digest('hex'));
+}
+
+async function indexProject(session) {
+  const directory = projectSessions(session.root);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  for (const marker of [join(directory, session.id), sessionPath(session.id).replace(/\.json$/, '.project')]) {
+    try {
+      const file = await open(marker, 'wx', 0o600);
+      await file.close();
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+}
+
 export async function writeSession(session) {
   const path = sessionPath(session.id);
   await saveJson(path, session);
   const info = await lstat(path).catch(() => null);
   if (info) await writeSummary(session.id, info, summarizeSession(session));
+  await indexProject(session).catch(() => {});
 }
 
 async function sessionSummary(id) {
@@ -205,14 +223,26 @@ async function sessionSummary(id) {
 
 export async function listSessions(root, onProblem = () => {}) {
   await mkdir(sessionsDir, { recursive: true, mode: 0o700 });
-  const files = await readdir(sessionsDir);
+  const files = new Set(await readdir(sessionsDir));
+  const indexes = await readdir(projectSessions(root)).catch(error => {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  });
+  const ids = new Set((indexes ?? []).filter(name => /^[0-9a-f-]{36}$/.test(name)));
+  for (const name of files) {
+    if (!/^[0-9a-f-]{36}\.json$/.test(name)) continue;
+    const id = name.slice(0, -5);
+    if (!indexes || !files.has(id + '.project')) ids.add(id);
+  }
   const sessions = [];
-  for (const file of files.filter(name => /^[0-9a-f-]{36}\.json$/.test(name))) {
+  for (const id of ids) {
     try {
-      const session = await sessionSummary(file.slice(0, -5));
-      if (session?.root === root) sessions.push(session);
+      const session = await sessionSummary(id);
+      if (!session) continue;
+      if (!files.has(id + '.project') || !indexes) await indexProject(session).catch(() => {});
+      if (session.root === root) sessions.push(session);
     } catch (error) {
-      onProblem(file, error);
+      onProblem(id + '.json', error);
     }
   }
   return sessions.sort((a, b) => b.updated.localeCompare(a.updated));
