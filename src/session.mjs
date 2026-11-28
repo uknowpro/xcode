@@ -20,15 +20,16 @@ export class Sessions {
     return listSessions(this.root, onProblem);
   }
 
+  async find(prefix) {
+    const previous = await this.list();
+    const matches = prefix === 'latest' ? previous.slice(0, 1) : previous.filter(session => session.id.startsWith(prefix));
+    if (matches.length !== 1) throw new Error(matches.length ? 'Session prefix is ambiguous.' : 'Session not found in this project.');
+    return matches[0];
+  }
+
   async select(prefix, defaults) {
-    let found;
-    if (prefix) {
-      const previous = await this.list();
-      const matches = prefix === 'latest' ? previous.slice(0, 1) : previous.filter(session => session.id.startsWith(prefix));
-      if (matches.length !== 1) throw new Error(matches.length ? 'Session prefix is ambiguous.' : 'Session not found in this project.');
-      found = matches[0];
-      if (this.open.has(found.id)) return this.open.get(found.id);
-    }
+    const found = prefix ? await this.find(prefix) : undefined;
+    if (found && this.open.has(found.id)) return this.open.get(found.id);
     const config = await settings();
     let session = found ?? {
       id: randomUUID(),

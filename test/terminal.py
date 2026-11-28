@@ -105,11 +105,29 @@ def smoke(scratch, endpoint):
         chat.expect(b"Type a request")
         chat.send(b"/settings\r")
         chat.expect(b"Change proposals")
+        chat.send(b'/attach "source doc.txt"\r')
+        chat.expect(b"For the next message")
         chat.send(b"/paste\r")
         chat.expect(b"/send submits")
         chat.send(b"read this file @source\t")
         chat.expect(b'@"source doc.txt"')
-        chat.send(b"\rcreate two files\r/send\r")
+        chat.send(b"\rcreate two files")
+        ready = time.monotonic() + WAIT_SECONDS
+        while True:
+            recovered = subprocess.run(command + ["draft", "latest"], cwd=root, env=env, capture_output=True, timeout=WAIT_SECONDS)
+            if b"create two files" in recovered.stdout:
+                assert b"source doc.txt" in recovered.stderr
+                break
+            if time.monotonic() >= ready:
+                raise AssertionError("Typed draft was not checkpointed")
+            time.sleep(0.05)
+        chat.process.terminate()
+        assert chat.process.wait(timeout=WAIT_SECONDS) == 0
+        chat.close()
+        chat = Terminal(command + ["resume", "latest"], root, env)
+        chat.expect(b"Draft restored")
+        chat.expect(b"create two files")
+        chat.send(b"\r/send\r")
         chat.expect(b"/diff to review")
         chat.send(b"/diff\r")
         chat.expect(b"Tab Files")

@@ -19,6 +19,7 @@ import { completeReference, pageKey, terminalClip, terminalWidth } from './termi
 import { Sessions } from './session.mjs';
 import { settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { projectRoot } from './workspace.mjs';
+import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -26,7 +27,7 @@ const print = value => stdout.write(clean(value) + '\n');
 const info = value => stderr.write(clean(value) + '\n');
 const namePattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,47}$/;
 const own = (object, key) => Object.hasOwn(object, key) ? object[key] : undefined;
-const maxPrompt = 32000;
+const maxPrompt = maxDraftLength;
 
 function validName(name) {
   if (typeof name !== 'string' || !namePattern.test(name)) throw new Error('Use 1–48 letters, numbers, hyphens or underscores.');
@@ -47,6 +48,7 @@ const help = [
   '  xcode ask "prompt"             Run a single prompt, or pipe text to xcode ask',
   '  xcode sessions [search]        List or filter sessions for this project',
   '  xcode resume <id|latest>       Resume a project session',
+  '  xcode draft [id|latest]        Read an unsent draft without opening the session',
   '  xcode continue [id|latest]    Run the pending message once',
   '  xcode profile list|show|use|set|tune|test|eval [name]',
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
@@ -442,7 +444,10 @@ async function historyCommand(root, action, prefix, id) {
 }
 
 async function collectAttachments(root, base, profile, prompt, paths) {
-  const requests = new Map([...explicitReferences(prompt).map(path => [path, false]), ...paths.map(path => [path, true])]);
+  const requests = new Map([
+    ...explicitReferences(prompt).map(path => [resolve(base, path), false]),
+    ...paths.map(path => [resolve(base, path), true]),
+  ]);
   const results = [];
   let bytes = 1;
   for (const [path, explicit] of requests) {
@@ -534,13 +539,18 @@ async function chat(root, base, defaults, options, prefix) {
   let chain = Promise.resolve();
   let paste = null;
   let pasteLength = 0;
+  let attachments = [];
+  let savedDraft;
+  let draftTimer;
+  let draftProblem;
+  let restoredLine = '';
+  let draftNotice;
   let pager = null;
   const notices = [];
   const rl = createInterface({
     input: stdin, output: stdout, terminal: true,
     completer: (line, callback) => completeReference(root, base, line).then(result => callback(null, result), callback),
   });
-  const staged = new Map();
   function endStream() {
     if (!streamOpen) return;
     stdout.write('\n');
@@ -556,6 +566,11 @@ async function chat(root, base, defaults, options, prefix) {
     if (closed || streamOpen || rendering || pager) return;
     rl.setPrompt(paste ? '│ ' : selected?.active ? '… › ' : '› ');
     rl.prompt(true);
+    if (restoredLine) {
+      const text = restoredLine;
+      restoredLine = '';
+      rl.write(text);
+    }
   }
   function show(text) {
     if (closed) return;
@@ -633,6 +648,7 @@ async function chat(root, base, defaults, options, prefix) {
         if (id) chain = chain.then(async () => {
           try { await select(id); banner(); }
           catch (error) { show(error.message); }
+          finally { prompt(); }
         });
       } else {
         const move = pageKey(key.name, Math.max(4, (stdout.rows || 24) - 5), pager.rows.length);
@@ -725,7 +741,33 @@ async function chat(root, base, defaults, options, prefix) {
     }
     setImmediate(prompt);
   });
+  async function saveDraft() {
+    if (!selected || pager) return;
+    const draft = { line: (restoredLine || rl.line).slice(0, maxPrompt), paste, attachments };
+    if (!savedDraft && !draft.line && !draft.paste?.length && !draft.attachments.length) return;
+    const signature = JSON.stringify(draft);
+    if (signature === savedDraft) return;
+    try {
+      await writeDraft(selected.session.id, draft);
+      savedDraft = signature;
+      draftProblem = undefined;
+    } catch (error) {
+      if (draftProblem === error.message) return;
+      draftProblem = error.message;
+      if (closed) info('Could not save draft: ' + error.message);
+      else show('Could not save draft: ' + error.message);
+    }
+  }
+  function scheduleDraft() {
+    if (pager || closed || draftTimer) return;
+    draftTimer = setTimeout(() => {
+      draftTimer = undefined;
+      chain = chain.then(() => { if (!closed) return saveDraft(); });
+    }, 250);
+    draftTimer.unref();
+  }
   const select = async id => {
+    if (selected) await saveDraft();
     const live = await sessions.select(id, defaults);
     if (options.profile || options.harness) {
       const config = await settings();
@@ -739,15 +781,32 @@ async function chat(root, base, defaults, options, prefix) {
     if (options.write) live.session.write = true;
     if (options.checks) live.session.checks = true;
     await sessions.persist(live);
+    let draft;
+    try {
+      draft = await readDraft(live.session.id);
+    } catch (error) {
+      show('Could not load draft: ' + error.message);
+    }
     selected = live;
+    attachments = draft?.attachments ?? [];
+    paste = draft?.paste ?? null;
+    pasteLength = paste?.reduce((length, line) => length + line.length + 1, 0) ?? 0;
+    restoredLine = draft ? clean(draft.line).replace(/\n/g, '') : '';
+    savedDraft = draft ? JSON.stringify(draft) : undefined;
+    draftProblem = undefined;
+    draftNotice = draft ? 'Draft restored' + (attachments.length ? ' · ' + attachments.length + ' attachment(s)' : '') +
+      (paste ? ' · /send submits, /cancel discards.' : '.') : undefined;
   };
   const banner = () => {
     show('xcode · ' + selected.session.title + ' · ' + selected.session.profile + ' · ' + selected.session.id.slice(0, 8));
+    if (draftNotice) {
+      show(draftNotice);
+      draftNotice = undefined;
+    }
     if (selected.session.undoInProgress) show('Undo interrupted · /undo to resume.');
     else if (selected.session.queue[0]?.review) show('Review pending · /diff, /apply [paths] or /reject.');
     else if (selected.held) show('Messages are paused. /continue resumes the pending request.');
   };
-  const files = () => staged.get(selected.session.id) ?? [];
   const editable = () => {
     if (selected.active) throw new Error('Pause the session before changing its settings.');
   };
@@ -759,6 +818,7 @@ async function chat(root, base, defaults, options, prefix) {
     else if (paste) {
       paste = null;
       show('Draft discarded.');
+      scheduleDraft();
     } else if (manualCheck) manualCheck.abort();
     else if (!sessions.stop(selected)) rl.close();
     else show('Stopping…');
@@ -767,10 +827,10 @@ async function chat(root, base, defaults, options, prefix) {
     if (!message.trim()) throw new Error('Enter a message.');
     if (message.length > maxPrompt) throw new Error('Prompt exceeds 32,000 characters.');
     const profile = profileFor(await settings(), selected.session.profile);
-    const attachments = await collectAttachments(root, base, profile, message, files());
-    const { run } = await sessions.enqueue(selected, message, attachments);
+    const prepared = await collectAttachments(root, base, profile, message, attachments);
+    const { run } = await sessions.enqueue(selected, message, prepared);
     run?.catch(error => show(error.message));
-    staged.delete(selected.session.id);
+    attachments = [];
   }
 
   async function input(raw) {
@@ -780,7 +840,9 @@ async function chat(root, base, defaults, options, prefix) {
     }
     const line = raw.trim();
     if (paste) {
-      if (line === '/cancel') {
+      if (line === '/exit') {
+        rl.close();
+      } else if (line === '/cancel') {
         paste = null;
         show('Draft discarded.');
       } else if (line === '/send') {
@@ -795,7 +857,14 @@ async function chat(root, base, defaults, options, prefix) {
       return;
     }
     if (!line) return;
-    if (!line.startsWith('/')) return send(line);
+    if (!line.startsWith('/')) {
+      try { await send(line); }
+      catch (error) {
+        if (!rl.line) restoredLine = clean(raw);
+        throw error;
+      }
+      return;
+    }
     const command = /^\/[^\s]+/.exec(line)[0];
     const args = splitArgs(line.slice(command.length));
     const [arg, value] = args;
@@ -912,11 +981,11 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       case '/skip': await sessions.skip(selected); break;
       case '/attach':
-        if (!args.length) return show(files().length ? files().join('\n') : 'Use /attach <path>.');
-        staged.set(session.id, [...new Set([...files(), ...args])]);
-        show('For the next message: ' + files().join(', '));
+        if (!args.length) return show(attachments.length ? attachments.join('\n') : 'Use /attach <path>.');
+        attachments = [...new Set([...attachments, ...args.map(path => resolve(base, path))])];
+        show('For the next message: ' + attachments.join(', '));
         break;
-      case '/clear': staged.delete(session.id); show('Attachments cleared.'); break;
+      case '/clear': attachments = []; show('Attachments cleared.'); break;
       case '/model':
         if (!arg) return showProfiles(await settings());
         editable();
@@ -977,10 +1046,11 @@ async function chat(root, base, defaults, options, prefix) {
   }
   try {
     await select(prefix);
-    if (options.attach?.length) staged.set(selected.session.id, options.attach);
+    if (options.attach?.length) attachments = [...new Set([...attachments, ...options.attach.map(path => resolve(base, path))])];
     const hasProfile = own((await settings()).profiles, selected.session.profile);
     rl.on('SIGINT', interrupt);
     stdin.on('keypress', reviewKey);
+    stdin.on('keypress', scheduleDraft);
     process.once('SIGTERM', closeTerminal);
     const finished = new Promise(resolve => {
       rl.on('close', () => { closed = true; terminalSignal.abort(); resolve(); });
@@ -994,6 +1064,7 @@ async function chat(root, base, defaults, options, prefix) {
           } catch (error) {
             show(error.message);
           } finally {
+            await saveDraft();
             rendering = false;
             prompt();
           }
@@ -1012,9 +1083,15 @@ async function chat(root, base, defaults, options, prefix) {
     closed = true;
     process.off('SIGTERM', closeTerminal);
     stdin.off('keypress', reviewKey);
+    stdin.off('keypress', scheduleDraft);
+    clearTimeout(draftTimer);
     closeReview();
     rl.close();
-    await sessions.close();
+    try {
+      await saveDraft();
+    } finally {
+      await sessions.close();
+    }
   }
 }
 
@@ -1045,6 +1122,16 @@ async function main() {
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
   if (command === 'continue') return continueMessage(root, rest[0]);
+  if (command === 'draft') {
+    const session = await new Sessions(root).find(rest[0] || 'latest');
+    const draft = await readDraft(session.id);
+    if (!draft) return info('No unsent draft for this session.');
+    if (draft.attachments.length) info('Attachments · ' + draft.attachments.join(', '));
+    const lines = [...(draft.paste ?? [])];
+    if (draft.line) lines.push(draft.line);
+    if (lines.length) print(lines.join('\n'));
+    return;
+  }
   if (command === 'sessions') {
     const sessions = new Sessions(root);
     return describeSessions(sessions, undefined, rest.join(' '));
