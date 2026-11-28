@@ -83,7 +83,7 @@ export class Sessions {
     return this.openSession({
       id: randomUUID(), root: origin.root, title: ('Fork · ' + origin.title).slice(0, 120),
       customTitle: true, profile: profile ?? origin.profile, harness: origin.harness, write: false, retrySeconds: 0,
-      queue: [], turns: structuredClone(turns), forkedFrom: { id: origin.id, turn: end },
+      queue: [], turns: structuredClone(turns), ...(origin.pins?.length ? { pins: structuredClone(origin.pins) } : {}), forkedFrom: { id: origin.id, turn: end },
     });
   }
 

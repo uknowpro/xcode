@@ -196,6 +196,7 @@ function excerpt(text, start, count) {
 export class Workspace {
   constructor(root) {
     this.root = root;
+    this.readCache = new Map();
   }
 
   async files(signal) {
@@ -303,8 +304,16 @@ export class Workspace {
 
   async read({ path, start, count }, signal) {
     const file = await verifiedFile(this.root, path, signal);
+    const { ino, size, mtimeMs, ctimeMs } = file.info;
+    const revision = [ino, size, mtimeMs, ctimeMs, start, count].join(':');
+    const saved = this.readCache.get(file.path);
+    if (saved?.revision === revision) return { ...saved.result, unchanged: true };
     const text = decodeText(await loadBytes(file.path, 1024 * 1024, signal));
-    return { path: slash(relative(this.root, file.path)), ...excerpt(text, start, count) };
+    const result = { path: slash(relative(this.root, file.path)), ...excerpt(text, start, count) };
+    this.readCache.delete(file.path);
+    this.readCache.set(file.path, { revision, result });
+    if (this.readCache.size > 8) this.readCache.delete(this.readCache.keys().next().value);
+    return result;
   }
 
   async guides(path = '.', signal) {
@@ -323,12 +332,35 @@ export class Workspace {
     return found;
   }
 
+  async changed(signal) {
+    try {
+      const { stdout } = await exec('git', ['status', '--porcelain=v1', '-z', '--untracked-files=all'], {
+        cwd: this.root, signal, maxBuffer: 1024 * 1024,
+      });
+      const paths = [];
+      const rows = stdout.split('\0');
+      for (let index = 0; index < rows.length; index++) {
+        const row = rows[index];
+        const path = slash(row.slice(3));
+        if (path && !blocked(path) && !isStatePath(resolve(this.root, path))) paths.push(path);
+        if (/[RC]/.test(row.slice(0, 2))) index++;
+      }
+      return paths;
+    } catch (error) {
+      signal?.throwIfAborted();
+      return [];
+    }
+  }
+
   async map({ query = '' }, signal) {
     const { files, truncated } = await this.files(signal);
     const terms = String(query).toLowerCase().match(/[\p{L}\p{N}_-]+/gu)?.filter(word => word.length > 1).slice(0, 12) ?? [];
     const rank = text => terms.filter(term => text.toLowerCase().includes(term)).length;
     const sources = files.filter(file => /\.(?:[cm]?[jt]sx?|py|go|rs|java|kt|cs|rb|php|swift)$/i.test(file));
-    const selected = sources.map(file => ({ file, score: rank(file) }))
+    const changed = new Set(await this.changed(signal));
+    const stem = path => path.split('/').at(-1).replace(/\.[^.]+$/, '').replace(/(?:[._-](?:spec|test)|Tests?)$/i, '').toLowerCase();
+    const related = new Set([...changed].map(stem));
+    const selected = sources.map(file => ({ file, score: rank(file) * 4 + (changed.has(file) ? 3 : related.has(stem(file)) ? 1 : 0) }))
       .sort((a, b) => b.score - a.score || a.file.split('/').length - b.file.split('/').length || a.file.localeCompare(b.file))
       .slice(0, 240);
     const seen = new Set(sources);

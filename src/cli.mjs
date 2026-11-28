@@ -28,6 +28,7 @@ import { cacheCapabilities, diagnosticKey, modelDirectory, networkSettings, save
 import { formatHistoryPage, historyText, sessionMarkdown } from './session-history.mjs';
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
+import { openLocation } from './editor.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -66,6 +67,7 @@ const help = [
   '  xcode harness list|show|effective|validate|eval|import|compose|export [name] [file]',
   '  xcode search <query> [--path <dir>] [--pattern <glob>] [--regex]',
   '  xcode symbol <identifier> [--path <dir>]',
+  '  xcode open <path[:line]>       Open a verified workspace file in XCODE_EDITOR',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> -- <command> [args...]',
   '  xcode check list|remove [name]',
@@ -98,6 +100,9 @@ const chatHelp = [
   '/harness effective             Show active stages, model tuning and tools',
   '/search <query>                Search with optional --regex, --path, --pattern or --type',
   '/symbol <name>                 Find JavaScript and TypeScript definitions and references',
+  '/open <path[:line]>            Open a workspace reference in the configured editor',
+  '/pin [file|decision|constraint|drop]  Keep context across long sessions',
+  '/outgoing [prompt]             Preview destination, attachments and pinned context',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
   '/attach <path[#L10-L20]>, /clear   Add files or text ranges for the next message',
@@ -1046,6 +1051,23 @@ async function chat(root, base, defaults, options, prefix) {
     attachments = [];
   }
 
+  async function outgoing(message = '') {
+    const session = selected.session;
+    const profile = profileFor(await settings(), session.profile);
+    const paths = [...new Set([...attachments, ...explicitReferences(message).map(path => resolve(base, path))])];
+    const lines = [
+      'Destination · ' + visibleEndpoint(profile, await tokenFor(session.profile)) + ' · ' + profile.model,
+      'Conversation · ' + session.turns.length + ' prior turns available to the context builder',
+      'Pinned context · ' + (session.pins?.length ?? 0) + ' items',
+    ];
+    for (const path of paths) {
+      const item = await inspectAttachment(root, path, terminalSignal.signal).catch(() => null);
+      if (item) lines.push('Attachment · ' + path);
+      else lines.push('Unresolved reference · ' + path);
+    }
+    show(lines.join('\n'));
+  }
+
   function addDraftLine(raw) {
     if (pasteLength + raw.length + 1 > maxPrompt)
       throw new Error('Draft exceeds 32,000 characters. Use /send or /cancel.');
@@ -1082,6 +1104,8 @@ async function chat(root, base, defaults, options, prefix) {
         await submitDraft('');
       } else if (line === '/preview') {
         show(previewDraft(paste, stdout.columns || 80, terminalClip));
+      } else if (line === '/outgoing') {
+        await outgoing(paste.join('\n'));
       } else if (keys.newline === 'ctrl+o') {
         await submitDraft(raw);
       } else {
@@ -1118,6 +1142,29 @@ async function chat(root, base, defaults, options, prefix) {
       case '/symbol': {
         const parsed = parseArgs({ args, options: searchOptions, allowPositionals: true });
         show(await workspaceQuery(root, command.slice(1), parsed.positionals.join(' '), parsed.values));
+        break;
+      }
+      case '/open': await openLocation(root, arg); break;
+      case '/outgoing': await outgoing(args.join(' ')); break;
+      case '/pin': {
+        const pins = [...(session.pins ?? [])];
+        if (!arg) {
+          show(pins.map((pin, index) => (index + 1) + ' · ' + pin.kind + ' · ' + pin.text).join('\n') || 'No pinned context.');
+          break;
+        }
+        if (arg === 'drop') {
+          const index = Number(value) - 1;
+          if (!Number.isInteger(index) || !pins[index]) throw new Error('Select a pin number.');
+          pins.splice(index, 1);
+        } else {
+          const text = args.slice(1).join(' ').trim();
+          if (!['file', 'decision', 'constraint'].includes(arg) || !text || text.length > 400 || pins.length >= 20)
+            throw new Error('Use /pin file|decision|constraint <text>. Limit 20 pins of 400 characters.');
+          pins.push({ kind: arg, text: clean(text) });
+        }
+        session.pins = pins;
+        await sessions.persist(selected);
+        show('Pinned context updated.');
         break;
       }
       case '/status':
@@ -1587,6 +1634,7 @@ async function main() {
     return print('Send · ' + keys.send + '\nLine break · ' + keys.newline +
       '\nTheme · ' + style.theme + '\nAccessible output · ' + (style.accessible ? 'on' : 'off'));
   }
+  if (command === 'open') return openLocation(root, rest[0]);
   if (command === 'search' || command === 'symbol') return print(await workspaceQuery(root, command, rest.join(' '), values));
   if (command === 'report') return reportCommand(root, rest[0], values);
   if (command === 'continue') return continueMessage(root, rest[0]);

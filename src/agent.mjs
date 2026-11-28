@@ -88,6 +88,8 @@ async function stageContext(session, job, harness, stage, project, skills, allow
     'Never claim that a project check ran unless its tool result includes an exit code or timeout.',
     stage.done ? 'Completion condition: ' + stage.done : '',
     harness.role ? 'Role: ' + roleText(harness.role) : '',
+    session.pins?.length ? 'User-pinned context:\n' + clipped(JSON.stringify(session.pins), 12000) : '',
+    'Reuse file excerpts from earlier tool results when available. Read again only when the file may have changed or a new range is needed.',
     guides.length ? 'Project instructions:\n' + clipped(JSON.stringify(guides), 16000) : '',
     catalog.length ? 'Available skills (load with skill_read when relevant):\n' + clipped(JSON.stringify(catalog), 10000) : '',
     selected.length ? 'Selected skill instructions:\n' + clipped(JSON.stringify(selected), 24000) : '',
@@ -131,6 +133,10 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
       }
       job.readPaths ??= [];
       if (!job.readPaths.includes(result.path)) job.readPaths.push(result.path);
+      if (result.unchanged) {
+        const { lines, ...reference } = result;
+        return { ...reference, note: 'The content is unchanged. Reuse the earlier read of this range.' };
+      }
       return result;
     }
     case 'glob': return project.glob(args, signal);

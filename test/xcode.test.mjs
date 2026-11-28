@@ -426,7 +426,8 @@ test('resuming older sessions restores decisions, file references, applied paths
   await writeFile(path, JSON.stringify(session));
   assert.match((await cli('continue')).stdout, /earlier decision/);
   const resumed = JSON.parse(await readFile(path, 'utf8'));
-  assert.equal(resumed.turns[0].answer, session.turns[0].answer);
+  const firstTurn = (await cli('session', 'history', 'latest', '2', '1')).stdout;
+  assert.ok(firstTurn.includes(session.turns[0].answer));
   assert.ok(resumed.memory.through >= 5);
   assert.match(resumed.memory.entries[0].result, /retry budget at five/);
 });
