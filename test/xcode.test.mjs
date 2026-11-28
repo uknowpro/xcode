@@ -1646,3 +1646,36 @@ test('request budgets stop additional model calls before sending', async t => {
   await assert.rejects(cli('ask', 'Use the file', '--request-budget', '1'), /Request budget exhausted/);
   assert.equal(api.requests.length, 1);
 });
+
+test('workflow stages gate execution, pass validated artifacts and preserve revisions', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return reply(res, '{"items":2}');
+    assert.match(JSON.stringify(body.messages), /Upstream artifacts/);
+    return reply(res, 'Reviewed artifact');
+  });
+  const { cli, work } = await profile(t, api);
+  const harness = { stages: [
+    { name: 'Collect', instruction: 'Return JSON', tools: [], artifact: { name: 'summary', schema: { type: 'object' } } },
+    { name: 'Report', instruction: 'Summarize', tools: [], approval: true, after: ['Collect'], consumes: ['summary'] },
+  ] };
+  await writeFile(join(work, 'workflow.json'), JSON.stringify(harness));
+  await cli('harness', 'import', 'gate-flow', 'workflow.json');
+  const first = JSON.parse((await cli('harness', 'versions', 'gate-flow')).stdout).current;
+  await assert.rejects(cli('ask', 'Check the flow', '--harness', 'gate-flow', '--json'), error =>
+    error.code === 3 && JSON.parse(error.stdout).status === 'awaiting-stage');
+  assert.equal(api.requests.length, 1);
+  await cli('session', 'gate', 'latest', 'approve');
+  assert.match((await cli('continue')).stdout, /Reviewed artifact/);
+  harness.stages[1].instruction = 'Include one detail';
+  await writeFile(join(work, 'workflow.json'), JSON.stringify(harness));
+  await cli('harness', 'import', 'gate-flow', 'workflow.json');
+  const diff = JSON.parse((await cli('harness', 'diff', 'gate-flow', first)).stdout);
+  assert.equal(diff.stages[0].stage, 'Report');
+});
+
+test('workflow dependencies reject missing artifacts and forward dependencies', async () => {
+  const { validateWorkflow } = await import('../src/workflow-graph.mjs');
+  assert.throws(() => validateWorkflow({ stages: [{ name: 'First', after: ['Second'] }, { name: 'Second', after: ['First'] }] }, []),
+    /cyclic stage dependency/);
+  assert.throws(() => validateWorkflow({ stages: [{ name: 'First', consumes: ['missing'] }] }, []), /Missing upstream artifact/);
+});

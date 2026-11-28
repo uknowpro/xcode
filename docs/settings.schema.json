@@ -16,7 +16,8 @@
     "skillPolicy": { "type": "object" },
     "localMcp": { "type": "object" },
     "sessionFilters": { "type": "object" },
-    "retention": { "type": "object" }
+    "retention": { "type": "object" },
+    "harnessRevisions": { "type": "object" }
   },
   "additionalProperties": false
 }

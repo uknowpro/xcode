@@ -35,6 +35,7 @@ import { DraftEdits, keyBindings } from './draft-edits.mjs';
 import { randomUUID } from 'node:crypto';
 import { note, portableTurn, retentionCandidates, retentionPolicy } from './session-organize.mjs';
 import { requestedBudget, usageSummary, requestFootprint } from './model-usage.mjs';
+import { rememberRevision, revisionOf, revisionsFor, workflowRevision } from './workflow-graph.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
@@ -80,6 +81,8 @@ const help = [
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
   '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>] [--json]',
   '  xcode harness list|show|effective|validate|eval|import|compose|export [name] [file]',
+  '  xcode harness versions|restore|diff|benchmark <name> [arguments]',
+  '  xcode session gate <id> <approve|skip> | replay <id> <stage>',
   '  xcode search <query> [--path <dir>] [--pattern <glob>] [--regex]',
   '  xcode symbol <identifier> [--path <dir>]',
   '  xcode open <path[:line]>       Open a verified workspace file in XCODE_EDITOR',
@@ -164,6 +167,8 @@ const chatHelp = [
   '/answer [number|find|outline|live]    Browse or search responses',
   '/route <stage> <profile> [task|visible]  Select a stage model and content scope',
   '/usage, /attempts              Review request usage and timings',
+  '/gate approve|skip             Decide a paused workflow stage',
+  '/harness revision <id|current> Pin a harness revision for this session',
   '/draft-edit <action> [line] [text]    Edit, preview dedent, undo or redo draft lines',
   'Tab after /                    Complete a chat command',
   'Tab after @                    Complete a workspace path',
@@ -405,6 +410,45 @@ async function harnessCommand(root, action, name, args, options) {
     harnessList(config);
   } else if (action === 'show') {
     showHarness(config, name || 'default', root);
+  } else if (action === 'versions' && name) {
+    const active = harnessFor(config, name);
+    return print(JSON.stringify({ current: workflowRevision(active), revisions: Object.keys(revisionsFor(config, name)) }, null, 2));
+  } else if (action === 'diff' && name) {
+    const active = harnessFor(config, name);
+    const [left, right] = args;
+    const before = left ? revisionOf(config, name, active, left) : active;
+    const after = right ? revisionOf(config, name, active, right) : active;
+    return print(JSON.stringify({ before: workflowRevision(before), after: workflowRevision(after),
+      stages: [...new Set([...before.stages, ...after.stages].map(step => step.name))].flatMap(stage => {
+        const a = before.stages.find(step => step.name === stage), b = after.stages.find(step => step.name === stage);
+        return JSON.stringify(a) === JSON.stringify(b) ? [] : [{ stage, before: a ?? null, after: b ?? null }];
+      }) }, null, 2));
+  } else if (action === 'restore' && name) {
+    if (!args[0]) throw new Error('Provide a previous revision.');
+    await updateSettings(value => {
+      const active = harnessFor(value, name);
+      const revision = revisionOf(value, name, active, args[0]);
+      rememberRevision(value, name, active);
+      value.harnesses[name] = revision;
+    });
+    return print('Restored ' + args[0]);
+  } else if (action === 'benchmark') {
+    if (!name || !args[0]) throw new Error('Provide a harness name and JSON file of benchmark tasks.');
+    const entries = JSON.parse((await loadBytes(resolve(root, args[0]), 48 * 1024)).toString('utf8'));
+    if (!Array.isArray(entries) || !entries.length || entries.length > 8 || entries.some(item =>
+      typeof item?.prompt !== 'string' || !item.prompt.trim() || item.prompt.length > maxPrompt ||
+      typeof item.contains !== 'string' || !item.contains)) throw new Error('Register up to eight prompt/contains benchmark tasks.');
+    const profileName = options.profile ?? config.defaultProfile ?? 'default';
+    const model = profileFor(config, profileName);
+    const token = await tokenFor(profileName);
+    const rows = [];
+    for (const entry of entries) {
+      for (const item of [name, ...(options.against ? [options.against] : [])]) {
+        const report = await evaluateProfile(model, token, { harness: harnessFor(config, item), prompt: entry.prompt, contains: entry.contains });
+        rows.push({ harness: item, passed: report.expected, durationMs: report.durationMs, metrics: report.metrics });
+      }
+    }
+    return print(JSON.stringify(rows, null, 2));
   } else if (action === 'effective') {
     print(effectiveHarness(config, name || 'default', root, options));
   } else if (action === 'validate') {
@@ -446,7 +490,9 @@ async function harnessCommand(root, action, name, args, options) {
     if (!args[0]) throw new Error('Use xcode harness compose <name> <recipe.json>.');
     const recipe = JSON.parse((await loadBytes(resolve(root, args[0]), 256 * 1024)).toString('utf8'));
     await updateSettings(value => {
+      try { rememberRevision(value, name, harnessFor(value, name)); } catch {}
       value.harnesses[name] = composeHarness(value, recipe);
+      rememberRevision(value, name, value.harnesses[name]);
     });
     showHarness(await settings(), name, root);
   } else if (action === 'checks' && name) {
@@ -472,8 +518,9 @@ async function harnessCommand(root, action, name, args, options) {
     if (source.length > 64000) throw new Error('Harness JSON exceeds 64,000 characters.');
     const harness = JSON.parse(source);
     await updateSettings(config => {
+      try { rememberRevision(config, name, harnessFor(config, name)); } catch {}
       config.harnesses[name] = harness;
-      harnessFor(config, name);
+      rememberRevision(config, name, harnessFor(config, name));
     });
     showHarness(await settings(), name, root);
   } else {
@@ -816,17 +863,18 @@ async function oneMessage(sessions, live, start, options) {
     const result = await run;
     if (options.json || options.events) {
       const session = live.session;
-      const evidence = result?.review || result?.error ? session.queue[0] : session.turns.at(-1);
+      const evidence = result?.review || result?.gate || result?.error ? session.queue[0] : session.turns.at(-1);
       const checks = latestChecks(evidence?.checks);
       const failed = checks.filter(check => check.status !== 'passed');
       const verification = !checks.length ? 'not-run' : failed.length ? 'failed' : 'passed';
-      const status = result?.error ? 'error' : result?.review ? 'awaiting-review' :
+      const status = result?.error ? 'error' : result?.gate ? 'awaiting-stage' : result?.review ? 'awaiting-review' :
         result?.failedChecks?.length ? 'verification-failed' : 'complete';
       print(JSON.stringify({
         ...(options.events ? { type: 'result' } : {}), sessionId: session.id, status, verification,
         answer: result?.answer ?? null, changedPaths: evidence?.changed ?? [],
         checks: checks.map(check => ({ name: check.name, status: check.status, exitCode: check.exitCode })),
         ...(result?.review ? { reviewId: result.review.id } : {}),
+        ...(result?.gate ? { gate: result.gate } : {}),
         ...(result?.error ? { error: modelFailure(result.error) } : {}),
       }));
     }
@@ -835,7 +883,10 @@ async function oneMessage(sessions, live, start, options) {
       if (stdout.isTTY) stdout.write('\n');
       else print(result.answer);
     }
-    if (result?.review) {
+    if (result?.gate) {
+      if (!options.json && !options.events) info('Waiting for stage approval · ' + result.gate.name);
+      process.exitCode = 3;
+    } else if (result?.review) {
       const id = live.session.id.slice(0, 8);
       if (!options.events && !options.json) info('Change set awaiting approval. Run xcode review show ' + id + ' or xcode resume ' + id + '.');
       process.exitCode = 3;
@@ -874,6 +925,7 @@ async function continueMessage(root, prefix, options) {
     const live = await sessions.select(prefix || 'latest', {});
     if (live.session.undoInProgress) throw new Error('Run xcode undo to finish the interrupted undo first.');
     if (!live.session.queue.length) throw new Error('Queue is empty.');
+    if (live.session.queue[0].stageGate) throw new Error('Decide the stage using xcode session gate first.');
     if (live.session.queue[0].manual) throw new Error('This message is held for manual release. Use /queue release 1 in the session.');
     if (live.session.queue[0].review) throw new Error('Show and decide the pending change set first with xcode review.');
     live.held = false;
@@ -1182,6 +1234,8 @@ async function chat(root, base, defaults, options, prefix) {
         (event.error ? ' · ' + event.error : ''));
     } else if (event.type === 'queue') {
       show(event.count + ' queued' + (live.held ? ' · /continue to send' : ''));
+    } else if (event.type === 'stage-gate') {
+      show('Stage awaiting approval · ' + event.name + ' · /gate approve or /gate skip');
     } else if (event.type === 'review') {
       show('Change set ' + event.id + ' · ' + event.files.length + ' files · /diff to review, /apply or /reject.');
     } else if (event.type === 'error' || event.type === 'note') {
@@ -1698,13 +1752,28 @@ async function chat(root, base, defaults, options, prefix) {
         await sessions.persist(selected);
         banner();
         break;
+      case '/gate':
+        await sessions.decideStage(selected, arg);
+        selected.held = false;
+        sessions.pump(selected)?.catch(error => show(error.message));
+        break;
       case '/harness':
+        if (arg === 'revision') {
+          if (!value || selected.active || session.queue.length) throw new Error('Choose a revision with no pending turns.');
+          const config = await settings();
+          const active = harnessFor(config, session.harness);
+          if (value === 'current') delete session.harnessRevision;
+          else { revisionOf(config, session.harness, active, value); session.harnessRevision = value; }
+          await sessions.persist(selected);
+          return show('Harness revision · ' + (session.harnessRevision ?? 'current'));
+        }
         if (arg === 'effective') return show(effectiveHarness(await settings(), session.harness, root, session));
         if (!arg || arg === 'preview') return showHarness(await settings(), value || session.harness, root);
         if (arg === 'list') return harnessList(await settings());
         editable();
         showHarness(await settings(), arg, root);
         session.harness = arg;
+        delete session.harnessRevision;
         await sessions.persist(selected);
         break;
       case '/inputs': {
@@ -2248,7 +2317,23 @@ async function main() {
     }
     try {
       const live = await sessions.select(prefix, defaults);
-      if (action === 'fit') {
+      if (action === 'gate') {
+        await sessions.decideStage(live, turn);
+        print('Stage decision saved. Run xcode continue to proceed.');
+      } else if (action === 'replay') {
+        const last = live.session.turns.at(-1);
+        const harness = last?.harness;
+        const at = harness?.stages.findIndex(stage => stage.name === turn) ?? -1;
+        if (at < 0) throw new Error('Select a stage from the latest completed workflow.');
+        const fork = await sessions.fork(live, live.session.turns.length - 1, { visibleOnly: true });
+        const artifacts = Object.fromEntries(harness.stages.slice(0, at).flatMap(stage =>
+          stage.artifact && Object.hasOwn(last.artifacts ?? {}, stage.artifact.name) ? [[stage.artifact.name, last.artifacts[stage.artifact.name]]] : []));
+        fork.session.queue.push({ prompt: last.prompt, attachments: [], completed: last.completed.slice(0, at), changed: [],
+          tools: [], checks: [], artifacts, harness, stageRoutes: {} });
+        fork.held = true;
+        await sessions.persist(fork);
+        print(fork.session.id);
+      } else if (action === 'fit') {
         const source = live.session.queue[0]?.prompt;
         if (!source || !['attachments', 'summary', 'new'].includes(turn)) throw new Error('Use session fit <id> attachments|summary|new on a held request.');
         const fork = await sessions.fork(live, turn === 'attachments' ? live.session.turns.length : 0, { visibleOnly: true });

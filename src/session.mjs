@@ -11,6 +11,7 @@ import { latestChecks } from './repair.mjs';
 import { modelFailure } from './model-transport.mjs';
 import { maxDraftLength } from './draft.mjs';
 import { note, sessionTag } from './session-organize.mjs';
+import { WorkflowGate } from './workflow-graph.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -123,7 +124,7 @@ export class Sessions {
   }
 
   pump(live) {
-    if (this.closing || live.active || live.held || live.reviewing || (live.session.queue[0]?.review || live.session.queue[0]?.manual) || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
+    if (this.closing || live.active || live.held || live.reviewing || (live.session.queue[0]?.review || live.session.queue[0]?.manual || live.session.queue[0]?.stageGate) || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
     const controller = new AbortController();
     const active = { controller, advance: false };
     live.active = active;
@@ -168,6 +169,13 @@ export class Sessions {
       this.notify(live, { type: 'complete', answer, failedChecks });
       return { answer, failedChecks };
     } catch (error) {
+      if (error instanceof WorkflowGate) {
+        job.stageGate = error.stage;
+        live.held = true;
+        await this.persist(live);
+        this.notify(live, { type: 'stage-gate', ...job.stageGate });
+        return { gate: job.stageGate };
+      }
       if (error instanceof ReviewRequired || (job.review && !active.advance)) {
         live.held = true;
         this.notify(live, { type: 'review', id: job.review.id, files: job.review.files.map(file => file.path) });
@@ -196,7 +204,7 @@ export class Sessions {
     const turns = live.session.turns;
     const item = {
       prompt: job.prompt, answer, status, completed: job.completed, changed: job.changed, tools: job.tools,
-      checks: job.checks ?? [], ...(job.usage ? { usage: job.usage } : {}), attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
+      checks: job.checks ?? [], ...(job.artifacts ? { artifacts: job.artifacts } : {}), ...(job.harness ? { harness: job.harness } : {}), ...(job.usage ? { usage: job.usage } : {}), attachments: job.attachments.map(file => file.name), time: new Date().toISOString(),
       ...(failedChecks.length ? { verificationFailed: true } : {}),
       ...(status !== 'complete' && job.partial ? { partial: job.partial } : {}),
       ...(status === 'complete' && job.wire ? { wire: completedWire(job) } : {}),
@@ -321,6 +329,15 @@ export class Sessions {
     } finally {
       live.reviewing = false;
     }
+  }
+
+  async decideStage(live, decision) {
+    const job = live.session.queue[0];
+    if (live.active || !job?.stageGate || !['approve', 'skip'].includes(decision))
+      throw new Error('Use approve or skip on a waiting stage.');
+    job.stageDecisions = { ...job.stageDecisions, [job.stageGate.index]: decision };
+    delete job.stageGate;
+    await this.persist(live);
   }
 
   async updateMetadata(live, action, title) {

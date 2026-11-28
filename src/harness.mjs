@@ -4,6 +4,7 @@ import { readdir, realpath } from 'node:fs/promises';
 import { blocked, readText, within } from './workspace.mjs';
 import { storage } from './store.mjs';
 import { projectChecks } from './checks.mjs';
+import { validateWorkflow } from './workflow-graph.mjs';
 
 export const roles = {
   cloud: 'Trace account, identity, network and availability boundaries. Identify failure domains and rollout risks.',
@@ -230,7 +231,7 @@ export function harnessFor(config, name) {
   if (harness.skills !== undefined && (!Array.isArray(harness.skills) ||
     harness.skills.some(name => typeof name !== 'string')))
     throw new Error('Harness skills must be a list of skill names.');
-  return harness;
+  return validateWorkflow(harness, readTools);
 }
 
 export function composeHarness(config, recipe) {

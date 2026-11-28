@@ -13,9 +13,10 @@ import { modelPolicy } from './model-profile.mjs';
 import { tokenFor } from './store.mjs';
 import { diagnosticKey } from './model-discovery.mjs';
 import { validateAnswer } from './json-contract.mjs';
+import { revisionOf, resolveArtifact, stageApplies, WorkflowGate } from './workflow-graph.mjs';
 import { requestFootprint, requestedBudget, traceAttempt } from './model-usage.mjs';
 import { completeWireStage, startWire, wireStage } from './wire-history.mjs';
-import { checkEvidence, recheck, scheduleRepair, stagePlan } from './repair.mjs';
+import { checkEvidence, latestChecks, recheck, scheduleRepair, stagePlan } from './repair.mjs';
 
 const exec = promisify(execFile);
 const schema = (description, properties, required = []) => ({
@@ -93,6 +94,8 @@ async function stageContext(session, job, harness, stage, project, skills, allow
     'Never claim that a project check ran unless its tool result includes an exit code or timeout.',
     stage.done ? 'Completion condition: ' + stage.done : '',
     harness.role ? 'Role: ' + roleText(harness.role) : '',
+    stage.consumes?.length ? 'Upstream artifacts:\n' + clipped(JSON.stringify(Object.fromEntries(
+      stage.consumes.map(name => [name, job.artifacts?.[name] ?? null]))), 12000) : '',
     session.pins?.length ? 'User-pinned context:\n' + clipped(JSON.stringify(session.pins), 12000) : '',
     'Reuse file excerpts from earlier tool results when available. Read again only when the file may have changed or a new range is needed.',
     guides.length ? 'Project instructions:\n' + clipped(JSON.stringify(guides), 16000) : '',
@@ -233,7 +236,7 @@ async function request(profile, token, messages, tools, session, signal, emit, j
 
 export async function runJob({ session, job, config, profile, token, signal, emit, save, isolated = false }) {
   job.harnessName ??= session.harness;
-  job.harness ??= harnessFor(config, job.harnessName);
+  if (!job.harness) job.harness = revisionOf(config, job.harnessName, harnessFor(config, job.harnessName), session.harnessRevision);
   const harness = job.harness;
   const project = new Workspace(session.root, config.transmitExclusions?.[session.root]);
   if (job.attachments.some(item => item.source && project.excluded(resolve(session.root, item.source))))
@@ -251,7 +254,47 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   for (let index = job.completed.length; index < stagePlan(job).length; index++) {
     signal.throwIfAborted();
     const stage = stagePlan(job)[index];
-    const rechecked = await recheck(stage, job, session, checks, { signal, save, emit, stageIndex: index, token });
+    const stageSignal = stage.maxSeconds ? AbortSignal.any([signal, AbortSignal.timeout(stage.maxSeconds * 1000)]) : signal;
+    if (!stageApplies(stage, latestChecks(job.checks))) {
+      job.completed.push({ name: stage.name, answer: 'Skipped by verification condition.', skipped: true });
+      if (replay) job.wire.full = false;
+      await save();
+      continue;
+    }
+    if (stage.approval && !job.stageDecisions?.[index]) throw new WorkflowGate({ index, name: stage.name });
+    if (stage.approval && job.stageDecisions[index] === 'skip') {
+      job.completed.push({ name: stage.name, answer: 'Skipped by the user.', skipped: true });
+      if (replay) job.wire.full = false;
+      await save();
+      continue;
+    }
+    if (stage.parallel) {
+      const steps = [];
+      for (let at = index; stagePlan(job)[at]?.parallel === stage.parallel; at++) {
+        if (Object.hasOwn(job.stageRoutes, stagePlan(job)[at].name)) throw new Error('Use serial steps for per-stage model routes.');
+        steps.push(stagePlan(job)[at]);
+      }
+      job.usage ??= { requests: 0, models: {}, attempts: [] };
+      const results = [];
+      for (let at = 0; at < steps.length; at += 2) {
+        const batch = await Promise.allSettled(steps.slice(at, at + 2).map(step => {
+          const branch = { ...job, harness: { ...harness, stages: [{ ...step, parallel: undefined }] }, completed: [],
+            plan: undefined, wire: undefined, stageHistory: [], responseSchema: undefined, readPaths: [] };
+          return runJob({ session: { ...session, write: false, checks: false }, job: branch, config, profile, token, signal,
+            emit: event => { if (event.type !== 'text') emit(event); }, save: async () => {}, isolated });
+        }));
+        const failed = batch.find(item => item.status === 'rejected');
+        if (failed) throw failed.reason;
+        results.push(...batch.map((item, offset) => ({ name: steps[at + offset].name, answer: item.value })));
+      }
+      job.completed.push(...results);
+      index += steps.length - 1;
+      if (replay) job.wire.full = false;
+      if (job.responseSchema !== undefined && index === stagePlan(job).length - 1) validateAnswer(job.responseSchema, results.at(-1).answer);
+      await save();
+      continue;
+    }
+    const rechecked = await recheck(stage, job, session, checks, { signal: stageSignal, save, emit, stageIndex: index, token });
     if (rechecked?.skipped) {
       emit({ type: 'note', text: rechecked.skipped });
       job.completed.push({ name: stage.name, answer: rechecked.skipped });
@@ -273,7 +316,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       return { ...tool, function: { ...tool.function, name } };
     });
     emit({ type: 'stage', stage: stage.name, index, total: stagePlan(job).length });
-    const context = await stageContext(contextSession, contextJob, harness, stage, project, skills, allowed, checks, signal, rechecked);
+    const context = await stageContext(contextSession, contextJob, harness, stage, project, skills, allowed, checks, stageSignal, rechecked);
     // Recalculate the older replay budget as the current assistant/tool exchange grows.
     for (let round = (job.stageHistory?.filter(message => message.role === 'assistant').length ?? 0); round < 16; round++) {
       const wire = replay && !routed ? wireStage(session, job, policy, stage) : null;
@@ -282,10 +325,12 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       const footprint = requestFootprint(messages, modelPolicy(currentProfile).contextWindow);
       if (isolated) emit({ type: 'request-size', bytes: footprint.bytes });
       emit({ type: 'footprint', ...footprint });
-      const message = await request(currentProfile, currentToken, messages, tools, session, signal,
+      const message = await request(currentProfile, currentToken, messages, tools, session, stageSignal,
         event => emit({ ...event, intermediate: index < stagePlan(job).length - 1 }), job, budget, footprint);
       if (!message.tool_calls?.length) {
         if (job.responseSchema !== undefined && index === stagePlan(job).length - 1) validateAnswer(job.responseSchema, message.content);
+        const artifact = resolveArtifact(stage, message.content);
+        if (artifact) job.artifacts = { ...job.artifacts, [artifact.name]: artifact.value };
         if (wire) completeWireStage(job, wire.input, message, policy);
         job.completed.push({ name: stage.name, answer: message.content });
         job.stageHistory = [];
@@ -296,6 +341,8 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         break;
       }
       if (budget.tools && job.tools.length + message.tool_calls.length > budget.tools) throw new Error('Tool call budget exhausted.');
+      if (stage.maxTools && job.tools.filter(item => item.stage === stage.name).length + message.tool_calls.length > stage.maxTools)
+        throw new Error('Tool call limit exhausted in ' + stage.name + '.');
       if (message.tool_calls.length > 12) throw new Error('Model issued too many tools in one request.');
       if (round === 15) throw new Error('Tool round limit reached. Narrow the request or start a new message.');
       job.stageHistory ??= [];
@@ -304,9 +351,9 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         // Fill interrupted tool slots so a resumed stage has a valid Chat Completions history.
         let result;
         try {
-          signal.throwIfAborted();
+          stageSignal.throwIfAborted();
           if (allowed.includes(call.function.name)) emit({ type: 'tool-start', name: call.function.name });
-          result = await execute(project, skills, job, call, allowed, checks, signal, index, currentToken);
+          result = await execute(project, skills, job, call, allowed, checks, stageSignal, index, currentToken);
         } catch (error) {
           result = { error: signal.aborted ? 'Stopped before this tool finished.' : error.message };
         }
