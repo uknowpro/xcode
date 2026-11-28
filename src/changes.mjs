@@ -69,6 +69,7 @@ export async function prepareReview(project, operations, readPaths, signal) {
   if (!Array.isArray(operations) || !operations.length || operations.length > 40)
     throw new Error('Propose between 1 and 40 file operations.');
   const files = new Map();
+  const existingChanges = new Set(await project.changed(signal));
   const find = async path => {
     location(project, path);
     const key = process.platform === 'linux' ? path : path.toLowerCase();
@@ -78,7 +79,8 @@ export async function prepareReview(project, operations, readPaths, signal) {
       return file;
     }
     const { text, mode } = await snapshot(project, path, signal);
-    const file = { path, before: text, after: text, beforeMode: mode, afterMode: mode };
+    const file = { path, before: text, after: text, beforeMode: mode, afterMode: mode,
+      ...(existingChanges.has(path) ? { workspaceChanged: true } : {}) };
     files.set(key, file);
     if (files.size > 20) throw new Error('A change set can contain at most 20 files.');
     return file;
@@ -430,6 +432,45 @@ function hunks(ops) {
   return output;
 }
 
+export function fileOperation(file) {
+  if (file.move?.to) return 'Move → ' + file.move.to;
+  if (file.move?.from) return 'Move destination ← ' + file.move.from;
+  if (file.before === null) return 'Add file';
+  if (file.after === null) return 'Delete file';
+  return 'Edit file';
+}
+
+function lineEnding(text) {
+  const windows = text.includes('\r\n');
+  const unix = /(^|[^\r])\n/.test(text);
+  return windows && unix ? 'mixed LF and CRLF' : windows ? 'CRLF' : unix ? 'LF' : 'no line breaks';
+}
+
+function fileNotes(file) {
+  const notes = file.workspaceChanged ? ['Existing workspace edits are part of the proposal baseline.'] : [];
+  if (file.before === null || file.after === null) return notes;
+  const before = lineEnding(file.before), after = lineEnding(file.after);
+  if (before !== after) notes.push('Line endings · ' + before + ' → ' + after);
+  if (file.before.endsWith('\n') !== file.after.endsWith('\n'))
+    notes.push('Final newline · ' + (file.after.endsWith('\n') ? 'added' : 'removed'));
+  return notes;
+}
+
+export function overrideReviewFile(review, path, bytes) {
+  if (review.state === 'applying') throw new Error('Finish the interrupted apply before editing a proposal.');
+  const file = review.files.find(file => file.path === path);
+  if (!file || file.after === null || file.move) throw new Error('Select a new or edited file in the change set.');
+  if (bytes.length > maxFile) throw new Error('Replacement text exceeds the 256 KiB file limit.');
+  decodeText(bytes);
+  const text = bytes.toString('utf8');
+  if (text === file.before) throw new Error('To keep the original, deselect this file.');
+  const total = review.files.reduce((sum, item) => sum + Buffer.byteLength(item.before ?? '') +
+    Buffer.byteLength(item === file ? text : item.after ?? ''), 0);
+  if (total > maxReview) throw new Error('The combined before-and-after contents exceed 1 MiB.');
+  file.after = text;
+  if (ownHunks(review, path)) delete review.hunkSelections[path];
+}
+
 export function reviewDiff(review, filePath) {
   const files = filePath ? choose(review.files, [filePath]) : review.files;
   return files.flatMap(file => [
@@ -437,6 +478,7 @@ export function reviewDiff(review, filePath) {
       file.move?.from ? ['rename ' + file.move.from + ' → ' + file.path] : []),
     '--- ' + (file.before === null ? '/dev/null' : file.path),
     '+++ ' + (file.after === null ? '/dev/null' : file.path),
+    ...fileNotes(file),
     ...hunks(diffOperations(textLines(file.before), textLines(file.after))),
     '',
   ]);

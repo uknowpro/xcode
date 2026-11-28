@@ -208,6 +208,18 @@ test('CLI reviews a multi-file change before applying it and runs the authorized
   assert.match(result.stderr, /validate · passed · exit 0/);
 });
 
+test('review edits report newline and workspace changes and do not affect workspace files', async () => {
+  const { overrideReviewFile, reviewDiff, fileOperation } = await import('../src/changes.mjs');
+  const file = { path: 'sample.txt', before: 'first\r\n', after: 'second\r\n', workspaceChanged: true };
+  const review = { files: [file], hunkSelections: { 'sample.txt': [1] }, state: 'pending' };
+  overrideReviewFile(review, file.path, Buffer.from('written by user'));
+  assert.equal(file.before, 'first\r\n');
+  assert.equal(file.after, 'written by user');
+  assert.equal(review.hunkSelections[file.path], undefined);
+  assert.match(reviewDiff(review).join('\n'), /Existing workspace edits[\s\S]*CRLF[\s\S]*Final newline/);
+  assert.equal(fileOperation({ move: { from: 'old.txt' } }), 'Move destination ← old.txt');
+});
+
 test('selected hunks preserve unselected lines and ambiguous edits report match locations', async () => {
   const { appliedReviewFiles, chooseHunks, reviewHunks } = await import('../src/changes.mjs');
   const lines = ['before', ...Array.from({ length: 20 }, (_, index) => 'Line ' + index), 'after'];

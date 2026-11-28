@@ -14,7 +14,7 @@ import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
 import { checkEvidence } from './repair.mjs';
 import { defineCheck, projectChecks, runCheck } from './checks.mjs';
-import { chooseHunks, conflictSummary, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
+import { chooseHunks, conflictSummary, fileOperation, inverseReview, overrideReviewFile, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
@@ -75,7 +75,8 @@ const help = [
   '  xcode review show|check|hunks|recovery|apply|reject [session] [paths...]',
   '  xcode guides|packages [path]  Show scoped instructions or local package dependencies',
   '  xcode changes [session]       List applied and undone changes',
-  '  xcode undo [session] [change] Undo a change if its files still match',
+  '  xcode undo [session] [change] [--preview]  Inspect or reverse applied changes',
+  '  xcode review edit <session> <path> <replacement-file>',
   '  xcode settings                 Show active defaults and project checks',
   '  xcode limits [--model-jobs <n>] [--check-jobs <n>]',
   '  xcode network                 Check local proxy and certificate settings',
@@ -118,7 +119,8 @@ const chatHelp = [
   '/recovery                     Inspect files in an interrupted apply or undo',
   '/guides, /packages [path]       Show folder instructions and package dependencies',
   '/verification                  View test outcomes for the current or last turn',
-  '/reject, /changes, /undo [id]  Reject a proposal, see history, or undo',
+  '/reject, /changes, /undo [preview] [id]  Reject, see history, or undo',
+  '/review-edit <path> <file>     Substitute local replacement text in a pending review',
   '/context [query]               Inspect the compacted session context',
   '/harness preview <name>        View an available harness without switching',
   '/checks [on|off]               Show or toggle the configured project checks',
@@ -574,14 +576,35 @@ async function recoveryText(root, session) {
       'Run xcode review apply to resume after resolving conflicts.');
 }
 
+async function editReviewFile(root, review, path, source) {
+  if (!path || !source) throw new Error('Provide the reviewed path and a UTF-8 replacement file.');
+  const file = await new Workspace(root).read({ path: source, count: 1 });
+  overrideReviewFile(review, path, await loadBytes(resolve(root, file.path), 256 * 1024));
+}
+
+async function undoPreview(root, session, id) {
+  const change = id ? session.changes?.find(item => item.id === id) : session.changes?.findLast(item => !item.undoneAt);
+  if (!change || change.undoneAt) throw new Error('No matching applied change to undo.');
+  if (session.undoInProgress && session.undoInProgress.id !== change.id)
+    throw new Error('Finish the existing interrupted undo first.');
+  const review = session.undoInProgress ?? inverseReview(change);
+  const conflicts = await reviewConflicts(new Workspace(root), review);
+  return [conflictSummary(conflicts), reviewDiff(review).join('\n')].filter(Boolean).join('\n\n');
+}
+
 async function reviewCommand(root, action, prefix, paths) {
-  if (!['show', 'check', 'hunks', 'recovery', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
+  if (!['show', 'check', 'hunks', 'recovery', 'edit', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     if (action === 'recovery') return print(await recoveryText(root, live.session));
     const review = live.session.queue[0]?.review;
     if (!review) throw new Error('There is no pending change set.');
+    if (action === 'edit') {
+      await editReviewFile(root, review, paths[0], paths[1]);
+      await sessions.persist(live);
+      return print('Proposal updated. Review the new diff before applying.');
+    }
     if (action === 'hunks') {
       if (paths.length > 1) {
         chooseHunks(review, paths[0], paths.slice(1));
@@ -628,11 +651,12 @@ function changeHistory(session) {
     '\n  ' + change.files.map(file => file.path).join(', ')).join('\n') || 'No undoable changes recorded in this session.';
 }
 
-async function historyCommand(root, action, prefix, id) {
+async function historyCommand(root, action, prefix, id, preview) {
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     if (action === 'changes') return print(changeHistory(live.session));
+    if (preview) return print(await undoPreview(root, live.session, id));
     const result = await sessions.undo(live, id);
     print('Undid change ' + result.id + ' (' + result.files.length + ' files).');
   } finally {
@@ -835,7 +859,7 @@ async function chat(root, base, defaults, options, prefix) {
     const lines = mode === 'files' ? review.files.map((file, index) =>
       (index === pager.focus ? '› ' : '  ') + (picked.has(file.path) ? '[x] ' : '[ ] ') + file.path +
       (conflicts.has(file.path) ? ' · conflict · ' + conflicts.get(file.path) :
-        file.move?.to ? ' → ' + file.move.to : file.after === null ? ' · delete' : file.before === null ? ' · new' : ' · edit')
+        ' · ' + fileOperation(file)) + (file.workspaceChanged ? ' · existing workspace edits' : '')
     ) : mode === 'tests' ? verificationLines(selected.session) : pager.lines;
     const last = Math.max(0, lines.length - rows);
     pager.offset = Math.max(0, Math.min(last, pager.offset + move));
@@ -1231,6 +1255,7 @@ async function chat(root, base, defaults, options, prefix) {
       case '/changes': show(changeHistory(session)); break;
       case '/verification': show(verificationLines(session).join('\n')); break;
       case '/undo': {
+        if (arg === 'preview') return show(await undoPreview(root, session, value));
         const result = await sessions.undo(selected, arg);
         show('Undid change ' + result.id + ' (' + result.files.length + ' files).');
         break;
@@ -1252,6 +1277,14 @@ async function chat(root, base, defaults, options, prefix) {
       case '/guides': show(await guideText(new Workspace(root), arg)); break;
       case '/packages': show(JSON.stringify(await new Workspace(root).packages(arg), null, 2)); break;
       case '/recovery': show(await recoveryText(root, session)); break;
+      case '/review-edit': {
+        const review = session.queue[0]?.review;
+        if (!review) throw new Error('There is no pending change set.');
+        await editReviewFile(root, review, arg, value);
+        await sessions.persist(selected);
+        show('Proposal updated. Review the new diff before applying.');
+        break;
+      }
       case '/hunks': {
         const review = session.queue[0]?.review;
         if (!review) throw new Error('There is no pending change set.');
@@ -1633,7 +1666,7 @@ async function main() {
       'model-jobs': { type: 'string' }, 'check-jobs': { type: 'string' },
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
-      clean: { type: 'string' }, session: { type: 'string' },
+      clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
@@ -1660,7 +1693,7 @@ async function main() {
   const defaults = { profile: values.profile, harness: values.harness };
   if (command === 'check') return checkCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
-  if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1]);
+  if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values.preview);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
   if (command === 'storage') {
