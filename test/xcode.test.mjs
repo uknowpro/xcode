@@ -1125,6 +1125,19 @@ test('chat completion and compose options respect the current editor mode', asyn
   assert.match(previewDraft(Array(14).fill('example'), 40, line => line), /2 more lines/);
 });
 
+test('terminal recalls distinct matches and copies a selected fenced response block', async () => {
+  const { recallEntries, terminalStyle } = await import('../src/chat-input.mjs');
+  const { clipboardCommands, responseSelection } = await import('../src/clipboard.mjs');
+  assert.deepEqual(recallEntries([{ prompt: 'Fix timeout' }, { prompt: 'Fix timeout' }], ['/profile', '/settings'], 'time'), ['Fix timeout']);
+  assert.equal(terminalStyle({ theme: 'dark' }, { NO_COLOR: '' }).color, false);
+  assert.equal(terminalStyle({ theme: 'light', accessible: true }, {}).plain, true);
+  assert.deepEqual(clipboardCommands('linux', { WAYLAND_DISPLAY: 'wayland-0' }), [['wl-copy']]);
+  const answer = 'a\n~~~sh\nprintf hello\n~~~\nb\n~~~text\nsecond\n~~~';
+  assert.equal(responseSelection(answer), answer);
+  assert.equal(responseSelection(answer, '2'), 'second');
+  assert.throws(() => responseSelection(answer, '3'), /from 1 to 2/);
+});
+
 test('terminal views clip Korean and emoji on display columns without breaking graphemes', async () => {
   const { terminalClip, terminalWidth } = await import('../src/terminal.mjs');
   assert.equal(terminalWidth('가🙂e\u0301'), 5);

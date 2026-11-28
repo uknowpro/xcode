@@ -22,7 +22,8 @@ import { readSession, settings, setToken, storage, tokenFor, updateSettings } fr
 import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
-import { completeCommand, configureEditor, editorKeys, previewDraft } from './chat-input.mjs';
+import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
+import { copyClipboard, responseSelection } from './clipboard.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -66,6 +67,7 @@ const help = [
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
   '  xcode terminal [--send-key ctrl+g|ctrl+x] [--newline-key enter|ctrl+o]',
+  '                 [--theme auto|light|dark|plain] [--accessible|--no-accessible]',
   '  xcode report [session] [--probe] Export a private-data-free diagnostic report',
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
@@ -95,7 +97,10 @@ const chatHelp = [
   '/harness preview <name>        View an available harness without switching',
   '/checks [on|off]               Show or toggle the configured project checks',
   '/check <name>                  Run a named project check manually',
-  '/settings                      View model, harness and permissions for this session',
+  '/status, /settings             View the compact status or full session settings',
+  '/recall [search|number]        Find and restore recent prompts or commands',
+  '/copy [block]                  Copy the latest reply or a numbered code block',
+  '/switch                        Switch to the previous session (Alt+J)',
   '/paste, /send, /cancel         Compose or paste a multi-line message',
   '/preview                       Show draft line count and a bounded preview',
   'Tab after /                    Complete a chat command',
@@ -565,7 +570,12 @@ async function chat(root, base, defaults, options, prefix) {
   let draftNotice;
   let pager = null;
   let bracketedPaste = false;
-  const keys = editorKeys((await settings()).terminal);
+  const terminalConfig = (await settings()).terminal;
+  const keys = editorKeys(terminalConfig);
+  const style = terminalStyle(terminalConfig);
+  let previousSession;
+  let recalled = [];
+  const commands = [];
   const notices = [];
   const rl = createInterface({
     input: stdin, output: stdout, terminal: true,
@@ -604,7 +614,9 @@ async function chat(root, base, defaults, options, prefix) {
     const width = Math.min(42, (stdout.columns || 80) - 12);
     const status = terminalClip(statusLabel(), width);
     const count = paste?.length ? paste.length + (paste.length === 1 ? ' line · ' : ' lines · ') : '';
-    rl.setPrompt((status ? status + ' · ' : '') + (paste ? count + '│ ' : '› '));
+    const marker = style.plain ? (paste ? '| ' : '> ') : (paste ? '│ ' : '› ');
+    const toned = style.color && status ? (style.theme === 'dark' ? '\x1b[96m' : '\x1b[34m') + status + '\x1b[0m' : status;
+    rl.setPrompt((toned ? toned + (style.plain ? ' | ' : ' · ') : '') + (paste ? count : '') + marker);
     rl.prompt(true);
     if (restoredLine) {
       const text = restoredLine;
@@ -828,7 +840,9 @@ async function chat(root, base, defaults, options, prefix) {
     } catch (error) {
       show('Could not load draft: ' + error.message);
     }
+    if (selected && selected.session.id !== live.session.id) previousSession = selected.session.id;
     selected = live;
+    recalled = [];
     attachments = draft?.attachments ?? [];
     paste = draft?.paste ?? null;
     pasteLength = paste?.reduce((length, line) => length + line.length + 1, 0) ?? 0;
@@ -839,7 +853,7 @@ async function chat(root, base, defaults, options, prefix) {
       (paste ? ' · /send submits, /cancel discards.' : '.') : undefined;
   };
   const banner = () => {
-    show('xcode · ' + selected.session.title + ' · ' + selected.session.profile + ' · ' + selected.session.id.slice(0, 8));
+    show('xcode · ' + selected.session.title + ' · ' + selected.session.id.slice(0, 8));
     if (draftNotice) {
       show(draftNotice);
       draftNotice = undefined;
@@ -930,6 +944,10 @@ async function chat(root, base, defaults, options, prefix) {
     const args = splitArgs(line.slice(command.length));
     const [arg, value] = args;
     const session = selected.session;
+    if (command !== '/recall' && commands.at(-1) !== line) {
+      commands.push(line.slice(0, 1000));
+      if (commands.length > 40) commands.shift();
+    }
     switch (command) {
       case '/help': show(chatHelp); break;
       case '/paste':
@@ -938,6 +956,40 @@ async function chat(root, base, defaults, options, prefix) {
           keys.send.toUpperCase() + ' sends · ' + keys.newline.toUpperCase() + ' adds a line.');
         break;
       case '/settings': show(await describeSettings(root, session)); break;
+      case '/status':
+        show(session.profile + ' · ' + session.harness + ' · ' + (session.write ? 'proposals allowed' : 'read-only') +
+          ' · checks ' + (session.checks ? 'on' : 'off'));
+        break;
+      case '/recall': {
+        if (args.length === 1 && /^[1-9]$/.test(arg)) {
+          const text = recalled[Number(arg) - 1];
+          if (!text) throw new Error('List recent entries with /recall first.');
+          if (text.includes('\n')) {
+            startDraft();
+            for (const part of text.split('\n')) addDraftLine(part);
+          } else {
+            restoredLine = clean(text);
+          }
+        } else {
+          recalled = recallEntries(session.turns, commands, args.join(' '));
+          show(recalled.map((text, index) => (index + 1) + '  ' + terminalClip(text.replace(/\s+/g, ' '), 95)).join('\n') ||
+            'No recent entries match.');
+        }
+        break;
+      }
+      case '/copy': {
+        const answer = session.turns.findLast(turn => turn.status === 'complete' && turn.answer)?.answer;
+        await copyClipboard(responseSelection(answer, arg));
+        show(arg ? 'Code block copied.' : 'Reply copied.');
+        break;
+      }
+      case '/switch': {
+        const id = previousSession ?? (await sessions.list()).find(item => item.id !== session.id)?.id;
+        if (!id) throw new Error('No previous session in this project.');
+        await select(id);
+        banner();
+        break;
+      }
       case '/changes': show(changeHistory(session)); break;
       case '/verification': show(verificationLines(session).join('\n')); break;
       case '/undo': {
@@ -964,7 +1016,7 @@ async function chat(root, base, defaults, options, prefix) {
         if (!review) throw new Error('There is no pending change set.');
         const lines = reviewDiff(review, arg);
         const conflicts = await reviewConflicts(new Workspace(root), review);
-        if (process.env.TERM === 'dumb') {
+        if (style.plain) {
           show([conflictSummary(conflicts), lines.join('\n')].filter(Boolean).join('\n\n'));
           break;
         }
@@ -1019,7 +1071,7 @@ async function chat(root, base, defaults, options, prefix) {
         await select(arg); banner(); break;
       case '/sessions': {
         const query = (arg === 'list' ? args.slice(1) : args).join(' ');
-        if (arg === 'list' || process.env.TERM === 'dumb') {
+        if (arg === 'list' || style.plain) {
           await describeSessions(sessions, session.id, query);
           break;
         }
@@ -1148,6 +1200,8 @@ async function chat(root, base, defaults, options, prefix) {
       bracketedPaste = false;
       const tail = takeInput();
       if (tail) queueInput(tail, 'insert');
+    } else if (!bracketedPaste && !paste && key.meta && key.name === 'j') {
+      if (!rl.line) queueInput('/switch');
     } else if (!bracketedPaste && paste && key.ctrl) {
       if ('ctrl+' + key.name === keys.send) queueInput(takeInput(), 'send');
       else if (keys.newline === 'ctrl+o' && key.name === 'o') queueInput(takeInput(), 'insert');
@@ -1166,7 +1220,7 @@ async function chat(root, base, defaults, options, prefix) {
     stdin.on('keypress', scheduleDraft);
     stdin.on('keypress', editorKey);
     stdout.on('resize', resize);
-    if (process.env.TERM !== 'dumb') stdout.write('\x1b[?2004h');
+    if (!style.plain) stdout.write('\x1b[?2004h');
     process.once('SIGTERM', closeTerminal);
     const finished = new Promise(resolve => {
       rl.on('close', () => { closed = true; terminalSignal.abort(); resolve(); });
@@ -1187,7 +1241,7 @@ async function chat(root, base, defaults, options, prefix) {
     stdin.off('keypress', scheduleDraft);
     stdin.off('keypress', editorKey);
     stdout.off('resize', resize);
-    if (process.env.TERM !== 'dumb') stdout.write('\x1b[?2004l');
+    if (!style.plain) stdout.write('\x1b[?2004l');
     clearTimeout(draftTimer);
     closeReview();
     rl.close();
@@ -1226,7 +1280,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
-      'send-key': { type: 'string' }, 'newline-key': { type: 'string' },
+      'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
+      accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
       'context-window': { type: 'string' }, 'max-tokens': { type: 'string' }, 'request-timeout': { type: 'string' },
@@ -1246,10 +1301,18 @@ async function main() {
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
   if (command === 'terminal') {
-    if (values['send-key'] || values['newline-key'])
-      await updateSettings(config => { config.terminal = configureEditor(config.terminal, values); });
-    const keys = editorKeys((await settings()).terminal);
-    return print('Send · ' + keys.send + '\nLine break · ' + keys.newline);
+    if (values['send-key'] !== undefined || values['newline-key'] !== undefined || values.theme !== undefined ||
+        values.accessible || values['no-accessible']) {
+      if (values.accessible && values['no-accessible']) throw new Error('Choose one accessibility mode.');
+      await updateSettings(config => {
+        config.terminal = configureEditor(config.terminal, { ...values, accessible: values['no-accessible'] ? false : values.accessible });
+      });
+    }
+    const terminal = (await settings()).terminal;
+    const keys = editorKeys(terminal);
+    const style = terminalStyle(terminal);
+    return print('Send · ' + keys.send + '\nLine break · ' + keys.newline +
+      '\nTheme · ' + style.theme + '\nAccessible output · ' + (style.accessible ? 'on' : 'off'));
   }
   if (command === 'report') return reportCommand(root, rest[0], values);
   if (command === 'continue') return continueMessage(root, rest[0]);
