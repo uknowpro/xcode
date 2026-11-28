@@ -1418,6 +1418,24 @@ test('long session history reads a bounded page without hydrating archived turns
   await exec(process.execPath, ['--input-type=module', '-e', script], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
 });
 
+test('Git worktrees are listed separately and shell completions cover each supported shell', async t => {
+  const root = await temp(t);
+  const tree = await temp(t);
+  const state = await temp(t);
+  const options = { cwd: root, env: { ...process.env, XCODE_HOME: state } };
+  await exec('git', ['init'], options);
+  await exec('git', ['-c', 'user.name=xcode fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--allow-empty', '-m', 'fixture'], options);
+  await exec('git', ['worktree', 'add', '--detach', tree], options);
+  const list = JSON.parse((await exec(process.execPath, [cliPath, 'worktrees', '--json'], options)).stdout);
+  assert.equal(list.find(item => item.path === root).current, true);
+  assert.equal(list.find(item => item.path === tree).current, false);
+  for (const shell of ['bash', 'zsh', 'fish', 'powershell']) {
+    const output = (await exec(process.execPath, [cliPath, 'completion', shell], options)).stdout;
+    assert.match(output, /worktrees/);
+    assert.match(output, /profile/);
+  }
+});
+
 test('session history pages by turn and forks or exports a saved conversation', async t => {
   const api = await server(t, (_body, res, n) => reply(res, 'Reply ' + n));
   const { cli } = await profile(t, api);

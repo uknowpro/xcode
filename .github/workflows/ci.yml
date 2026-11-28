@@ -30,6 +30,7 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       - run: npm test
+      - run: npm run test:docs
       - run: npm run test:install
       - name: Exercise the terminal with a PTY
         if: runner.os == 'Linux'

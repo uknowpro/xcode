@@ -19,7 +19,7 @@ import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
 import { readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
-import { loadBytes, projectRoot, Workspace } from './workspace.mjs';
+import { loadBytes, projectRoot, worktrees, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
 import { executionLimits, setLimits } from './limits.mjs';
@@ -29,6 +29,7 @@ import { formatHistoryPage, historyText, sessionMarkdown } from './session-histo
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
 import { openLocation } from './editor.mjs';
+import { shellCompletion } from './completion.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
 
@@ -92,6 +93,8 @@ const help = [
   '  xcode check sequence <name...> [--stop-on-failure]',
   '  xcode limits [--model-jobs <n>] [--check-jobs <n>]',
   '  xcode network                 Check local proxy and certificate settings',
+  '  xcode worktrees [--json]       List separate workspace roots',
+  '  xcode completion <shell>     Generate Bash, Zsh, Fish or PowerShell completion',
   '  xcode storage [--json] [--clean cache|draft|attachments|archive --session <id>]',
   '  xcode terminal [--send-key ctrl+g|ctrl+x] [--newline-key enter|ctrl+o]',
   '                 [--theme auto|light|dark|plain] [--accessible|--no-accessible]',
@@ -1869,9 +1872,7 @@ async function reportCommand(root, prefix, options) {
 }
 
 async function main() {
-  const { positionals, values } = parseArgs({
-    allowPositionals: true,
-    options: {
+  const cliOptions = {
       ...searchOptions,
       cwd: { type: 'string' }, profile: { type: 'string' }, harness: { type: 'string' },
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
@@ -1889,10 +1890,11 @@ async function main() {
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
       'context-window': { type: 'string' }, 'max-tokens': { type: 'string' }, 'request-timeout': { type: 'string' },
-    },
-  });
+  };
+  const { positionals, values } = parseArgs({ allowPositionals: true, options: cliOptions });
   const [command, ...rest] = positionals;
   if (values.help || command === 'help') return print(help);
+  if (command === 'completion') return print(shellCompletion(rest[0], help, cliOptions));
   if (values.events && values.json) throw new Error('Choose either --events or --json.');
   if (values.version) return print(JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
   const initial = await settings().catch(() => null);
@@ -1909,6 +1911,12 @@ async function main() {
   const base = resolve(values.cwd || process.cwd());
   const root = await projectRoot(base);
   const defaults = { profile: values.profile, harness: values.harness };
+  if (command === 'worktrees') {
+    const items = await worktrees(root);
+    return print(values.json ? JSON.stringify(items, null, 2) :
+      items.map(tree => (tree.current ? '* ' : '  ') + tree.path + ' · ' + (tree.branch ?? 'detached') +
+        (tree.locked ? ' · locked' : '')).join('\n'));
+  }
   if (command === 'check') return checkCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values);

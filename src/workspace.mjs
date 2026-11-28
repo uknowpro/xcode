@@ -102,6 +102,29 @@ export async function readText(root, path, signal, max = 1024 * 1024) {
   return decodeText(await loadBytes((await verifiedFile(root, path, signal)).path, max, signal));
 }
 
+export async function worktrees(root) {
+  let stdout;
+  try {
+    ({ stdout } = await exec('git', ['worktree', 'list', '--porcelain', '-z'], { cwd: root, maxBuffer: 1024 * 1024 }));
+  } catch {
+    throw new Error('Git could not list worktrees for this project.');
+  }
+  const result = [];
+  let current;
+  for (const field of stdout.split('\0')) {
+    if (field.startsWith('worktree ')) {
+      const path = field.slice(9);
+      const location = await realpath(path).catch(() => path);
+      current = { path: location, current: location === root };
+      result.push(current);
+    } else if (current && field.startsWith('branch ')) current.branch = field.slice(7).replace(/^refs\/heads\//, '');
+    else if (current && field === 'detached') current.detached = true;
+    else if (current && field.startsWith('locked')) current.locked = true;
+    else if (!field) current = undefined;
+  }
+  return result;
+}
+
 export async function projectRoot(directory) {
   const current = await realpath(directory);
   try {

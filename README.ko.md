@@ -12,7 +12,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
     xcode setup
     xcode profile test
 
-업데이트는 새 .tgz로 같은 설치 명령을 실행하면 됩니다. 기존 모델 프로필, 토큰, 세션을 이어서 사용합니다. 소스에서 설치할 때는 npm install -g .을 사용합니다.
+업데이트는 새 .tgz로 같은 설치 명령을 실행하면 됩니다. [설치 안내](docs/install.md)에서 운영체제별 명령, 오프라인 설치, 체크섬 및 xcode completion 사용법을 확인하세요. 기존 모델 프로필, 토큰, 세션을 이어서 사용합니다. 소스에서 설치할 때는 npm install -g .을 사용합니다.
 
 **API 주소, 모델 ID, 토큰**을 입력합니다. 로컬과 원격의 HTTP·HTTPS 주소를 쓸 수 있습니다. /v1 또는 /chat/completions 주소를 사용하세요. 기본 프로필은 새 세션에 적용되며 주소 변경 시 토큰은 유지됩니다. 연결 진단은 일반 채팅, SSE, 함수 호출을 구분해서 표시합니다. xcode report > xcode-report.json으로 API 주소·토큰·경로·대화 내용을 제외한 진단 리포트를 저장할 수 있습니다. --probe --only chat을 추가하면 실제 연결을 검사합니다.
 
