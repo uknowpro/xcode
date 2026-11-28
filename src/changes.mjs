@@ -154,22 +154,26 @@ export function selectedFiles(review, paths = []) {
   if (review.state === 'applying' && review.selection) {
     const saved = review.files.filter(file => review.selection.includes(file.path));
     if (!paths.length) return saved;
-    const requested = choose(review.files, paths);
+    const requested = choose(review.files, paths, review.groups);
     if (requested.length !== saved.length || requested.some(file => !saved.includes(file)))
       throw new Error('This apply must resume with its original file selection.');
     return saved;
   }
-  return choose(review.files, paths);
+  return choose(review.files, paths, review.groups);
 }
 
-function choose(files, paths) {
+function choose(files, paths, groups = []) {
   if (!paths.length) return files;
   const selected = new Set();
-  for (const path of paths) {
+  const pending = [...paths];
+  while (pending.length) {
+    const path = pending.shift();
+    if (selected.has(path)) continue;
     const file = files.find(item => item.path === path);
     if (!file) throw new Error('No pending change for ' + path);
     selected.add(path);
-    if (file.move) selected.add(file.move.from ?? file.move.to);
+    if (file.move && files.some(item => item.path === (file.move.from ?? file.move.to))) pending.push(file.move.from ?? file.move.to);
+    for (const group of groups) if (group.includes(path)) pending.push(...group.filter(member => files.some(file => file.path === member)));
   }
   return files.filter(file => selected.has(file.path));
 }

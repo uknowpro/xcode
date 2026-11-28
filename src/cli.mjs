@@ -38,6 +38,7 @@ import { requestedBudget, usageSummary, requestFootprint } from './model-usage.m
 import { rememberRevision, revisionOf, revisionsFor, workflowRevision } from './workflow-graph.mjs';
 import { languageKey, packageImpact, sourceHistory, treeChanges, updateSourceIndex, verifyAnchor } from './source-index.mjs';
 import { languageLocations } from './language-server.mjs';
+import { addReviewComment, addReviewGroup, gitChange, patchCheck, reversalFor, reviewReport, threeWay } from './review-workflow.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
@@ -107,7 +108,10 @@ const help = [
   '  xcode guides|packages [path]  Show scoped instructions or local package dependencies',
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] [--preview]  Inspect or reverse applied changes',
-  '  xcode review edit <session> <path> <replacement-file>',
+  '  xcode review edit|annotate|group|three-way|report <session> [arguments]',
+  '  xcode undo|redo <session> [change] [--files path[#hunks=1,2]] [--preview]',
+  '  xcode changes <session> <change> [--message|--stage|--worktree path --branch name]',
+  '  xcode patch-check <file>      Inspect a patch and check its applicability',
   '  xcode settings [validate|schema|export]  Inspect or export local configuration',
   '  xcode doctor [--json]          Check the local runtime and data locations',
   '  xcode session backup <id> --output <file>  Write a backward-compatible session',
@@ -723,24 +727,32 @@ async function editReviewFile(root, review, path, source) {
   overrideReviewFile(review, path, await loadBytes(resolve(root, file.path), 256 * 1024));
 }
 
-async function undoPreview(root, session, id) {
-  const change = id ? session.changes?.find(item => item.id === id) : session.changes?.findLast(item => !item.undoneAt);
-  if (!change || change.undoneAt) throw new Error('No matching applied change to undo.');
+async function undoPreview(root, session, id, operation = 'undo', selections = []) {
+  const change = id ? session.changes?.find(item => item.id === id) : session.changes?.findLast(item => operation === 'redo' ? item.undoneAt || item.reversals?.length : !item.undoneAt);
+  if (!change) throw new Error('No matching applied change to undo.');
   if (session.undoInProgress && session.undoInProgress.id !== change.id)
     throw new Error('Finish the existing interrupted undo first.');
-  const review = session.undoInProgress ?? inverseReview(change);
+  const review = session.undoInProgress ?? reversalFor(change, operation, selections);
   const conflicts = await reviewConflicts(new Workspace(root), review);
   return [conflictSummary(conflicts), reviewDiff(review).join('\n')].filter(Boolean).join('\n\n');
 }
 
 async function reviewCommand(root, action, prefix, paths) {
-  if (!['show', 'check', 'hunks', 'recovery', 'edit', 'patch', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
+  if (!['show', 'check', 'hunks', 'recovery', 'edit', 'annotate', 'group', 'three-way', 'report', 'patch', 'apply', 'reject'].includes(action)) throw new Error('Use review show, check, apply or reject [session].');
   const sessions = new Sessions(root);
   try {
     const live = await sessions.select(prefix || 'latest', {});
     if (action === 'recovery') return print(await recoveryText(root, live.session));
     const review = live.session.queue[0]?.review;
     if (!review) throw new Error('There is no pending change set.');
+    if (action === 'annotate' || action === 'group') {
+      if (action === 'annotate') addReviewComment(review, paths[0], paths[1], paths.slice(2).join(' '));
+      else addReviewGroup(review, paths);
+      await sessions.persist(live);
+      return print(reviewReport(review));
+    }
+    if (action === 'three-way') return print(JSON.stringify(await threeWay(root, review, paths[0]), null, 2));
+    if (action === 'report') return print(reviewReport(review, live.session.queue[0]?.checks));
     if (action === 'patch') return outputPatch(appliedReviewFiles(review, paths));
     if (action === 'edit') {
       await editReviewFile(root, review, paths[0], paths[1]);
@@ -755,7 +767,8 @@ async function reviewCommand(root, action, prefix, paths) {
       return print(hunkList(review, paths[0]));
     }
     if (action === 'show' || action === 'check') {
-      if (action === 'show') print([review.label, review.description, reviewDiff(review, paths[0]).join('\n')].filter(Boolean).join('\n'));
+      if (action === 'show') print([review.label, review.description,
+        ...(review.comments ?? []).filter(item => !paths[0] || item.path === paths[0]).map(item => item.path + ':' + item.line + ' · ' + item.text), reviewDiff(review, paths[0]).join('\n')].filter(Boolean).join('\n'));
       const chosen = paths.length || review.state === 'applying' ? paths : review.markedPaths ?? paths;
       if (action === 'check' && review.markedPaths && !chosen.length && review.state !== 'applying')
         throw new Error('Select at least one file in /diff or pass paths to check.');
@@ -803,14 +816,25 @@ async function historyCommand(root, action, prefix, id, options) {
   try {
     const live = await sessions.select(prefix || 'latest', {});
     if (action === 'changes') {
-      if (!options.patch) return print(changeHistory(live.session));
+      if (!options.patch && !options.message && !options.stage && !options.worktree) return print(changeHistory(live.session));
       const change = id ? live.session.changes?.find(item => item.id === id) : live.session.changes?.at(-1);
       if (!change) throw new Error('No matching recorded change.');
+      if (options.message) {
+        const title = String(change.prompt ?? 'Apply reviewed changes').replace(/\s+/g, ' ').slice(0, 72);
+        const evidence = live.session.turns.at(-1)?.checks ?? live.session.queue[0]?.checks ?? [];
+        return print([title, '', ...change.files.map(file => '- ' + file.path),
+          ...evidence.map(check => '- Check ' + check.name + ' · ' + check.status)].join('\n'));
+      }
+      if (options.stage || options.worktree) {
+        if (options.stage && options.worktree) throw new Error('Choose staging or a separate worktree.');
+        await gitChange(root, change, options);
+        return print(options.stage ? 'Staged the approved patch.' : 'Applied the approved patch in the new worktree.');
+      }
       return outputPatch(change.files);
     }
-    if (options.preview) return print(await undoPreview(root, live.session, id));
-    const result = await sessions.undo(live, id);
-    print('Undid change ' + result.id + ' (' + result.files.length + ' files).');
+    if (options.preview) return print(await undoPreview(root, live.session, id, action, options.files));
+    const result = await sessions.undo(live, id, action, options.files);
+    print((action === 'redo' ? 'Redid change ' : 'Undid change ') + result.id + ' (' + result.files.length + ' files).');
   } finally {
     await sessions.close();
   }
@@ -2114,6 +2138,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      files: { type: 'string', multiple: true }, stage: { type: 'boolean' }, message: { type: 'boolean' },
+      worktree: { type: 'string' }, branch: { type: 'string' },
       at: { type: 'string' }, language: { type: 'string' }, revision: { type: 'string' }, text: { type: 'string' },
       'usage-reporting': { type: 'string' }, 'request-budget': { type: 'string' }, 'tool-budget': { type: 'string' },
       'token-budget': { type: 'string' }, 'response-schema': { type: 'string' }, 'input-price': { type: 'string' }, 'output-price': { type: 'string' },
@@ -2160,7 +2186,13 @@ async function main() {
   }
   if (command === 'check') return checkCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
-  if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values);
+  if (command === 'patch-check') {
+    if (!rest[0]) throw new Error('Provide a patch file.');
+    const result = await patchCheck(root, rest[0]);
+    if (!result.applicable) process.exitCode = 1;
+    return print(JSON.stringify(result, null, 2));
+  }
+  if (command === 'changes' || command === 'undo' || command === 'redo') return historyCommand(root, command, rest[0], rest[1], values);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') {
     if (rest[0] === 'export') return exportSettings(root, values);

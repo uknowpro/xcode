@@ -12,6 +12,7 @@ import { modelFailure } from './model-transport.mjs';
 import { maxDraftLength } from './draft.mjs';
 import { note, sessionTag } from './session-organize.mjs';
 import { WorkflowGate } from './workflow-graph.mjs';
+import { effectiveChange, reversalFor } from './review-workflow.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -266,6 +267,8 @@ export class Sessions {
         live.session.changes = [...(oldHistory ?? []), {
           id: review.id, prompt: job.prompt.slice(0, 160), appliedAt: new Date().toISOString(),
           files: appliedReviewFiles(review).filter(file => files.includes(file.path)),
+          ...(review.groups?.length ? { groups: review.groups } : {}),
+          ...(review.comments?.length ? { comments: review.comments } : {}),
         }];
       }
       tool.content = JSON.stringify(decision === 'apply'
@@ -289,21 +292,20 @@ export class Sessions {
     }
   }
 
-  async undo(live, id) {
+  async undo(live, id, operation = 'undo', selections = []) {
     const session = live.session;
     if (live.active || live.reviewing) throw new Error('Pause the session before undoing an applied change.');
     if (session.queue[0]?.review?.state === 'applying') throw new Error('Finish the interrupted apply before undoing a change.');
     const journal = session.undoInProgress;
-    if (journal && id && journal.id !== id) throw new Error('First finish undoing ' + journal.id + '.');
+    if (journal && ((id && journal.id !== id) || (journal.operation ?? 'undo') !== operation || selections.length))
+      throw new Error('First finish the saved ' + (journal.operation ?? 'undo') + ' of ' + journal.id + '.');
     const history = session.changes ?? [];
     const change = id || journal
       ? history.find(item => item.id === (id || journal.id))
-      : history.findLast(item => !item.undoneAt);
+      : history.findLast(item => operation === 'redo' ? item.undoneAt || item.reversals?.length : !item.undoneAt);
     if (!change) throw new Error('No applied change to undo in this session.');
-    if (change.undoneAt) throw new Error('Change ' + change.id + ' was already undone.');
-
+    const undo = journal ?? reversalFor(change, operation, selections);
     live.reviewing = true;
-    const undo = journal ?? inverseReview(change);
     session.undoInProgress = undo;
     try {
       let files;
@@ -316,12 +318,19 @@ export class Sessions {
         }
         throw error;
       }
-      change.undoneAt = new Date().toISOString();
+      const oldUndone = change.undoneAt, previous = change.reversals;
+      const initial = previous ?? (oldUndone ? [{ operation: 'undo', files: inverseReview(change).files }] : []);
+      change.reversals = [...initial, { operation, time: new Date().toISOString(), files: appliedReviewFiles(undo) }];
+      if (effectiveChange(change).every(file => file.after === file.before && (file.afterMode ?? null) === (file.beforeMode ?? null)))
+        change.undoneAt = new Date().toISOString();
+      else delete change.undoneAt;
       delete session.undoInProgress;
       try {
         await this.persist(live);
       } catch (error) {
-        delete change.undoneAt;
+        if (oldUndone) change.undoneAt = oldUndone;
+        else delete change.undoneAt;
+        change.reversals = previous;
         session.undoInProgress = undo;
         throw error;
       }

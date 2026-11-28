@@ -1711,3 +1711,25 @@ test('repository maps resolve local TypeScript aliases and detect package cycles
   assert.deepEqual(impact.cycles, ['a → b']);
   assert.equal(impact.affected.length, 2);
 });
+
+test('grouped proposals approve together and an approved change can be previewed and redone', async t => {
+  const api = await server(t, (_body, res, request) => {
+    if (request === 1) return tool(res, 'propose_changes', JSON.stringify({ changes: [
+      { path: 'one.txt', action: 'create', newText: 'one\n' },
+      { path: 'two.txt', action: 'create', newText: 'two\n' },
+    ] }));
+    return reply(res, 'Applied');
+  });
+  const { cli, work } = await profile(t, api);
+  await assert.rejects(cli('ask', 'Add both files', '--write'), error => error.code === 3);
+  await cli('review', 'annotate', 'latest', 'one.txt', '1', 'Verify line');
+  const grouped = await cli('review', 'group', 'latest', 'one.txt', 'two.txt');
+  assert.match(grouped.stdout, /Verify line/);
+  assert.match((await cli('review', 'apply', 'latest', 'one.txt')).stdout, /Applied 2 files/);
+  await cli('continue');
+  await cli('undo');
+  await assert.rejects(readFile(join(work, 'two.txt'), 'utf8'), { code: 'ENOENT' });
+  assert.match((await cli('redo', '--preview')).stdout, /one\.txt/);
+  await cli('redo');
+  assert.equal(await readFile(join(work, 'two.txt'), 'utf8'), 'two\n');
+});
