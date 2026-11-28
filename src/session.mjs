@@ -14,6 +14,7 @@ import { note, sessionTag } from './session-organize.mjs';
 import { WorkflowGate } from './workflow-graph.mjs';
 import { effectiveChange, reversalFor } from './review-workflow.mjs';
 import { McpApproval, performMcp } from './session-mcp.mjs';
+import { audit } from './privacy-policy.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -292,6 +293,7 @@ export class Sessions {
         tool.content = previous;
         throw error;
       }
+      await audit(this.root, { type: 'file-review', sessionId: live.session.id, decision, fileCount: files.length }).catch(() => {});
       return files;
     } finally {
       live.reviewing = false;
@@ -368,6 +370,7 @@ export class Sessions {
       item.content = JSON.stringify(output);
       delete job.mcpApproval;
       await this.persist(live);
+      await audit(this.root, { type: 'mcp-decision', sessionId: live.session.id, alias: call.alias, decision }).catch(() => {});
       return output;
     } finally { live.reviewing = false; }
   }

@@ -1798,3 +1798,34 @@ test('SQLite schema and bounded table output preserve relations and CSV quoting'
   assert.equal(query.nextOffset, 1);
   assert.equal(csvRows(query.rows, query.columns), '"text"\n"a,b"');
 });
+
+test('project transmission policies block unknown destinations and keep offline commands local', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Allowed'));
+  const { cli, work } = await profile(t, api);
+  await cli('policy', 'allow-profile', 'work');
+  await cli('policy', 'deny-profile', 'work');
+  await assert.rejects(cli('ask', 'Do not transmit'), /Confirm this destination/);
+  await cli('policy', 'allow-profile', 'work');
+  await writeFile(join(work, 'internal.txt'), 'sensitive marker');
+  await cli('policy', 'rule', 'internal.txt', 'deny');
+  await assert.rejects(cli('ask', 'Blocked file', '--attach', 'internal.txt'), /excluded|blocked/);
+  await cli('policy', 'offline', 'on');
+  await assert.rejects(cli('ask', 'Offline'), /local-only mode/);
+  await assert.rejects(cli('profile', 'test', 'work', '--only', 'chat'), /local-only mode/);
+  assert.equal(api.requests.length, 0);
+  assert.match((await cli('policy', 'audit')).stdout, /policy-change/);
+  await cli('policy', 'offline', 'off');
+  assert.match((await cli('ask', 'Allowed now')).stdout, /Allowed/);
+});
+
+test('encrypted session backups authenticate both the passphrase and the contents', async () => {
+  const { encryptBackup, decryptBackup } = await import('../src/privacy-policy.mjs');
+  const start = { turns: [{ answer: 'Private content' }] };
+  const envelope = await encryptBackup(start, 'fixture passphrase');
+  assert.doesNotMatch(JSON.stringify(envelope), /Private content/);
+  assert.deepEqual(await decryptBackup(envelope, 'fixture passphrase'), start);
+  await assert.rejects(decryptBackup(envelope, 'incorrect passphrase'), /incorrect or the backup is damaged/);
+  const tag = Buffer.from(envelope.tag, 'base64');
+  tag[0] ^= 1;
+  await assert.rejects(decryptBackup({ ...envelope, tag: tag.toString('base64') }, 'fixture passphrase'), /backup is damaged/);
+});

@@ -13,12 +13,12 @@ import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
 import { checkEvidence, checkLocations, compareCheckRuns, latestChecks } from './repair.mjs';
-import { defineCheck, projectChecks, redactSecrets, runCheck } from './checks.mjs';
+import { checkKey, defineCheck, projectChecks, redactSecrets, runCheck } from './checks.mjs';
 import { appliedReviewFiles, asGitPatch, chooseHunks, conflictSummary, fileOperation, inverseReview, overrideReviewFile, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { isStatePath, readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
+import { isStatePath, pruneUnusedSessionRecords, readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { loadBytes, projectRoot, worktrees, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
@@ -40,6 +40,7 @@ import { languageKey, packageImpact, sourceHistory, treeChanges, updateSourceInd
 import { languageLocations } from './language-server.mjs';
 import { checkPlan, checkSettings, comparePlans, executeCheckPlan, repeatedCheck, savedCheckRun } from './check-plan.mjs';
 import { bindMcp } from './session-mcp.mjs';
+import { allowModel, audit, decryptBackup, destination, encryptBackup, inspectTransfer, noNetwork, policyAt, recentAudit } from './privacy-policy.mjs';
 import { addReviewComment, addReviewGroup, gitChange, patchCheck, reversalFor, reviewReport, threeWay } from './review-workflow.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
@@ -133,6 +134,10 @@ const help = [
   '  xcode terminal [--send-key ctrl+g|ctrl+x] [--newline-key enter|ctrl+o]',
   '                 [--theme auto|light|dark|plain] [--accessible|--no-accessible]',
   '  xcode report [session] [--probe] Export a private-data-free diagnostic report',
+  '  xcode policy list|allow-profile|deny-profile|rule|offline|preview|audit [arguments]',
+  '  xcode profile rotate <name> --token-stdin  Test a replacement token before saving',
+  '  xcode session scrub-replay|check-allow <id> [checks...]',
+  '  xcode session backup <id> --output file [--encrypted --password-stdin]',
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
   '  --attach <path>     --endpoint <url>   --model <id>      --token-stdin',
@@ -187,6 +192,7 @@ const chatHelp = [
   '/usage, /attempts              Review request usage and timings',
   '/gate approve|skip             Decide a paused workflow stage',
   '/mcp link|list|pending|approve|reject|detach  Control local session tools',
+  '/check-allow <names|all|none>  Limit the registered checks the model can request',
   '/harness revision <id|current> Pin a harness revision for this session',
   '/draft-edit <action> [line] [text]    Edit, preview dedent, undo or redo draft lines',
   'Tab after /                    Complete a chat command',
@@ -317,6 +323,18 @@ async function profileCommand(action, name, options) {
   if (action === 'use') {
     await updateSettings(value => { value.defaultProfile = name; });
     print('Default profile: ' + name);
+  } else if (action === 'rotate') {
+    if (!options['token-stdin'] || stdin.isTTY) throw new Error('Pipe the new token with --token-stdin.');
+    const next = (await readInput(8192)).trim();
+    if (!next) throw new Error('Provide a replacement token.');
+    const report = await diagnose(profile, next, { only: 'chat' });
+    if (report[0].status !== 'pass') throw new Error('Replacement token failed verification. ' + report[0].detail);
+    await updateSettings(async current => {
+      if (diagnosticKey(profileFor(current, name)) !== diagnosticKey(profile)) throw new Error('The profile changed while rotating the token.');
+      await setToken(name, next, current);
+    });
+    await cacheCapabilities(name, diagnosticKey(profile), report).catch(() => {});
+    return print('Verified and saved the replacement token.');
   } else if (action === 'compare') {
     if (!options.against) throw new Error('Use xcode profile compare <name> --against <name>.');
     await compareProfiles(config, name, options.against, options.json);
@@ -423,6 +441,8 @@ function checkBinding({ names, checks }) {
 
 async function harnessCommand(root, action, name, args, options) {
   const config = await settings();
+  if (['eval', 'benchmark'].includes(action))
+    allowModel(policyAt(config, root), profileFor(config, options.profile ?? config.defaultProfile ?? 'default'));
   if (action === 'roles') {
     Object.entries(roles).forEach(([role, instruction]) => print(role + ' · ' + instruction));
   } else if (action === 'list' || !action) {
@@ -634,6 +654,7 @@ async function suggestChecks(root, session, signal) {
 }
 
 async function checkCommand(root, action, name, argv, options) {
+  if (['run', 'sequence', 'run-plan', 'resume-plan', 'flaky'].includes(action)) noNetwork(policyAt(await settings(), root));
   if (action === 'configure') {
     await updateSettings(config => {
       const checks = { ...projectChecks(config, root) };
@@ -885,13 +906,13 @@ async function historyCommand(root, action, prefix, id, options) {
   }
 }
 
-async function collectAttachments(root, base, profile, prompt, paths, excludes = [], token) {
+async function collectAttachments(root, base, profile, prompt, paths, excludes = [], token, policy = {}) {
   const requests = new Map([
     ...explicitReferences(prompt).map(path => [resolve(base, path), false]),
     ...paths.map(path => [resolve(base, path), true]),
   ]);
   const results = [];
-  const workspace = new Workspace(root, excludes);
+  const workspace = new Workspace(root, [...excludes, ...(policy.inspect ?? []).filter(rule => rule.action === 'deny').map(rule => rule.pattern)]);
   let bytes = 1;
   for (const [path, explicit] of requests) {
     const source = path.replace(/#L[1-9]\d*(?:-L?[1-9]\d*)?$/, '');
@@ -904,7 +925,11 @@ async function collectAttachments(root, base, profile, prompt, paths, excludes =
       throw error;
     }
     file.source = source;
-    file.parts = file.parts.map(part => part.type === 'text' ? { ...part, text: redactSecrets(part.text, [token]) } : part);
+    file.parts = file.parts.map(part => {
+      const inspected = inspectTransfer(policy, root, source, part.type === 'text' ? part.text : '', token);
+      if (inspected.count) void audit(root, { type: 'transmission-redacted', kind: inspected.kind, count: inspected.count }).catch(() => {});
+      return part.type === 'text' ? { ...part, text: inspected.text } : part;
+    });
     bytes += attachmentSize(file);
     if (results.length >= maxAttachments || bytes > maxAttachmentBytes)
       throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
@@ -984,9 +1009,11 @@ async function ask(root, base, defaults, options, prompt) {
   const saved = options.session ? await readSession((await new Sessions(root).find(options.session)).id) : null;
   const name = defaults.profile || saved?.profile || config.defaultProfile || 'default';
   const profile = profileFor(config, name);
+  const policy = policyAt(config, root);
+  allowModel(policy, profile);
   harnessFor(config, defaults.harness || saved?.harness || 'default');
   const attachments = await collectAttachments(root, base, profile, prompt, options.attach ?? [],
-    config.transmitExclusions?.[root], await tokenFor(name));
+    config.transmitExclusions?.[root], await tokenFor(name), policy);
   const sessions = streamSession(root, options);
   try {
     const live = await sessions.select(options.session, defaults);
@@ -1429,7 +1456,9 @@ async function chat(root, base, defaults, options, prefix) {
     const config = await settings();
     const name = selected.session.profile;
     const profile = profileFor(config, name);
-    const prepared = await collectAttachments(root, base, profile, message, attachments, config.transmitExclusions?.[root], await tokenFor(name));
+    const policy = policyAt(config, root);
+    allowModel(policy, profile);
+    const prepared = await collectAttachments(root, base, profile, message, attachments, config.transmitExclusions?.[root], await tokenFor(name), policy);
     const { run } = await sessions.enqueue(selected, message, prepared);
     run?.catch(error => show(error.message));
     attachments = [];
@@ -1740,6 +1769,9 @@ async function chat(root, base, defaults, options, prefix) {
         sessions.pump(selected)?.catch(error => show(error.message));
         break;
       }
+      case '/check-allow':
+        await allowChecks(sessions, selected, args);
+        return show('Registered check permissions updated.');
       case '/checks':
         if (!arg) {
           show('Agent checks · ' + (session.checks ? 'on' : 'off') + '\n' + checkList(projectChecks(await settings(), root)));
@@ -1752,6 +1784,7 @@ async function chat(root, base, defaults, options, prefix) {
         show('Agent checks ' + arg + '.');
         break;
       case '/check': {
+        noNetwork(policyAt(await settings(), root));
         editable();
         manualCheck = new AbortController();
         try {
@@ -2148,6 +2181,7 @@ async function localMcpCommand(root, action = 'list', name, args, options) {
     return print(action === 'add' ? 'Registered ' + name + '. Local processes run with your OS permissions.' : 'Removed ' + name + '.');
   }
   const argv = own(servers, name);
+  if (['tools', 'call', 'probe', 'restart'].includes(action)) noNetwork(policyAt(config, root));
   if (argv && ['probe', 'restart'].includes(action)) {
     const clock = performance.now();
     let result;
@@ -2173,6 +2207,64 @@ async function localMcpCommand(root, action = 'list', name, args, options) {
     return request('tools/call', { name: tool, arguments: input });
   });
   print(JSON.stringify(result, null, 2));
+}
+
+async function allowChecks(manager, live, names) {
+  if (live.active || live.session.queue.length || !names.length) throw new Error('Set check permissions with no pending work.');
+  const checks = projectChecks(await settings(), manager.root);
+  if (names.length === 1 && names[0] === 'all') delete live.session.checkAllow;
+  else {
+    const selected = names.length === 1 && names[0] === 'none' ? [] : [...new Set(names)];
+    if (selected.some(name => !Object.hasOwn(checks, name))) throw new Error('Select registered check names.');
+    live.session.checkAllow = Object.fromEntries(selected.map(name => [name, checkKey(checks[name].argv, checks[name].timeout, checks[name].directory)]));
+  }
+  await manager.persist(live);
+  await audit(manager.root, { type: 'check-permissions', sessionId: live.session.id, names }).catch(() => {});
+}
+
+async function workspacePolicy(root, action = 'list', args, options) {
+  const config = await settings();
+  if (action === 'audit') return print(JSON.stringify(await recentAudit(root), null, 2));
+  if (action === 'preview') {
+    const target = profileFor(config, args[0] ?? config.defaultProfile ?? 'default');
+    const targetToken = await tokenFor(args[0] ?? config.defaultProfile ?? 'default').catch(() => undefined);
+    const manager = new Sessions(root);
+    const summary = options.session ? await manager.find(options.session) : (await manager.list())[0];
+    const session = summary ? await readSession(summary.id) : null;
+    const exposed = { destination: visibleEndpoint(target, targetToken), scopedSource: 'only sources selected during tool use',
+      attachments: (session?.queue[0]?.attachments ?? []).map(file => redactSecrets(file.name, [targetToken])),
+      priorTurns: session?.turns.length ?? 0, pinnedItems: session?.pins?.length ?? 0,
+      pendingPrompt: Boolean(session?.queue[0]), offline: Boolean(policyAt(config, root).offline) };
+    return print(JSON.stringify(exposed, null, 2));
+  }
+  if (action !== 'list') {
+    await updateSettings(next => {
+      const policy = { ...policyAt(next, root) };
+      if (action === 'offline') {
+        if (!['on', 'off'].includes(args[0])) throw new Error('Choose offline on or off.');
+        policy.offline = args[0] === 'on';
+      } else if (action === 'allow-profile' || action === 'deny-profile') {
+        const address = destination(profileFor(next, args[0]));
+        const endpoints = new Set(policy.endpoints ?? []);
+        if (action === 'allow-profile') endpoints.add(address);
+        else endpoints.delete(address);
+        policy.endpoints = [...endpoints];
+        policy.restrictDestinations = true;
+      } else if (action === 'rule') {
+        const [pattern, mode] = args;
+        if (!pattern || pattern.length > 240 || pattern.startsWith('/') || pattern.includes('\\') || pattern.split('/').includes('..') ||
+            !['mask', 'block-match', 'deny', 'remove'].includes(mode)) throw new Error('Use a relative glob and mask, block-match, deny or remove.');
+        const rules = (policy.inspect ?? []).filter(item => item.pattern !== pattern);
+        if (mode !== 'remove') rules.push({ pattern, action: mode });
+        if (rules.length > 100) throw new Error('Maximum 100 inspection rules.');
+        policy.inspect = rules;
+      } else throw new Error('Unknown workspace policy action.');
+      next.dataPolicy = { ...next.dataPolicy, [root]: policy };
+    });
+    await audit(root, { type: 'policy-change', action }).catch(() => {});
+  }
+  const policy = policyAt(await settings(), root);
+  return print(JSON.stringify({ ...policy, endpoints: (policy.endpoints ?? []).map(value => redactSecrets(value)) }, null, 2));
 }
 
 async function transmissionRules(root, action, pattern) {
@@ -2229,6 +2321,7 @@ async function reportCommand(root, prefix, options) {
   const config = await settings().catch(() => null);
   const name = options.profile ?? session?.profile ?? config?.defaultProfile ?? 'default';
   const profile = config ? own(config.profiles, name) : null;
+  if (options.probe && profile) allowModel(policyAt(config ?? {}, root), profile);
   const report = await buildReport({
     session, state: session ? sessionStatus(session) : null, profile,
     configuration: config ? 'readable' : 'unreadable', unreadableSessions,
@@ -2260,6 +2353,7 @@ async function main() {
       heading: { type: 'string' }, table: { type: 'string' }, range: { type: 'string' }, outline: { type: 'boolean' },
       columns: { type: 'string' }, order: { type: 'string' }, csv: { type: 'boolean' },
       input: { type: 'string' }, rows: { type: 'string' }, part: { type: 'string' }, sheet: { type: 'string' }, page: { type: 'string' },
+      encrypted: { type: 'boolean' }, 'password-stdin': { type: 'boolean' },
       where: { type: 'string' }, in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
       'stop-on-failure': { type: 'boolean' }, 'include-tokens': { type: 'boolean' }, 'include-history': { type: 'boolean' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
@@ -2284,6 +2378,11 @@ async function main() {
     return print('Model requests · ' + limits.modelJobs + '\nProject checks · ' + limits.checkJobs + '\nLimits apply per xcode process.');
   }
   if (command === 'setup') return setup(rest[0] || (await settings()).defaultProfile || 'default');
+  if (command === 'profile' && ['test', 'models', 'eval', 'rotate'].includes(rest[0])) {
+    const root = await projectRoot(resolve(values.cwd || process.cwd()));
+    const config = await settings();
+    allowModel(policyAt(config, root), profileFor(config, rest[1] || config.defaultProfile || 'default'));
+  }
   if (command === 'profile') return profileCommand(rest[0], rest[1] || (await settings()).defaultProfile || 'default', values);
   const base = resolve(values.cwd || process.cwd());
   const root = await projectRoot(base);
@@ -2323,6 +2422,7 @@ async function main() {
       item.check + ' · ' + item.status + ' · ' + item.detail).join('\n'));
   }
   if (command === 'skills') return print(await skillCommand(root, rest[0], rest[1]));
+  if (command === 'policy') return workspacePolicy(root, rest[0], rest.slice(1), values);
   if (command === 'mcp') return localMcpCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'extract') return print(JSON.stringify(await extractDocument(root, rest[0], values), null, 2));
   if (command === 'document-diff') return print(JSON.stringify(await compareDocuments(root, rest[0], rest[1], values), null, 2));
@@ -2397,6 +2497,7 @@ async function main() {
         .map(row => ({ path, ...row }))).slice(0, 100) } : {}) }, null, 2));
   }
   if (command === 'symbol' && values.at) {
+    noNetwork(policyAt(await settings(), root));
     const match = /^(.*):([1-9]\d*):([1-9]\d*)$/.exec(values.at);
     if (!match) throw new Error('Use --at <file:line:column>.');
     const language = values.language ?? languageKey(match[1]);
@@ -2505,7 +2606,11 @@ async function main() {
       const turns = [];
       let title = 'Combined conversation';
       if (action === 'import') {
-        const backup = JSON.parse((await loadBytes(resolve(rest[1] ?? ''), 16 * 1024 * 1024)).toString('utf8'));
+        let backup = JSON.parse((await loadBytes(resolve(rest[1] ?? ''), 32 * 1024 * 1024)).toString('utf8'));
+        if (backup?.format) {
+          if (!values['password-stdin'] || stdin.isTTY) throw new Error('Pipe the backup passphrase with --password-stdin.');
+          backup = await decryptBackup(backup, (await readInput(4096)).trimEnd());
+        }
         if (!Array.isArray(backup?.turns)) throw new Error('Provide a session backup file.');
         title = ('Imported · ' + String(backup.title ?? 'Session')).replace(/[\r\n]/g, ' ').slice(0, 120);
         for (const [index, turn] of backup.turns.entries()) {
@@ -2544,14 +2649,24 @@ async function main() {
       const session = action === 'history' ? await readSessionPage(entry.id, turn, count) : await readSession(entry.id);
       if (!session || session.root !== root) throw new Error('Session is no longer available in this project.');
       if (action === 'backup') {
-        await writeFile(resolve(values.output), JSON.stringify(session, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        if (values.encrypted && (!values['password-stdin'] || stdin.isTTY)) throw new Error('Pipe a backup passphrase with --password-stdin.');
+        const backup = values.encrypted ? await encryptBackup(session, (await readInput(4096)).trimEnd()) : session;
+        await writeFile(resolve(values.output), JSON.stringify(backup, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
         return print('Wrote a backward-compatible session backup.');
       }
       return print(action === 'export' ? sessionMarkdown(session) : formatHistoryPage(session, 'xcode session history ' + entry.id.slice(0, 8)));
     }
     try {
       const live = await sessions.select(prefix, defaults);
-      if (action === 'mcp') {
+      if (action === 'check-allow') {
+        await allowChecks(sessions, live, rest.slice(2));
+        print('Registered check permissions updated.');
+      } else if (action === 'scrub-replay') {
+        if (live.session.queue.length) throw new Error('Finish pending requests before removing saved replay.');
+        live.session.turns = live.session.turns.map(({ wire: _wire, ...turn }) => turn);
+        await sessions.persist(live);
+        print('Removed replay references and ' + await pruneUnusedSessionRecords(live.session.id) + ' unreferenced records.');
+      } else if (action === 'mcp') {
         await sessionMcp(sessions, live, rest.slice(2), print);
       } else if (action === 'gate') {
         await sessions.decideStage(live, turn);

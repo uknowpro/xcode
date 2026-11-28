@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { mcpTools, withMcp } from './local-mcp.mjs';
 import { validateContract } from './json-contract.mjs';
 import { redactSecrets } from './checks.mjs';
+import { noNetwork, policyAt } from './privacy-policy.mjs';
 
 export class McpApproval extends Error {}
 
@@ -14,6 +15,7 @@ function serverCommand(config, root, server) {
 }
 
 export async function bindMcp(config, root, alias, server, tool, mode = 'approve') {
+  noNetwork(policyAt(config, root));
   if (!/^[a-z0-9][a-z0-9_-]{0,47}$/i.test(alias) || !tool || !['read', 'approve'].includes(mode))
     throw new Error('Use an alias, server, tool and approve or read mode.');
   const command = serverCommand(config, root, server);
@@ -37,6 +39,7 @@ export function prepareMcpCall(bindings, args) {
 }
 
 export async function performMcp(config, root, call, token) {
+  noNetwork(policyAt(config, root));
   const command = serverCommand(config, root, call.server);
   return withMcp(root, command, async request => {
     const info = (await mcpTools(request)).tools.find(item => item.name === call.tool);

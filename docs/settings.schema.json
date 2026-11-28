@@ -21,7 +21,8 @@
     "languageServers": { "type": "object" },
     "readRoots": { "type": "object" },
     "glossary": { "type": "object" },
-    "mcpHealth": { "type": "object" }
+    "mcpHealth": { "type": "object" },
+    "dataPolicy": { "type": "object" }
   },
   "additionalProperties": false
 }

@@ -7,7 +7,7 @@ import { checksForHarness, harnessFor, roleText, skillRead, skillsAt, stageTools
 import { userMessage } from './attachments.mjs';
 import { Workspace } from './workspace.mjs';
 import { prepareReview, ReviewRequired } from './changes.mjs';
-import { runCheck } from './checks.mjs';
+import { checkKey, runCheck } from './checks.mjs';
 import { recentMessages, remember } from './memory.mjs';
 import { modelPolicy } from './model-profile.mjs';
 import { tokenFor } from './store.mjs';
@@ -15,6 +15,7 @@ import { diagnosticKey } from './model-discovery.mjs';
 import { validateAnswer } from './json-contract.mjs';
 import { revisionOf, resolveArtifact, stageApplies, WorkflowGate } from './workflow-graph.mjs';
 import { McpApproval, performMcp, prepareMcpCall } from './session-mcp.mjs';
+import { allowModel, audit, inspectTransfer, policyAt } from './privacy-policy.mjs';
 import { requestFootprint, requestedBudget, traceAttempt } from './model-usage.mjs';
 import { completeWireStage, startWire, wireStage } from './wire-history.mjs';
 import { checkEvidence, latestChecks, recheck, scheduleRepair, stagePlan } from './repair.mjs';
@@ -145,6 +146,10 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
     }
     case 'read': {
       const result = await project.read(args, signal);
+      const policy = policyAt(config, session.root);
+      const inspected = inspectTransfer(policy, session.root, resolve(session.root, result.path), result.lines, token);
+      result.lines = inspected.text;
+      if (inspected.count) await audit(session.root, { type: 'transmission-redacted', kind: inspected.kind, count: inspected.count }).catch(() => {});
       const key = result.path.includes('/') ? result.path.slice(0, result.path.lastIndexOf('/')) : '.';
       if (key !== '.') {
         const guides = (await project.guides(args.path, signal)).filter(guide => guide.path !== 'AGENTS.md');
@@ -171,7 +176,18 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
       return result;
     }
     case 'glob': return project.glob(args, signal);
-    case 'grep': return project.search(args, signal);
+    case 'grep': {
+      const result = await project.search(args, signal);
+      const matches = [];
+      for (const item of result.matches) {
+        try {
+          const inspected = inspectTransfer(policyAt(config, session.root), session.root, resolve(session.root, item.path), item.text, token);
+          matches.push({ ...item, text: inspected.text });
+          if (inspected.count) await audit(session.root, { type: 'transmission-redacted', kind: inspected.kind, count: inspected.count }).catch(() => {});
+        } catch { /* The workspace transmission policy excludes this result. */ }
+      }
+      return { ...result, matches };
+    }
     case 'project_guides': return project.guides(args.path, signal);
     case 'repo_map': return project.map(args, signal);
     case 'skill_read': return skillRead(skills, args.name, args.path, signal);
@@ -252,11 +268,17 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   job.harnessName ??= session.harness;
   if (!job.harness) job.harness = revisionOf(config, job.harnessName, harnessFor(config, job.harnessName), session.harnessRevision);
   const harness = job.harness;
-  const project = new Workspace(session.root, config.transmitExclusions?.[session.root]);
+  const dataPolicy = policyAt(config, session.root);
+  const project = new Workspace(session.root, [...(config.transmitExclusions?.[session.root] ?? []),
+    ...(dataPolicy.inspect ?? []).filter(rule => rule.action === 'deny').map(rule => rule.pattern)]);
   if (job.attachments.some(item => item.source && project.excluded(resolve(session.root, item.source))))
     throw new Error('A queued attachment is now excluded. Discard the pending message and attach an allowed file.');
   const skills = isolated ? new Map() : await skillsAt(session.root, signal, config.skillPolicy?.[session.root]);
-  const { checks } = checksForHarness(config, session.root, job.harnessName);
+  const allChecks = checksForHarness(config, session.root, job.harnessName).checks;
+  const checks = !session.checkAllow ? allChecks : Object.fromEntries(Object.entries(allChecks).filter(([name, item]) =>
+    Object.hasOwn(session.checkAllow, name) && session.checkAllow[name] === checkKey(item.argv, item.timeout, item.directory)));
+  const transfer = dataPolicy;
+  if (!isolated) allowModel(transfer, profile);
   job.stageRoutes ??= isolated ? {} : session.stageRoutes ?? {};
   job.mcpBindings ??= isolated ? [] : session.mcpBindings ?? [];
   session = { ...session, mcpBindings: job.mcpBindings };
@@ -323,6 +345,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
     const routed = route && Object.hasOwn(config.profiles, route.profile) ? config.profiles[route.profile] : undefined;
     if (route && (!routed || diagnosticKey(routed) !== route.key)) throw new Error('Stage model settings changed. Reconfirm the route in a new turn.');
     const currentProfile = routed ?? requestProfile;
+    if (!isolated) allowModel(transfer, currentProfile);
     const currentToken = routed ? await tokenFor(route.profile) : token;
     const contextSession = route?.scope === 'task' ? { ...session, turns: [], memory: undefined, pins: [], changes: [] } : session;
     const contextJob = route?.scope === 'task' ? { ...job, completed: [] } : job;

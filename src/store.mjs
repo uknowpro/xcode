@@ -22,7 +22,7 @@ const stateRoots = new Set([storage, canonicalStateRoot(storage)]);
 export function isStatePath(path) {
   for (const root of stateRoots) {
     const first = relative(root, path).split(sep)[0];
-    if (/^(?:sessions|keychain|indexes|check-plans|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
+    if (/^(?:sessions|keychain|indexes|check-plans|audit|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
   }
   return false;
 }
@@ -236,6 +236,26 @@ export async function readSession(id) {
     turns.push(turn);
   }
   return { ...session, turns };
+}
+
+export async function pruneUnusedSessionRecords(id) {
+  const record = await readSessionRecord(id);
+  if (!record) return 0;
+  const paths = new Set([...(record.olderTurns ?? []), ...record.turns.flatMap(row => isReference(row?.wireRef) ? [row.wireRef] : [])]);
+  const folder = recordsDir(id);
+  const files = await readdir(folder, { withFileTypes: true }).catch(error => {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  });
+  let count = 0;
+  for (const file of files) {
+    if (!file.isFile() || !file.name.endsWith('.json')) continue;
+    const id = file.name.slice(0, -5);
+    if (!isReference(id) || paths.has(id)) continue;
+    await rm(join(folder, file.name), { force: true });
+    count++;
+  }
+  return count;
 }
 
 export async function readSessionPage(id, before, count = 8) {
