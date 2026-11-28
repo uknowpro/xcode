@@ -1083,6 +1083,33 @@ test('connection diagnostics separate HTTP authentication and malformed model st
   assert.match(stream.detail, /Response stream/);
 });
 
+test('diagnostic reports omit credentials, locations, and session contents and only probe on request', async t => {
+  const api = await server(t, (_body, res) => res.writeHead(401).end('upstream-secret-marker'));
+  const { work, state, cli } = await profile(t, api);
+  await assert.rejects(cli('ask', 'private draft marker'));
+  const sessionDir = join(state, 'sessions');
+  const [file] = (await readdir(sessionDir)).filter(name => name.endsWith('.json'));
+  const before = await readFile(join(sessionDir, file), 'utf8');
+
+  const about = await cli('report');
+  const result = JSON.parse(about.stdout);
+  assert.equal(api.requests.length, 1);
+  assert.equal(result.model.transport, 'http');
+  assert.equal(result.session.state, 'failed');
+  assert.deepEqual(result.session.failure, { phase: 'auth', httpStatus: 401 });
+  assert.equal(result.probe, undefined);
+  const probed = await cli('report', 'latest', '--probe', '--only', 'chat');
+  assert.equal(api.requests.length, 2);
+  assert.deepEqual(JSON.parse(probed.stdout).probe.tests, [
+    { name: 'chat', status: 'fail', failure: { phase: 'auth', httpStatus: 401 } },
+  ]);
+  for (const output of [about.stdout, probed.stdout]) {
+    for (const value of [api.url, '127.0.0.1', work, state, file, 'fixture-token', 'private draft marker', 'upstream-secret-marker'])
+      assert.ok(!output.includes(value));
+  }
+  assert.equal(await readFile(join(sessionDir, file), 'utf8'), before);
+});
+
 test('terminal views clip Korean and emoji on display columns without breaking graphemes', async () => {
   const { terminalClip, terminalWidth } = await import('../src/terminal.mjs');
   assert.equal(terminalWidth('가🙂e\u0301'), 5);

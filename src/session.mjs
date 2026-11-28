@@ -8,6 +8,7 @@ import { refreshMemory } from './memory.mjs';
 import { attachmentSize, maxAttachmentBytes, maxAttachments } from './attachments.mjs';
 import { completedWire, pruneWire } from './wire-history.mjs';
 import { latestChecks } from './repair.mjs';
+import { modelFailure } from './model-transport.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -118,6 +119,7 @@ export class Sessions {
       const profile = config.profiles[session.profile];
       const token = await tokenFor(session.profile);
       delete job.failure;
+      delete job.failureInfo;
       const answer = await runJob({ session, job, config, profile, token, signal,
         emit: event => {
           if (event.type === 'request' || event.type === 'stage') {
@@ -143,7 +145,11 @@ export class Sessions {
         this.notify(live, { type: 'note', text: 'Stopped current message. Sending the next queued message.' });
       } else {
         live.held = true;
-        if (!signal.aborted) job.failure = error.message;
+        if (!signal.aborted) {
+          const { detail, ...failureInfo } = modelFailure(error);
+          job.failure = detail;
+          if (failureInfo.phase) job.failureInfo = failureInfo;
+        }
         await this.persist(live);
         this.notify(live, { type: 'error', error: signal.aborted ? new Error('Stopped. /continue resumes, /skip removes this message.') : error });
       }

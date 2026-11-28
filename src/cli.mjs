@@ -18,9 +18,10 @@ import { conflictSummary, reviewConflicts, reviewDiff, selectedFiles } from './c
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
+import { readSession, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
+import { buildReport } from './report.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -63,6 +64,7 @@ const help = [
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
+  '  xcode report [session] [--probe] Export a private-data-free diagnostic report',
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
   '  --attach <path>     --endpoint <url>   --model <id>      --token-stdin',
@@ -1128,6 +1130,25 @@ async function chat(root, base, defaults, options, prefix) {
   }
 }
 
+async function reportCommand(root, prefix, options) {
+  if (options.only && (!options.probe || !['chat', 'sse', 'tools'].includes(options.only)))
+    throw new Error('Use --probe --only chat, sse or tools.');
+  const sessions = new Sessions(root);
+  let unreadableSessions = 0;
+  const summary = prefix ? await sessions.find(prefix) : (await sessions.list(() => { unreadableSessions++; }))[0];
+  const session = summary ? await readSession(summary.id) : null;
+  if (session && session.root !== root) throw new Error('Session is no longer available in this project.');
+  const config = await settings().catch(() => null);
+  const name = options.profile ?? session?.profile ?? config?.defaultProfile ?? 'default';
+  const profile = config ? own(config.profiles, name) : null;
+  const report = await buildReport({
+    session, state: session ? sessionStatus(session) : null, profile,
+    configuration: config ? 'readable' : 'unreadable', unreadableSessions,
+    probe: options.probe ? { only: options.only, token: () => tokenFor(name) } : null,
+  });
+  print(JSON.stringify(report, null, 2));
+}
+
 async function main() {
   const { positionals, values } = parseArgs({
     allowPositionals: true,
@@ -1135,7 +1156,7 @@ async function main() {
       cwd: { type: 'string' }, profile: { type: 'string' }, harness: { type: 'string' },
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
-      'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' },
+      'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
       thinking: { type: 'string' }, effort: { type: 'string' },
       'context-window': { type: 'string' }, 'max-tokens': { type: 'string' }, 'request-timeout': { type: 'string' },
@@ -1154,6 +1175,7 @@ async function main() {
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1]);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'settings') return print(await describeSettings(root));
+  if (command === 'report') return reportCommand(root, rest[0], values);
   if (command === 'continue') return continueMessage(root, rest[0]);
   if (command === 'draft') {
     const session = await new Sessions(root).find(rest[0] || 'latest');
