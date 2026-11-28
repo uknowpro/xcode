@@ -1733,3 +1733,21 @@ test('grouped proposals approve together and an approved change can be previewed
   await cli('redo');
   assert.equal(await readFile(join(work, 'two.txt'), 'utf8'), 'two\n');
 });
+
+test('check plans order prerequisites, resume completed results and summarize report failures', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const cli = (...args) => exec(process.execPath, [cliPath, ...args], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+  await cli('check', 'add', 'build', '--', 'node', '-e', 'require("fs").writeFileSync("ready","ok")');
+  await cli('check', 'add', 'unit', '--', 'node', '-e',
+    'const fs=require("fs"); if(!fs.existsSync("ready")) process.exit(5); fs.writeFileSync("result.json",JSON.stringify([{name:"sample",status:"failed",location:"a.js:1"}])); console.log("warning: fixture");');
+  await cli('check', 'configure', 'unit', '--after', 'build', '--report-format', 'json', '--report-file', 'result.json');
+  await cli('check', 'plan', 'unit', '--output', 'plan.json');
+  const result = JSON.parse((await cli('check', 'run-plan', 'plan.json', '--json', '--parallel', '2')).stdout);
+  assert.equal(result.results.build.status, 'passed');
+  assert.equal(result.results.unit.failures[0].test, 'sample');
+  assert.equal(result.results.unit.warnings, 1);
+  const resumed = JSON.parse((await cli('check', 'resume-plan', result.plan.id, '--json')).stdout);
+  assert.deepEqual(resumed.results, result.results);
+  assert.equal(JSON.parse((await cli('check', 'compare-plan', result.plan.id, result.plan.id)).stdout).warnings.delta, 0);
+});

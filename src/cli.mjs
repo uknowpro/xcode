@@ -38,6 +38,7 @@ import { requestedBudget, usageSummary, requestFootprint } from './model-usage.m
 import { rememberRevision, revisionOf, revisionsFor, workflowRevision } from './workflow-graph.mjs';
 import { languageKey, packageImpact, sourceHistory, treeChanges, updateSourceIndex, verifyAnchor } from './source-index.mjs';
 import { languageLocations } from './language-server.mjs';
+import { checkPlan, checkSettings, comparePlans, executeCheckPlan, repeatedCheck, savedCheckRun } from './check-plan.mjs';
 import { addReviewComment, addReviewGroup, gitChange, patchCheck, reversalFor, reviewReport, threeWay } from './review-workflow.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
@@ -118,6 +119,8 @@ const help = [
   '  xcode exclusions list|add|remove [glob]  Control workspace transmission',
   '  xcode profile credentials [name] [--backend file|keychain]',
   '  xcode check sequence <name...> [--stop-on-failure]',
+  '  xcode check configure <name> [--after name] [--report-format json|junit --report-file path] [--idle-seconds n]',
+  '  xcode check plan <names...> | run-plan <file> | resume-plan <id> | flaky <name> | compare-plan <old> <new>',
   '  xcode limits [--model-jobs <n>] [--check-jobs <n>]',
   '  xcode network                 Check local proxy and certificate settings',
   '  xcode worktrees [--json]       List separate workspace roots',
@@ -626,6 +629,43 @@ async function suggestChecks(root, session, signal) {
 }
 
 async function checkCommand(root, action, name, argv, options) {
+  if (action === 'configure') {
+    await updateSettings(config => {
+      const checks = { ...projectChecks(config, root) };
+      checks[name] = checkSettings(checks, name, options);
+      checkPlan(root, checks, [name]);
+      config.projectChecks = { ...config.projectChecks, [root]: checks };
+    });
+    return print('Configured check · ' + name);
+  }
+  if (['plan', 'run-plan', 'resume-plan', 'flaky', 'compare-plan'].includes(action)) {
+    const config = await settings();
+    const checks = projectChecks(config, root);
+    const token = await tokenFor(config.defaultProfile ?? 'default').catch(() => undefined);
+    if (action === 'compare-plan') return print(JSON.stringify(comparePlans(await savedCheckRun(root, name), await savedCheckRun(root, argv[0])), null, 2));
+    if (action === 'plan') {
+      const plan = checkPlan(root, checks, [name, ...argv].filter(Boolean));
+      const data = JSON.stringify(plan, null, 2) + '\n';
+      if (options.output) await writeFile(resolve(options.output), data, { flag: 'wx', mode: 0o600 });
+      return print(data.trimEnd());
+    }
+    const signal = new AbortController();
+    const interrupt = () => signal.abort();
+    process.once('SIGINT', interrupt);
+    try {
+      if (action === 'flaky') return print(JSON.stringify(await repeatedCheck(root, checks, name, options.repeat, signal.signal,
+        { secrets: [token] }), null, 2));
+      const plan = action === 'resume-plan' ? (await savedCheckRun(root, name)).plan :
+        JSON.parse((await loadBytes(resolve(name), 128 * 1024)).toString('utf8'));
+      const result = await executeCheckPlan(root, checks, plan, { signal: signal.signal, secrets: [token], parallel: options.parallel,
+        resume: action === 'resume-plan', logs: options.logs,
+        onEvent: event => { if (!options.json) info(event.name + ' · ' + event.type + (event.status ? ' · ' + event.status :
+          event.bytes ? ' · ' + event.bytes + ' bytes' : '')); },
+      });
+      if (Object.values(result.results).some(item => item.status !== 'passed')) process.exitCode = 1;
+      return print(JSON.stringify(result, null, 2));
+    } finally { process.off('SIGINT', interrupt); }
+  }
   if (!action || action === 'list') return print(checkList(projectChecks(await settings(), root)));
   if (action === 'suggest' || action === 'compare') {
     const sessions = new Sessions(root);
@@ -873,7 +913,7 @@ function streamSession(root, options) {
     if (options.events) {
       if (!['text', 'stage', 'tool', 'queue', 'review', 'note', 'error'].includes(event.type)) return;
       const data = event.type === 'error' ? { type: 'error', ...modelFailure(event.error) } : event;
-      print(JSON.stringify({ sessionId: live.session.id, ...data }));
+      print(JSON.stringify({ schemaVersion: 1, sessionId: live.session.id, ...data }));
       return;
     }
     if (options.json) return;
@@ -901,7 +941,7 @@ async function oneMessage(sessions, live, start, options) {
       const status = result?.error ? 'error' : result?.gate ? 'awaiting-stage' : result?.review ? 'awaiting-review' :
         result?.failedChecks?.length ? 'verification-failed' : 'complete';
       print(JSON.stringify({
-        ...(options.events ? { type: 'result' } : {}), sessionId: session.id, status, verification,
+        schemaVersion: 1, ...(options.events ? { type: 'result' } : {}), sessionId: session.id, status, verification,
         answer: result?.answer ?? null, changedPaths: evidence?.changed ?? [],
         checks: checks.map(check => ({ name: check.name, status: check.status, exitCode: check.exitCode })),
         ...(result?.review ? { reviewId: result.review.id } : {}),
@@ -2138,6 +2178,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      after: { type: 'string', multiple: true }, repeat: { type: 'string' }, parallel: { type: 'string' }, logs: { type: 'boolean' },
+      'report-format': { type: 'string' }, 'report-file': { type: 'string' }, 'idle-seconds': { type: 'string' },
       files: { type: 'string', multiple: true }, stage: { type: 'boolean' }, message: { type: 'boolean' },
       worktree: { type: 'string' }, branch: { type: 'string' },
       at: { type: 'string' }, language: { type: 'string' }, revision: { type: 'string' }, text: { type: 'string' },
