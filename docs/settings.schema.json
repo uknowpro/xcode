@@ -20,7 +20,8 @@
     "harnessRevisions": { "type": "object" },
     "languageServers": { "type": "object" },
     "readRoots": { "type": "object" },
-    "glossary": { "type": "object" }
+    "glossary": { "type": "object" },
+    "mcpHealth": { "type": "object" }
   },
   "additionalProperties": false
 }

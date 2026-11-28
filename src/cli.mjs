@@ -39,10 +39,11 @@ import { rememberRevision, revisionOf, revisionsFor, workflowRevision } from './
 import { languageKey, packageImpact, sourceHistory, treeChanges, updateSourceIndex, verifyAnchor } from './source-index.mjs';
 import { languageLocations } from './language-server.mjs';
 import { checkPlan, checkSettings, comparePlans, executeCheckPlan, repeatedCheck, savedCheckRun } from './check-plan.mjs';
+import { bindMcp } from './session-mcp.mjs';
 import { addReviewComment, addReviewGroup, gitChange, patchCheck, reversalFor, reviewReport, threeWay } from './review-workflow.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
-import { extractDocument, queryLocalDatabase } from './local-data.mjs';
+import { compareDocuments, csvRows, extractDocument, queryLocalDatabase } from './local-data.mjs';
 
 const controls = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g;
 const clean = value => String(value).replace(controls, '');
@@ -87,6 +88,8 @@ const help = [
   '  xcode harness list|show|effective|validate|eval|import|compose|export [name] [file]',
   '  xcode harness versions|restore|diff|benchmark <name> [arguments]',
   '  xcode session gate <id> <approve|skip> | replay <id> <stage>',
+  '  xcode session mcp <id> link <alias> <server> <tool> [approve|read]',
+  '  xcode session mcp <id> list|pending|approve|reject|detach [alias]',
   '  xcode search <query> [--path <dir>] [--pattern <glob>] [--regex]',
   '  xcode symbol <identifier> [--path <dir>] | --at <file:line:column>',
   '  xcode index [symbol] | lsp <language> -- <local-command...>',
@@ -97,7 +100,8 @@ const help = [
   '  xcode skills list|show|enable|disable [name]',
   '  xcode mcp add|list|tools|call|remove [name]',
   '  xcode extract <document> [--part tables|paragraphs] [--sheet <name>] [--rows <n>]',
-  '  xcode db <sqlite-file> list|table [name] [--where column=value] [--rows <n>]',
+  '  xcode document-diff <before> <after>  Compare selected document rows',
+  '  xcode db <sqlite-file> list|schema|table [name] [--columns list] [--order column:asc] [--csv]',
   '  xcode harness checks <name> [check...] [--clear]',
   '  xcode check add <name> [--in <directory>] -- <command> [args...]',
   '  xcode check suggest|compare [session]',
@@ -182,6 +186,7 @@ const chatHelp = [
   '/route <stage> <profile> [task|visible]  Select a stage model and content scope',
   '/usage, /attempts              Review request usage and timings',
   '/gate approve|skip             Decide a paused workflow stage',
+  '/mcp link|list|pending|approve|reject|detach  Control local session tools',
   '/harness revision <id|current> Pin a harness revision for this session',
   '/draft-edit <action> [line] [text]    Edit, preview dedent, undo or redo draft lines',
   'Tab after /                    Complete a chat command',
@@ -934,11 +939,11 @@ async function oneMessage(sessions, live, start, options) {
     const result = await run;
     if (options.json || options.events) {
       const session = live.session;
-      const evidence = result?.review || result?.gate || result?.error ? session.queue[0] : session.turns.at(-1);
+      const evidence = result?.review || result?.gate || result?.mcp || result?.error ? session.queue[0] : session.turns.at(-1);
       const checks = latestChecks(evidence?.checks);
       const failed = checks.filter(check => check.status !== 'passed');
       const verification = !checks.length ? 'not-run' : failed.length ? 'failed' : 'passed';
-      const status = result?.error ? 'error' : result?.gate ? 'awaiting-stage' : result?.review ? 'awaiting-review' :
+      const status = result?.error ? 'error' : result?.mcp ? 'awaiting-mcp' : result?.gate ? 'awaiting-stage' : result?.review ? 'awaiting-review' :
         result?.failedChecks?.length ? 'verification-failed' : 'complete';
       print(JSON.stringify({
         schemaVersion: 1, ...(options.events ? { type: 'result' } : {}), sessionId: session.id, status, verification,
@@ -946,6 +951,7 @@ async function oneMessage(sessions, live, start, options) {
         checks: checks.map(check => ({ name: check.name, status: check.status, exitCode: check.exitCode })),
         ...(result?.review ? { reviewId: result.review.id } : {}),
         ...(result?.gate ? { gate: result.gate } : {}),
+        ...(result?.mcp ? { mcp: result.mcp } : {}),
         ...(result?.error ? { error: modelFailure(result.error) } : {}),
       }));
     }
@@ -954,7 +960,10 @@ async function oneMessage(sessions, live, start, options) {
       if (stdout.isTTY) stdout.write('\n');
       else print(result.answer);
     }
-    if (result?.gate) {
+    if (result?.mcp) {
+      if (!options.json && !options.events) info('Local MCP approval waiting · ' + result.mcp.alias);
+      process.exitCode = 3;
+    } else if (result?.gate) {
       if (!options.json && !options.events) info('Waiting for stage approval · ' + result.gate.name);
       process.exitCode = 3;
     } else if (result?.review) {
@@ -972,16 +981,23 @@ async function oneMessage(sessions, live, start, options) {
 
 async function ask(root, base, defaults, options, prompt) {
   const config = await settings();
-  const name = defaults.profile || config.defaultProfile || 'default';
+  const saved = options.session ? await readSession((await new Sessions(root).find(options.session)).id) : null;
+  const name = defaults.profile || saved?.profile || config.defaultProfile || 'default';
   const profile = profileFor(config, name);
-  harnessFor(config, defaults.harness || 'default');
+  harnessFor(config, defaults.harness || saved?.harness || 'default');
   const attachments = await collectAttachments(root, base, profile, prompt, options.attach ?? [],
     config.transmitExclusions?.[root], await tokenFor(name));
   const sessions = streamSession(root, options);
   try {
-    const live = await sessions.select(undefined, defaults);
-    live.session.write = Boolean(options.write);
-    live.session.checks = Boolean(options.checks);
+    const live = await sessions.select(options.session, defaults);
+    if (live.session.queue.length || live.session.undoInProgress) throw new Error('Finish pending work before adding a one-shot request.');
+    if (defaults.profile) live.session.profile = defaults.profile;
+    if (defaults.harness && live.session.harness !== defaults.harness) {
+      live.session.harness = defaults.harness;
+      delete live.session.harnessRevision;
+    }
+    if (!options.session || options.write !== undefined) live.session.write = Boolean(options.write);
+    if (!options.session || options.checks !== undefined) live.session.checks = Boolean(options.checks);
     live.session.requestBudget = requestedBudget({}, options);
     if (options['response-schema']) live.session.responseSchema = JSON.parse((await loadBytes(resolve(base, options['response-schema']), 64 * 1024)).toString('utf8'));
     await oneMessage(sessions, live, () => sessions.enqueue(live, prompt, attachments), options);
@@ -996,6 +1012,7 @@ async function continueMessage(root, prefix, options) {
     const live = await sessions.select(prefix || 'latest', {});
     if (live.session.undoInProgress) throw new Error('Run xcode undo to finish the interrupted undo first.');
     if (!live.session.queue.length) throw new Error('Queue is empty.');
+    if (live.session.queue[0].mcpApproval) throw new Error('Decide the pending local tool first.');
     if (live.session.queue[0].stageGate) throw new Error('Decide the stage using xcode session gate first.');
     if (live.session.queue[0].manual) throw new Error('This message is held for manual release. Use /queue release 1 in the session.');
     if (live.session.queue[0].review) throw new Error('Show and decide the pending change set first with xcode review.');
@@ -1305,6 +1322,8 @@ async function chat(root, base, defaults, options, prefix) {
         (event.error ? ' · ' + event.error : ''));
     } else if (event.type === 'queue') {
       show(event.count + ' queued' + (live.held ? ' · /continue to send' : ''));
+    } else if (event.type === 'mcp-approval') {
+      show('Local MCP approval waiting · ' + event.alias + ' · /mcp pending to see arguments');
     } else if (event.type === 'stage-gate') {
       show('Stage awaiting approval · ' + event.name + ' · /gate approve or /gate skip');
     } else if (event.type === 'review') {
@@ -1832,6 +1851,14 @@ async function chat(root, base, defaults, options, prefix) {
         await sessions.persist(selected);
         banner();
         break;
+      case '/mcp': {
+        await sessionMcp(sessions, selected, args, show);
+        if (arg === 'approve' || arg === 'reject') {
+          selected.held = false;
+          sessions.pump(selected)?.catch(error => show(error.message));
+        }
+        break;
+      }
       case '/gate':
         await sessions.decideStage(selected, arg);
         selected.held = false;
@@ -2081,6 +2108,31 @@ async function skillCommand(root, action = 'list', name) {
     (skill.description ? ' · ' + skill.description : '')).join('\n') || 'No local skills found.';
 }
 
+async function sessionMcp(manager, live, args, output) {
+  const [action = 'list', alias, server, tool, mode] = args;
+  const { session } = live;
+  if (action === 'list') return output(JSON.stringify((session.mcpBindings ?? []).map(({ schema: _schema, signature: _signature, ...binding }) => binding), null, 2));
+  if (action === 'pending') {
+    const item = session.queue[0]?.mcpApproval;
+    if (!item) return output('No waiting MCP tool.');
+    const token = await tokenFor(session.profile).catch(() => undefined);
+    return output(redactSecrets(JSON.stringify({ alias: item.alias, server: item.server, tool: item.tool,
+      input: item.input, state: item.state }, null, 2), [token]));
+  }
+  if (action === 'approve' || action === 'reject') {
+    return output(JSON.stringify(await manager.decideMcp(live, action), null, 2));
+  }
+  if (live.active || session.queue.length) throw new Error('Finish pending work before changing tool links.');
+  const current = (session.mcpBindings ?? []).filter(item => item.alias !== alias);
+  if (action === 'link') {
+    if (current.length >= 16) throw new Error('Maximum 16 linked MCP tools.');
+    current.push(await bindMcp(await settings(), manager.root, alias, server, tool, mode));
+  } else if (action !== 'detach') throw new Error('Use link, list, pending, approve, reject or detach.');
+  session.mcpBindings = current;
+  await manager.persist(live);
+  return output('Updated session tool links.');
+}
+
 async function localMcpCommand(root, action = 'list', name, args, options) {
   const config = await settings();
   const servers = config.localMcp?.[root] ?? {};
@@ -2096,6 +2148,20 @@ async function localMcpCommand(root, action = 'list', name, args, options) {
     return print(action === 'add' ? 'Registered ' + name + '. Local processes run with your OS permissions.' : 'Removed ' + name + '.');
   }
   const argv = own(servers, name);
+  if (argv && ['probe', 'restart'].includes(action)) {
+    const clock = performance.now();
+    let result;
+    try {
+      const data = await withMcp(root, argv, mcpTools);
+      result = { status: 'ready', tools: data.tools.length };
+    } catch { result = { status: 'failed' }; process.exitCode = 1; }
+    result.durationMs = Math.round(performance.now() - clock);
+    result.at = new Date().toISOString();
+    await updateSettings(value => {
+      value.mcpHealth = { ...value.mcpHealth, [root]: { ...value.mcpHealth?.[root], [name]: result } };
+    });
+    return print(JSON.stringify(result, null, 2));
+  }
   if (!argv || !['tools', 'call'].includes(action)) throw new Error('Register the local MCP server first.');
   const result = await withMcp(root, argv, async request => {
     const list = await mcpTools(request);
@@ -2191,6 +2257,8 @@ async function main() {
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
       clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' }, patch: { type: 'boolean' },
+      heading: { type: 'string' }, table: { type: 'string' }, range: { type: 'string' }, outline: { type: 'boolean' },
+      columns: { type: 'string' }, order: { type: 'string' }, csv: { type: 'boolean' },
       input: { type: 'string' }, rows: { type: 'string' }, part: { type: 'string' }, sheet: { type: 'string' }, page: { type: 'string' },
       where: { type: 'string' }, in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
       'stop-on-failure': { type: 'boolean' }, 'include-tokens': { type: 'boolean' }, 'include-history': { type: 'boolean' },
@@ -2257,7 +2325,18 @@ async function main() {
   if (command === 'skills') return print(await skillCommand(root, rest[0], rest[1]));
   if (command === 'mcp') return localMcpCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'extract') return print(JSON.stringify(await extractDocument(root, rest[0], values), null, 2));
-  if (command === 'db') return print(JSON.stringify(await queryLocalDatabase(root, rest[0], rest[1], rest[2], values), null, 2));
+  if (command === 'document-diff') return print(JSON.stringify(await compareDocuments(root, rest[0], rest[1], values), null, 2));
+  if (command === 'db') {
+    const result = await queryLocalDatabase(root, rest[0], rest[1], rest[2], values);
+    if (values.csv) {
+      if (!result.rows) throw new Error('CSV export requires a table query.');
+      const output = csvRows(result.rows, result.columns);
+      if (values.output) await writeFile(resolve(values.output), output + '\n', { flag: 'wx', mode: 0o600 });
+      else print(output);
+      return;
+    }
+    return print(JSON.stringify(result, null, 2));
+  }
   if (command === 'exclusions') return transmissionRules(root, rest[0], rest[1]);
   if (command === 'storage') {
     if (values.clean) {
@@ -2472,7 +2551,9 @@ async function main() {
     }
     try {
       const live = await sessions.select(prefix, defaults);
-      if (action === 'gate') {
+      if (action === 'mcp') {
+        await sessionMcp(sessions, live, rest.slice(2), print);
+      } else if (action === 'gate') {
         await sessions.decideStage(live, turn);
         print('Stage decision saved. Run xcode continue to proceed.');
       } else if (action === 'replay') {

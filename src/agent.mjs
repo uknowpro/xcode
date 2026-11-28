@@ -14,6 +14,7 @@ import { tokenFor } from './store.mjs';
 import { diagnosticKey } from './model-discovery.mjs';
 import { validateAnswer } from './json-contract.mjs';
 import { revisionOf, resolveArtifact, stageApplies, WorkflowGate } from './workflow-graph.mjs';
+import { McpApproval, performMcp, prepareMcpCall } from './session-mcp.mjs';
 import { requestFootprint, requestedBudget, traceAttempt } from './model-usage.mjs';
 import { completeWireStage, startWire, wireStage } from './wire-history.mjs';
 import { checkEvidence, latestChecks, recheck, scheduleRepair, stagePlan } from './repair.mjs';
@@ -29,6 +30,9 @@ const schema = (description, properties, required = []) => ({
 const string = { type: 'string' };
 const integer = { type: 'integer' };
 const definitions = {
+  mcp_call: schema('Call one explicitly linked local MCP alias. Review-required calls wait for the user.', {
+    alias: string, input: { type: 'object' },
+  }, ['alias', 'input']),
   glob: schema('Find paths by workspace-relative glob. Use nextOffset to request another page.', {
     pattern: string, path: string, offset: integer, count: integer,
   }),
@@ -126,12 +130,19 @@ async function stageContext(session, job, harness, stage, project, skills, allow
   };
 }
 
-async function execute(project, skills, job, call, allowed, checks, signal, stageIndex, token) {
+async function execute(project, skills, job, call, allowed, checks, signal, stageIndex, token, session, config) {
   const name = call.function.name;
   if (!allowed.includes(name)) throw new Error('Tool is unavailable in this stage: ' + name);
   const args = JSON.parse(call.function.arguments || '{}');
   if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Send an object as tool arguments.');
   switch (name) {
+    case 'mcp_call': {
+      if (job.review || job.mcpApproval) throw new Error('Finish the existing approval before calling another tool.');
+      const pending = prepareMcpCall(session.mcpBindings ?? [], args);
+      if (pending.mode === 'read') return performMcp(config, session.root, pending, token);
+      job.mcpApproval = { ...pending, callId: call.id, state: 'pending' };
+      return { status: 'awaiting_mcp_approval', alias: pending.alias };
+    }
     case 'read': {
       const result = await project.read(args, signal);
       const key = result.path.includes('/') ? result.path.slice(0, result.path.lastIndexOf('/')) : '.';
@@ -247,6 +258,8 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   const skills = isolated ? new Map() : await skillsAt(session.root, signal, config.skillPolicy?.[session.root]);
   const { checks } = checksForHarness(config, session.root, job.harnessName);
   job.stageRoutes ??= isolated ? {} : session.stageRoutes ?? {};
+  job.mcpBindings ??= isolated ? [] : session.mcpBindings ?? [];
+  session = { ...session, mcpBindings: job.mcpBindings };
   session = { ...session, glossary: isolated ? undefined : config.glossary?.[session.root] };
   const budget = requestedBudget(job.budget ??= session.requestBudget ?? {});
   const policy = modelPolicy(profile);
@@ -283,7 +296,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       for (let at = 0; at < steps.length; at += 2) {
         const batch = await Promise.allSettled(steps.slice(at, at + 2).map(step => {
           const branch = { ...job, harness: { ...harness, stages: [{ ...step, parallel: undefined }] }, completed: [],
-            plan: undefined, wire: undefined, stageHistory: [], responseSchema: undefined, readPaths: [] };
+            plan: undefined, wire: undefined, stageHistory: [], responseSchema: undefined, readPaths: [], mcpBindings: [] };
           return runJob({ session: { ...session, write: false, checks: false }, job: branch, config, profile, token, signal,
             emit: event => { if (event.type !== 'text') emit(event); }, save: async () => {}, isolated });
         }));
@@ -315,8 +328,13 @@ export async function runJob({ session, job, config, profile, token, signal, emi
     const contextJob = route?.scope === 'task' ? { ...job, completed: [] } : job;
     if (routed && replay) job.wire.full = false;
     const allowed = stageTools(stage, currentProfile, session, checks);
+    if (currentProfile.tools !== false && session.mcpBindings?.length) allowed.push('mcp_call');
     const tools = allowed.map(name => {
       const tool = definitions[name];
+      if (name === 'mcp_call') return { ...tool, function: { ...tool.function, name, parameters: {
+        ...tool.function.parameters, properties: { ...tool.function.parameters.properties,
+          alias: { type: 'string', enum: session.mcpBindings.map(item => item.alias) } },
+      } } };
       return { ...tool, function: { ...tool.function, name } };
     });
     emit({ type: 'stage', stage: stage.name, index, total: stagePlan(job).length });
@@ -357,7 +375,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         try {
           stageSignal.throwIfAborted();
           if (allowed.includes(call.function.name)) emit({ type: 'tool-start', name: call.function.name });
-          result = await execute(project, skills, job, call, allowed, checks, stageSignal, index, currentToken);
+          result = await execute(project, skills, job, call, allowed, checks, stageSignal, index, currentToken, session, config);
         } catch (error) {
           result = { error: signal.aborted ? 'Stopped before this tool finished.' : error.message };
         }
@@ -383,6 +401,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       await save();
       signal.throwIfAborted();
       if (job.review) throw new ReviewRequired(job.review.id);
+      if (job.mcpApproval) throw new McpApproval();
     }
   }
   return job.completed.at(-1)?.answer;

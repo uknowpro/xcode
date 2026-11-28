@@ -13,6 +13,7 @@ import { maxDraftLength } from './draft.mjs';
 import { note, sessionTag } from './session-organize.mjs';
 import { WorkflowGate } from './workflow-graph.mjs';
 import { effectiveChange, reversalFor } from './review-workflow.mjs';
+import { McpApproval, performMcp } from './session-mcp.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -125,7 +126,7 @@ export class Sessions {
   }
 
   pump(live) {
-    if (this.closing || live.active || live.held || live.reviewing || (live.session.queue[0]?.review || live.session.queue[0]?.manual || live.session.queue[0]?.stageGate) || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
+    if (this.closing || live.active || live.held || live.reviewing || (live.session.queue[0]?.review || live.session.queue[0]?.manual || live.session.queue[0]?.stageGate || live.session.queue[0]?.mcpApproval) || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
     const controller = new AbortController();
     const active = { controller, advance: false };
     live.active = active;
@@ -170,6 +171,11 @@ export class Sessions {
       this.notify(live, { type: 'complete', answer, failedChecks });
       return { answer, failedChecks };
     } catch (error) {
+      if (error instanceof McpApproval) {
+        live.held = true;
+        this.notify(live, { type: 'mcp-approval', alias: job.mcpApproval.alias });
+        return { mcp: { alias: job.mcpApproval.alias } };
+      }
       if (error instanceof WorkflowGate) {
         job.stageGate = error.stage;
         live.held = true;
@@ -338,6 +344,32 @@ export class Sessions {
     } finally {
       live.reviewing = false;
     }
+  }
+
+  async decideMcp(live, decision) {
+    const job = live.session.queue[0];
+    const call = job?.mcpApproval;
+    if (live.active || live.reviewing || !call || !['approve', 'reject'].includes(decision))
+      throw new Error('Choose approve or reject for a waiting tool call.');
+    if (decision === 'approve' && call.state === 'calling')
+      throw new Error('The prior call may have executed. Inspect its result locally before rejecting or continuing.');
+    const item = job.stageHistory?.find(item => item.role === 'tool' && item.tool_call_id === call.callId);
+    if (!item) throw new Error('Missing checkpoint for this tool call.');
+    live.reviewing = true;
+    try {
+      let output = { status: 'rejected_by_user' };
+      if (decision === 'approve') {
+        call.state = 'calling';
+        await this.persist(live);
+        const configuration = await settings();
+        try { output = await performMcp(configuration, this.root, call, await tokenFor(live.session.profile)); }
+        catch { output = { status: 'execution_uncertain', error: 'The server did not confirm success. Check local effects.' }; }
+      }
+      item.content = JSON.stringify(output);
+      delete job.mcpApproval;
+      await this.persist(live);
+      return output;
+    } finally { live.reviewing = false; }
   }
 
   async decideStage(live, decision) {

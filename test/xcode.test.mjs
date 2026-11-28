@@ -1751,3 +1751,50 @@ test('check plans order prerequisites, resume completed results and summarize re
   assert.deepEqual(resumed.results, result.results);
   assert.equal(JSON.parse((await cli('check', 'compare-plan', result.plan.id, result.plan.id)).stdout).warnings.delta, 0);
 });
+
+test('linked session MCP validates inputs and executes an approved call once', async t => {
+  const api = await server(t, (body, res, request) => {
+    if (request === 1) return reply(res, 'Seed');
+    if (request === 2) return tool(res, 'mcp_call', '{"alias":"local","input":{"name":"fixture"}}');
+    assert.match(JSON.stringify(body.messages.at(-1)), /Tool result/);
+    return reply(res, 'Approved output');
+  });
+  const { cli, work } = await profile(t, api);
+  const script = [
+    'import { appendFileSync } from "node:fs";',
+    'import { createInterface } from "node:readline";',
+    'createInterface({input:process.stdin}).on("line", line => {',
+    ' const {id,method}=JSON.parse(line); if(id==null)return;',
+    ' const result=method==="initialize"?{protocolVersion:"2025-06-18"}:method==="tools/list"?',
+    ' {tools:[{name:"fixture",inputSchema:{type:"object",required:["name"],properties:{name:{type:"string"}}}}]}:',
+    ' (appendFileSync("calls.txt","called\\n"),{content:[{type:"text",text:"Tool result"}]});',
+    ' console.log(JSON.stringify({jsonrpc:"2.0",id,result}));',
+    '});',
+  ].join('\n');
+  await writeFile(join(work, 'fixture.mjs'), script);
+  await cli('ask', 'Start session');
+  await cli('mcp', 'add', 'fixture', '--', process.execPath, 'fixture.mjs');
+  await cli('session', 'mcp', 'latest', 'link', 'local', 'fixture', 'fixture');
+  await assert.rejects(cli('ask', 'Use tool', '--session', 'latest', '--json'), error =>
+    error.code === 3 && JSON.parse(error.stdout).status === 'awaiting-mcp');
+  await assert.rejects(readFile(join(work, 'calls.txt'), 'utf8'), { code: 'ENOENT' });
+  assert.match((await cli('session', 'mcp', 'latest', 'pending')).stdout, /fixture/);
+  await cli('session', 'mcp', 'latest', 'approve');
+  assert.equal(await readFile(join(work, 'calls.txt'), 'utf8'), 'called\n');
+  assert.match((await cli('continue')).stdout, /Approved output/);
+});
+
+test('SQLite schema and bounded table output preserve relations and CSV quoting', async t => {
+  const sqlite = await import('node:sqlite').catch(() => null);
+  if (!sqlite) return t.skip('SQLite is unavailable');
+  const { queryLocalDatabase, csvRows } = await import('../src/local-data.mjs');
+  const root = await temp(t);
+  const db = new sqlite.DatabaseSync(join(root, 'sample.sqlite'));
+  db.exec("create table tags (id integer primary key); create table notes (id integer, text text, tag_id references tags(id)); insert into tags values (1); insert into notes values (2, 'b', 1), (1, 'a,b', 1);");
+  db.close();
+  const schema = await queryLocalDatabase(root, 'sample.sqlite', 'schema', 'notes', {});
+  assert.equal(schema.tables[0].foreignKeys[0].table, 'tags');
+  const query = await queryLocalDatabase(root, 'sample.sqlite', 'table', 'notes', { columns: 'text', order: 'id:asc', rows: '1' });
+  assert.equal(query.nextOffset, 1);
+  assert.equal(csvRows(query.rows, query.columns), '"text"\n"a,b"');
+});
