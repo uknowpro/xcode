@@ -36,9 +36,9 @@ async function pack(cwd) {
   return manifest;
 }
 
-async function install(manifest) {
-  await npmRun(['install', '--offline', '--no-audit', '--ignore-scripts', '--prefix', prefix, join(scratch, manifest.filename)]);
-  const { stdout } = await cli(['--version']);
+async function install(manifest, target = prefix) {
+  await npmRun(['install', '--offline', '--no-audit', '--ignore-scripts', '--prefix', target, join(scratch, manifest.filename)]);
+  const { stdout } = await npmRun(['exec', '--offline', '--prefix', target, '--', 'xcode', '--version']);
   assert.equal(stdout.trim(), manifest.version);
 }
 
@@ -51,9 +51,7 @@ try {
   await exec('git', ['worktree', 'add', '--detach', baseline, baselineCommit]);
   worktreeAdded = true;
   const oldPackage = await pack(baseline);
-  const starting = performance.now();
   await install(oldPackage);
-  const installMs = Math.round(performance.now() - starting);
 
   endpoint = createServer(async (req, res) => {
     for await (const _chunk of req) { /* drain the request */ }
@@ -84,6 +82,9 @@ try {
   assert.match(oldSessions.stdout, /Retain this existing session/);
 
   const current = await pack(process.cwd());
+  const starting = performance.now();
+  await install(current, join(scratch, 'clean-install'));
+  const installMs = Math.round(performance.now() - starting);
   const upgrading = performance.now();
   await install(current);
   const upgradeMs = Math.round(performance.now() - upgrading);

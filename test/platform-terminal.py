@@ -1,4 +1,5 @@
 """Exercise the same draft and resize flow in each platform's real pseudoterminal."""
+import errno
 import os
 import select
 import shutil
@@ -55,23 +56,46 @@ class Terminal:
         self.tail = self.tail.split(text, 1)[1]
 
     def wait(self):
+        deadline = time.monotonic() + 20
         if os.name == "nt":
-            deadline = time.monotonic() + 20
             while self.process.isalive() and time.monotonic() < deadline:
                 time.sleep(0.03)
             if self.process.isalive():
                 raise AssertionError("Terminal did not exit after /exit")
-        elif self.process.wait(timeout=20) != 0:
+            return
+        while self.process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError(f"Terminal did not exit after /exit; last output {self.tail[-300:]!r}")
+            # Some PTYs have small output buffers and can block the final screen redraw.
+            if not select.select([self.master], [], [], min(remaining, 0.1))[0]:
+                continue
+            try:
+                chunk = os.read(self.master, 4096)
+            except OSError as error:
+                if error.errno != errno.EIO:
+                    raise
+                break
+            if not chunk:
+                break
+            self.tail = (self.tail + chunk.decode("utf-8", "replace"))[-32000:]
+        if self.process.wait(timeout=max(0.1, deadline - time.monotonic())) != 0:
             raise AssertionError("Terminal exited with an error")
 
     def close(self):
         if os.name == "nt":
             self.process.close()
         else:
-            if self.process.poll() is None:
-                self.process.terminate()
-                self.process.wait(timeout=10)
-            os.close(self.master)
+            try:
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    try:
+                        self.process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self.process.kill()
+                        self.process.wait(timeout=5)
+            finally:
+                os.close(self.master)
 
 
 def main():
