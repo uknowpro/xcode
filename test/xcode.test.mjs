@@ -1679,3 +1679,35 @@ test('workflow dependencies reject missing artifacts and forward dependencies', 
     /cyclic stage dependency/);
   assert.throws(() => validateWorkflow({ stages: [{ name: 'First', consumes: ['missing'] }] }, []), /Missing upstream artifact/);
 });
+
+test('incremental source catalogs reuse unchanged files and relocate source anchors', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const cli = (...args) => exec(process.execPath, [cliPath, ...args], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+  await writeFile(join(root, 'work.ts'), 'export function example() {}\n');
+  const first = JSON.parse((await cli('index', 'example')).stdout);
+  assert.equal(first.revised, 1);
+  assert.deepEqual(first.matches, [{ path: 'work.ts', name: 'example', line: 1 }]);
+  assert.equal(JSON.parse((await cli('index')).stdout).revised, 0);
+  await writeFile(join(root, 'work.ts'), '// inserted\nexport function example() {}\n');
+  const anchor = JSON.parse((await cli('anchor', 'work.ts', '1', '--text', 'export function example() {}')).stdout);
+  assert.deepEqual(anchor, { status: 'moved', line: 2 });
+  assert.equal(JSON.parse((await cli('index')).stdout).revised, 1);
+});
+
+test('repository maps resolve local TypeScript aliases and detect package cycles', async t => {
+  const { packageImpact } = await import('../src/source-index.mjs');
+  const root = await temp(t);
+  await mkdir(join(root, 'a'));
+  await mkdir(join(root, 'b'));
+  await writeFile(join(root, 'tsconfig.json'), JSON.stringify({ compilerOptions: { paths: { '@lib/*': ['b/*'] } } }));
+  await writeFile(join(root, 'a', 'index.ts'), "import { sample } from '@lib/index';\nexport const value = sample;");
+  await writeFile(join(root, 'b', 'index.ts'), 'export function sample() {}');
+  await writeFile(join(root, 'a', 'package.json'), '{"name":"a","dependencies":{"b":"*"}}');
+  await writeFile(join(root, 'b', 'package.json'), '{"name":"b","dependencies":{"a":"*"}}');
+  const map = await new Workspace(root).map({});
+  assert.deepEqual(map.files.find(file => file.path === 'a/index.ts').imports, ['b/index.ts']);
+  const impact = await packageImpact(root, 'a');
+  assert.deepEqual(impact.cycles, ['a → b']);
+  assert.equal(impact.affected.length, 2);
+});

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile, writeFile } from 'node:fs/promises';
+import { lstat, readFile, realpath, writeFile } from 'node:fs/promises';
 import { stdin, stdout, stderr } from 'node:process';
 import { createInterface, clearLine, clearScreenDown, cursorTo } from 'node:readline';
 import { createInterface as questions } from 'node:readline/promises';
@@ -18,7 +18,7 @@ import { appliedReviewFiles, asGitPatch, chooseHunks, conflictSummary, fileOpera
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
+import { isStatePath, readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { loadBytes, projectRoot, worktrees, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
@@ -36,6 +36,8 @@ import { randomUUID } from 'node:crypto';
 import { note, portableTurn, retentionCandidates, retentionPolicy } from './session-organize.mjs';
 import { requestedBudget, usageSummary, requestFootprint } from './model-usage.mjs';
 import { rememberRevision, revisionOf, revisionsFor, workflowRevision } from './workflow-graph.mjs';
+import { languageKey, packageImpact, sourceHistory, treeChanges, updateSourceIndex, verifyAnchor } from './source-index.mjs';
+import { languageLocations } from './language-server.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
@@ -84,7 +86,11 @@ const help = [
   '  xcode harness versions|restore|diff|benchmark <name> [arguments]',
   '  xcode session gate <id> <approve|skip> | replay <id> <stage>',
   '  xcode search <query> [--path <dir>] [--pattern <glob>] [--regex]',
-  '  xcode symbol <identifier> [--path <dir>]',
+  '  xcode symbol <identifier> [--path <dir>] | --at <file:line:column>',
+  '  xcode index [symbol] | lsp <language> -- <local-command...>',
+  '  xcode code-history <file> [--line n] | tree-diff <ref>',
+  '  xcode anchor <file> <line> [--revision ref] [--text quote]',
+  '  xcode impact [package] | references add|read|remove|list | glossary set|remove|list',
   '  xcode open <path[:line]>       Open a verified workspace file in XCODE_EDITOR',
   '  xcode skills list|show|enable|disable [name]',
   '  xcode mcp add|list|tools|call|remove [name]',
@@ -150,6 +156,7 @@ const chatHelp = [
   '/hunks <path> [number …|all]     List or select edit hunks',
   '/recovery                     Inspect files in an interrupted apply or undo',
   '/guides, /packages [path]       Show folder instructions and package dependencies',
+  '/reference <name> <path> [line]  Pin a selected excerpt from a registered directory',
   '/verification [compare|open <number>]  Inspect results, reruns or an error location',
   '/suggest-tests                 Find tests related to changed files',
   '/reject, /changes, /undo [preview] [id]  Reject, see history, or undo',
@@ -1464,6 +1471,15 @@ async function chat(root, base, defaults, options, prefix) {
       }
       case '/open': await openLocation(root, arg); break;
       case '/outgoing': await outgoing(args.join(' ')); break;
+      case '/reference': {
+        const text = await referenceExcerpt(root, arg, value, args[2]);
+        const pins = [...(session.pins ?? [])];
+        if (pins.length >= 20) throw new Error('Remove a pin before adding an excerpt.');
+        pins.push({ kind: 'file', text: text.slice(0, 400) });
+        session.pins = pins;
+        await sessions.persist(selected);
+        return show('Pinned excerpt · ' + arg + '/' + value);
+      }
       case '/pin': {
         const pins = [...(session.pins ?? [])];
         if (!arg) {
@@ -1948,6 +1964,14 @@ async function guideText(workspace, path = '.') {
     '\n' + guide.lines), ...warnings].join('\n\n') || 'No scoped AGENTS.md found.';
 }
 
+async function referenceExcerpt(root, name, path, line) {
+  const config = await settings();
+  const directory = own(config.readRoots?.[root] ?? {}, name);
+  if (!directory || !path) throw new Error('Select a registered directory and file.');
+  const result = await new Workspace(directory).read({ path, count: 6, start: line === undefined ? 1 : Number(line) });
+  return name + '/' + result.path + '\n' + result.lines;
+}
+
 const searchOptions = {
   path: { type: 'string' }, pattern: { type: 'string' }, type: { type: 'string' }, regex: { type: 'boolean' },
   offset: { type: 'string' }, line: { type: 'string' }, json: { type: 'boolean' },
@@ -2090,6 +2114,7 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      at: { type: 'string' }, language: { type: 'string' }, revision: { type: 'string' }, text: { type: 'string' },
       'usage-reporting': { type: 'string' }, 'request-budget': { type: 'string' }, 'tool-budget': { type: 'string' },
       'token-budget': { type: 'string' }, 'response-schema': { type: 'string' }, 'input-price': { type: 'string' }, 'output-price': { type: 'string' },
       days: { type: 'string' }, count: { type: 'string' }, mib: { type: 'string' }, 'trash-days': { type: 'string' },
@@ -2203,6 +2228,62 @@ async function main() {
   if (command === 'guides') return print(await guideText(new Workspace(root), rest[0] ?? values.path));
   if (command === 'packages') return print(JSON.stringify(await new Workspace(root).packages(rest[0] ?? values.path), null, 2));
   if (command === 'open') return openLocation(root, rest[0]);
+  if (command === 'index') {
+    if (rest[0] === 'lsp') {
+      const language = validName(rest[1]);
+      const command = mcpCommand(rest.slice(2));
+      await updateSettings(config => {
+        config.languageServers = { ...config.languageServers, [root]: { ...config.languageServers?.[root], [language]: command } };
+      });
+      return print('Registered language server · ' + language);
+    }
+    const index = await updateSourceIndex(root, AbortSignal.timeout(45000));
+    const symbol = rest[0];
+    return print(JSON.stringify({ scanned: index.scanned, revised: index.revised, ...(symbol ? { matches:
+      Object.entries(index.entries).flatMap(([path, value]) => value.symbols.filter(row => row.name === symbol)
+        .map(row => ({ path, ...row }))).slice(0, 100) } : {}) }, null, 2));
+  }
+  if (command === 'symbol' && values.at) {
+    const match = /^(.*):([1-9]\d*):([1-9]\d*)$/.exec(values.at);
+    if (!match) throw new Error('Use --at <file:line:column>.');
+    const language = values.language ?? languageKey(match[1]);
+    const argv = own((await settings()).languageServers?.[root] ?? {}, language);
+    if (!argv) throw new Error('Register a local language server for the selected language.');
+    return print(JSON.stringify(await languageLocations(root, argv, match[1], language, Number(match[2]), Number(match[3])), null, 2));
+  }
+  if (command === 'code-history') return print(JSON.stringify(await sourceHistory(root, rest[0], values.line), null, 2));
+  if (command === 'tree-diff') return print(JSON.stringify(await treeChanges(root, rest[0] ?? 'main'), null, 2));
+  if (command === 'impact') return print(JSON.stringify(await packageImpact(root, rest[0]), null, 2));
+  if (command === 'anchor') return print(JSON.stringify(await verifyAnchor(root, rest[0], Number(rest[1]), values.revision, values.text), null, 2));
+  if (command === 'references' || command === 'glossary') {
+    const [action = 'list', name, ...args] = rest;
+    const map = command === 'references' ? 'readRoots' : 'glossary';
+    if (action === 'read' && command === 'references') return print(await referenceExcerpt(root, name, args[0], args[1]));
+    if (action !== 'list') {
+      validName(name);
+      const remove = action === 'remove';
+      if (!remove && action !== (command === 'references' ? 'add' : 'set')) throw new Error('Unknown project mapping action.');
+      let value;
+      if (!remove) {
+        if (command === 'references') {
+          if (!args[0]) throw new Error('Provide the read-only directory path.');
+          value = await realpath(resolve(base, args[0]));
+          if (!(await lstat(value)).isDirectory() || isStatePath(value) || value === storage)
+            throw new Error('Choose a regular reference directory outside application data.');
+        } else {
+          value = note(args.join(' '), 400);
+          if (!value) throw new Error('Provide a glossary definition.');
+        }
+      }
+      await updateSettings(config => {
+        const project = { ...config[map]?.[root] };
+        if (remove) delete project[name];
+        else project[name] = value;
+        config[map] = { ...config[map], [root]: project };
+      });
+    }
+    return print(JSON.stringify((await settings())[map]?.[root] ?? {}, null, 2));
+  }
   if (command === 'search' || command === 'symbol') return print(await workspaceQuery(root, command, rest.join(' '), values));
   if (command === 'report') return reportCommand(root, rest[0], values);
   if (command === 'continue') return continueMessage(root, rest[0], values);

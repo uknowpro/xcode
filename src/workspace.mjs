@@ -3,6 +3,7 @@ import { lstat, open, readdir, realpath } from 'node:fs/promises';
 import { dirname, isAbsolute, join, matchesGlob, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { isStatePath } from './store.mjs';
+import { importTargets, typeScriptPaths } from './source-index.mjs';
 
 const exec = promisify(execFile);
 const ignored = new Set(['.git', '.xcode', 'node_modules', '.venv', '__pycache__', 'vendor', 'dist', 'build', 'coverage']);
@@ -210,7 +211,7 @@ async function inventory(root, signal) {
 }
 
 const outline = /^\s*(?:(?:export|default|public|private|protected|static|async|abstract|final)\s+)*(?:function|fn|func|def|class|interface|type|struct|enum|trait|record|module)\s+([A-Za-z_$][\w$]*)/;
-const importPath = /(?:from\s*|import\s*\(?\s*|require\(\s*)['"](\.[^'"]+)['"]/g;
+const importPath = /(?:from\s*|import\s*\(?\s*|require\(\s*)['"]([^'"]+)['"]/g;
 
 function excerpt(text, start, count) {
   const lines = text.split('\n');
@@ -396,6 +397,14 @@ export class Workspace {
     }
   }
 
+  async revision(signal) {
+    this.catalogRevision ??= exec('git', ['rev-parse', '--verify', 'HEAD'], { cwd: this.root, signal, maxBuffer: 4096 })
+      .then(result => result.stdout.trim()).catch(() => undefined);
+    const revision = await this.catalogRevision;
+    signal?.throwIfAborted();
+    return revision;
+  }
+
   async packages(path = '.', signal) {
     let directory = this.scope(path);
     if (!(await lstat(directory)).isDirectory()) directory = dirname(directory);
@@ -434,6 +443,7 @@ export class Workspace {
       .sort((a, b) => b.score - a.score || a.file.split('/').length - b.file.split('/').length || a.file.localeCompare(b.file))
       .slice(0, 240);
     const seen = new Set(sources);
+    const aliases = await typeScriptPaths(this.root, signal);
     const items = [];
     for (const { file, score } of selected) {
       signal?.throwIfAborted();
@@ -446,9 +456,10 @@ export class Workspace {
         const name = outline.exec(text)?.[1];
         if (name) symbols.push({ name, line });
         for (const match of text.matchAll(importPath)) {
-          const location = slash(relative(this.root, resolve(this.root, dirname(file), match[1])));
-          const target = [location, location.replace(/\.js$/, '.ts'), ...['.ts', '.tsx', '.js', '.mjs', '/index.ts', '/index.js']
-            .map(suffix => location + suffix)].find(candidate => seen.has(candidate));
+          const candidates = importTargets(this.root, file, match[1], aliases).map(path => slash(relative(this.root, path)));
+          const target = candidates.flatMap(location => [location, location.replace(/\.js$/, '.ts'),
+            ...['.ts', '.tsx', '.js', '.mjs', '/index.ts', '/index.js'].map(suffix => location + suffix)])
+            .find(candidate => seen.has(candidate));
           if (target && target !== file) imports.add(target);
         }
       }

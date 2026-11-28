@@ -17,7 +17,10 @@
     "localMcp": { "type": "object" },
     "sessionFilters": { "type": "object" },
     "retention": { "type": "object" },
-    "harnessRevisions": { "type": "object" }
+    "harnessRevisions": { "type": "object" },
+    "languageServers": { "type": "object" },
+    "readRoots": { "type": "object" },
+    "glossary": { "type": "object" }
   },
   "additionalProperties": false
 }
