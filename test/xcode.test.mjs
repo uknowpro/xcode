@@ -819,6 +819,29 @@ test('a failed test prompts a reviewed repair and only then repeats the original
   assert.deepEqual(checks.map(check => [check.status, Boolean(check.automatic)]), [['failed', false], ['passed', true]]);
 });
 
+test('ordered checks stop on failure and workspace transmission rules reject excluded attachments', async t => {
+  const api = await server(t, (body, res) => {
+    assert.doesNotMatch(JSON.stringify(body), /sk-abcdefghijklmnopqrstuvwxyz123456/);
+    reply(res, 'OK');
+  });
+  const { work, cli } = await profile(t, api);
+  await cli('check', 'add', 'first', '--', 'node', '-e', 'process.exit(5)');
+  await cli('check', 'add', 'second', '--', 'node', '-e', 'console.log("ran")');
+  await assert.rejects(cli('check', 'sequence', 'first', 'second', '--stop-on-failure', '--json'),
+    error => error.code === 5 && JSON.parse(error.stdout).length === 1);
+  await writeFile(join(work, 'secret.txt'), 'sk-abcdefghijklmnopqrstuvwxyz123456');
+  await cli('exclusions', 'add', 'secret.txt');
+  await assert.rejects(cli('ask', 'Read file', '--attach', 'secret.txt'), /excluded by a workspace/);
+  await cli('exclusions', 'remove', 'secret.txt');
+  await cli('ask', 'Text sample', '--attach', 'secret.txt');
+  assert.equal(api.requests.length, 1);
+  assert.match(JSON.stringify(api.requests[0].body), /redacted/);
+  const output = JSON.parse((await cli('settings', 'export')).stdout);
+  assert.equal(output.tokens, undefined);
+  assert.equal(output.conversations, undefined);
+  await assert.rejects(cli('settings', 'export', '--include-tokens'), /Choose --output/);
+});
+
 test('one-shot JSON and event streams keep verification and completion machine readable', async t => {
   const api = await server(t, (_body, res) => reply(res, 'OK'));
   const { cli } = await profile(t, api);

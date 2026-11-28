@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { stdin, stdout, stderr } from 'node:process';
 import { createInterface, clearLine, clearScreenDown, cursorTo } from 'node:readline';
 import { createInterface as questions } from 'node:readline/promises';
@@ -13,12 +13,12 @@ import { diagnose } from './diagnostic.mjs';
 import { modelFailure } from './model-transport.mjs';
 import { evaluateProfile } from './profile-eval.mjs';
 import { checkEvidence, checkLocations, compareCheckRuns, latestChecks } from './repair.mjs';
-import { defineCheck, projectChecks, runCheck } from './checks.mjs';
+import { defineCheck, projectChecks, redactSecrets, runCheck } from './checks.mjs';
 import { appliedReviewFiles, asGitPatch, chooseHunks, conflictSummary, fileOperation, inverseReview, overrideReviewFile, ownHunks, reviewConflicts, reviewDiff, reviewHunks, reviewRecovery, selectedFiles } from './changes.mjs';
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { readSession, readSessionPage, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
+import { readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { loadBytes, projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
@@ -80,7 +80,10 @@ const help = [
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] [--preview]  Inspect or reverse applied changes',
   '  xcode review edit <session> <path> <replacement-file>',
-  '  xcode settings                 Show active defaults and project checks',
+  '  xcode settings [export]        Show active defaults or export local settings',
+  '  xcode exclusions list|add|remove [glob]  Control workspace transmission',
+  '  xcode profile credentials [name] [--backend file|keychain]',
+  '  xcode check sequence <name...> [--stop-on-failure]',
   '  xcode limits [--model-jobs <n>] [--check-jobs <n>]',
   '  xcode network                 Check local proxy and certificate settings',
   '  xcode storage [--json] [--clean cache|draft|attachments|archive --session <id>]',
@@ -163,7 +166,7 @@ async function saveProfile(name, endpoint, model, token, use, options = {}) {
     if (!modelId?.trim() || modelId.length > 256) throw new Error('Enter a model ID up to 256 characters.');
     config.profiles[name] = configureModel({ ...existing, endpoint: url, model: modelId.trim() }, options);
     if (token !== undefined) {
-      await setToken(name, token);
+      await setToken(name, token, config);
       await cacheCapabilities(name).catch(() => {});
     }
     if (use || !config.defaultProfile) config.defaultProfile = name;
@@ -242,6 +245,10 @@ async function profileCommand(action, name, options) {
     return;
   }
   const profile = profileFor(config, name);
+  if (action === 'credentials') {
+    if (options.backend !== undefined) await selectCredentialBackend(name, options.backend);
+    return print('Credential storage · ' + ((await settings()).credentialBackends?.[name] ?? 'file'));
+  }
   if (action === 'show' || action === 'tune') {
     if (action === 'tune') {
       await updateSettings(value => {
@@ -533,6 +540,23 @@ async function checkCommand(root, action, name, argv, options) {
     const results = compareCheckRuns(session?.queue[0]?.checks ?? session?.turns.at(-1)?.checks ?? []);
     return print(results.join('\n') || 'No repeated checks in this turn.');
   }
+  if (action === 'sequence') {
+    const names = [name, ...argv].filter(Boolean);
+    if (!names.length) throw new Error('Provide registered check names in execution order.');
+    const config = await settings();
+    const checks = projectChecks(config, root);
+    const token = await tokenFor(config.defaultProfile ?? 'default').catch(() => undefined);
+    const results = [];
+    for (const item of names) {
+      const result = await runCheck(root, checks, item, undefined, { secrets: [token] });
+      results.push(result);
+      if (result.status !== 'passed') {
+        process.exitCode = result.exitCode || 1;
+        if (options['stop-on-failure']) break;
+      }
+    }
+    return print(options.json ? JSON.stringify(results, null, 2) : results.map(checkSummary).join('\n'));
+  }
   if (action === 'run') {
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -701,21 +725,26 @@ async function historyCommand(root, action, prefix, id, options) {
   }
 }
 
-async function collectAttachments(root, base, profile, prompt, paths) {
+async function collectAttachments(root, base, profile, prompt, paths, excludes = [], token) {
   const requests = new Map([
     ...explicitReferences(prompt).map(path => [resolve(base, path), false]),
     ...paths.map(path => [resolve(base, path), true]),
   ]);
   const results = [];
+  const workspace = new Workspace(root, excludes);
   let bytes = 1;
   for (const [path, explicit] of requests) {
+    const source = path.replace(/#L[1-9]\d*(?:-L?[1-9]\d*)?$/, '');
+    if (workspace.excluded(source)) throw new Error('Attachment is excluded by a workspace transmission rule.');
     let file;
     try {
-      file = await attach(root, path, profile, undefined, { explicit, base });
+      file = await attach(root, path, profile, undefined, { explicit, base, forbid: path => workspace.excluded(path) });
     } catch (error) {
       if (!explicit && ['ENOENT', 'ENOTDIR'].includes(error.code)) continue;
       throw error;
     }
+    file.source = source;
+    file.parts = file.parts.map(part => part.type === 'text' ? { ...part, text: redactSecrets(part.text, [token]) } : part);
     bytes += attachmentSize(file);
     if (results.length >= maxAttachments || bytes > maxAttachmentBytes)
       throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
@@ -784,9 +813,11 @@ async function oneMessage(sessions, live, start, options) {
 
 async function ask(root, base, defaults, options, prompt) {
   const config = await settings();
-  const profile = profileFor(config, defaults.profile || config.defaultProfile || 'default');
+  const name = defaults.profile || config.defaultProfile || 'default';
+  const profile = profileFor(config, name);
   harnessFor(config, defaults.harness || 'default');
-  const attachments = await collectAttachments(root, base, profile, prompt, options.attach ?? []);
+  const attachments = await collectAttachments(root, base, profile, prompt, options.attach ?? [],
+    config.transmitExclusions?.[root], await tokenFor(name));
   const sessions = streamSession(root, options);
   try {
     const live = await sessions.select(undefined, defaults);
@@ -1155,8 +1186,10 @@ async function chat(root, base, defaults, options, prefix) {
   async function send(message) {
     if (!message.trim()) throw new Error('Enter a message.');
     if (message.length > maxPrompt) throw new Error('Prompt exceeds 32,000 characters.');
-    const profile = profileFor(await settings(), selected.session.profile);
-    const prepared = await collectAttachments(root, base, profile, message, attachments);
+    const config = await settings();
+    const name = selected.session.profile;
+    const profile = profileFor(config, name);
+    const prepared = await collectAttachments(root, base, profile, message, attachments, config.transmitExclusions?.[root], await tokenFor(name));
     const { run } = await sessions.enqueue(selected, message, prepared);
     run?.catch(error => show(error.message));
     attachments = [];
@@ -1164,7 +1197,10 @@ async function chat(root, base, defaults, options, prefix) {
 
   async function outgoing(message = '') {
     const session = selected.session;
-    const profile = profileFor(await settings(), session.profile);
+    const config = await settings();
+    const profile = profileFor(config, session.profile);
+    const token = await tokenFor(session.profile);
+    const workspace = new Workspace(root, config.transmitExclusions?.[root]);
     const paths = [...new Set([...attachments, ...explicitReferences(message).map(path => resolve(base, path))])];
     const lines = [
       'Destination · ' + visibleEndpoint(profile, await tokenFor(session.profile)) + ' · ' + profile.model,
@@ -1172,9 +1208,16 @@ async function chat(root, base, defaults, options, prefix) {
       'Pinned context · ' + (session.pins?.length ?? 0) + ' items',
     ];
     for (const path of paths) {
+      const shown = redactSecrets(path, [token]);
+      if (workspace.excluded(path.replace(/#L.*$/, ''))) { lines.push('Excluded · ' + shown); continue; }
       const item = await inspectAttachment(root, path, terminalSignal.signal).catch(() => null);
-      if (item) lines.push('Attachment · ' + path);
-      else lines.push('Unresolved reference · ' + path);
+      if (!item) { lines.push('Unresolved reference · ' + shown); continue; }
+      let masked = false;
+      if (item.range || (item.bytes <= 128 * 1024 && !/\.(?:pdf|png|gif|jpe?g|webp)$/i.test(item.name))) {
+        const preview = await attach(root, path, profile, terminalSignal.signal, { explicit: true }).catch(() => null);
+        masked = Boolean(preview?.parts.some(part => part.type === 'text' && redactSecrets(part.text, [token]) !== part.text));
+      }
+      lines.push('Attachment · ' + shown + (masked ? ' · token-like text will be masked' : ''));
     }
     show(lines.join('\n'));
   }
@@ -1710,6 +1753,49 @@ async function workspaceQuery(root, action, query, options) {
   return rows.join('\n') || 'No matching source lines.';
 }
 
+async function transmissionRules(root, action, pattern) {
+  if (action === 'add' || action === 'remove') {
+    if (!pattern || pattern.length > 240 || /[\x00-\x1f\\]/.test(pattern) || pattern.startsWith('/') || pattern.split('/').includes('..'))
+      throw new Error('Provide a workspace-relative glob using forward slashes.');
+    await updateSettings(config => {
+      const rules = new Set(config.transmitExclusions?.[root] ?? []);
+      if (action === 'add') rules.add(pattern);
+      else rules.delete(pattern);
+      if (rules.size > 100) throw new Error('Maximum 100 workspace transmission rules.');
+      config.transmitExclusions = { ...config.transmitExclusions, [root]: [...rules] };
+    });
+  } else if (action && action !== 'list') throw new Error('Use xcode exclusions list, add <glob>, or remove <glob>.');
+  print(((await settings()).transmitExclusions?.[root] ?? []).join('\n') || 'No custom transmission exclusions.');
+}
+
+async function exportSettings(root, options) {
+  if ((options['include-tokens'] || options['include-history']) && !options.output)
+    throw new Error('Choose --output <new-file> when exporting tokens or conversation history.');
+  const config = await settings();
+  const report = {
+    version: 1, defaultProfile: config.defaultProfile,
+    profiles: Object.fromEntries(Object.entries(config.profiles).map(([name, profile]) => {
+      const allowed = ['endpoint', 'model', 'adapter', 'protocol', 'modelPreset', 'thinking', 'reasoningEffort',
+        'contextWindow', 'maxTokens', 'requestTimeout', 'imageInput', 'pdfInput', 'tools'];
+      return [name, Object.fromEntries(Object.entries(profile).filter(([key]) => allowed.includes(key)))];
+    })),
+    harnesses: config.harnesses, checks: projectChecks(config, root), terminal: config.terminal,
+  };
+  if (options['include-tokens']) {
+    report.tokens = Object.fromEntries(await Promise.all(Object.keys(config.profiles).map(async name => [name, await savedToken(name, config)])));
+  }
+  if (options['include-history']) {
+    report.conversations = [];
+    for (const item of await new Sessions(root).list()) {
+      const session = await readSession(item.id);
+      if (session?.root === root) report.conversations.push(sessionMarkdown(session));
+    }
+  }
+  const output = JSON.stringify(report, null, 2) + '\n';
+  if (options.output) await writeFile(resolve(options.output), output, { flag: 'wx', mode: 0o600 });
+  else print(output.trimEnd());
+}
+
 async function reportCommand(root, prefix, options) {
   if (options.only && (!options.probe || !['chat', 'sse', 'tools'].includes(options.only)))
     throw new Error('Use --probe --only chat, sse or tools.');
@@ -1742,7 +1828,8 @@ async function main() {
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
       clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' }, patch: { type: 'boolean' },
-      in: { type: 'string' }, events: { type: 'boolean' },
+      in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
+      'stop-on-failure': { type: 'boolean' }, 'include-tokens': { type: 'boolean' }, 'include-history': { type: 'boolean' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
       accessible: { type: 'boolean' }, 'no-accessible': { type: 'boolean' },
       adapter: { type: 'string' }, protocol: { type: 'string' }, preset: { type: 'string' }, against: { type: 'string' },
@@ -1772,7 +1859,8 @@ async function main() {
   if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
-  if (command === 'settings') return print(await describeSettings(root));
+  if (command === 'settings') return rest[0] === 'export' ? exportSettings(root, values) : print(await describeSettings(root));
+  if (command === 'exclusions') return transmissionRules(root, rest[0], rest[1]);
   if (command === 'storage') {
     if (values.clean) {
       if (!values.session) throw new Error('Provide --session <id> for cleanup.');

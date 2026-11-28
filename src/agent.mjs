@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { setTimeout as wait } from 'node:timers/promises';
 import { promisify } from 'node:util';
+import { resolve } from 'node:path';
 import { complete } from './model.mjs';
 import { checksForHarness, harnessFor, roleText, skillRead, skillsAt, stageTools } from './harness.mjs';
 import { userMessage } from './attachments.mjs';
@@ -208,7 +209,9 @@ export async function runJob({ session, job, config, profile, token, signal, emi
   job.harnessName ??= session.harness;
   job.harness ??= harnessFor(config, job.harnessName);
   const harness = job.harness;
-  const project = new Workspace(session.root);
+  const project = new Workspace(session.root, config.transmitExclusions?.[session.root]);
+  if (job.attachments.some(item => item.source && project.excluded(resolve(session.root, item.source))))
+    throw new Error('A queued attachment is now excluded. Discard the pending message and attach an allowed file.');
   const skills = isolated ? new Map() : await skillsAt(session.root, signal);
   const { checks } = checksForHarness(config, session.root, job.harnessName);
   const policy = modelPolicy(profile);

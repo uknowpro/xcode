@@ -1,4 +1,5 @@
 import { realpathSync } from 'node:fs';
+import { readCredential, writeCredential } from './keychain.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
@@ -21,7 +22,7 @@ const stateRoots = new Set([storage, canonicalStateRoot(storage)]);
 export function isStatePath(path) {
   for (const root of stateRoots) {
     const first = relative(root, path).split(sep)[0];
-    if (/^(?:sessions|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
+    if (/^(?:sessions|keychain|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
   }
   return false;
 }
@@ -119,16 +120,51 @@ function validToken(value) {
   return value;
 }
 
-export async function tokenFor(name) {
-  if (process.env.XCODE_API_TOKEN !== undefined) return validToken(process.env.XCODE_API_TOKEN);
+async function fileToken(name) {
   const tokens = objectValue(await readJson(join(storage, 'tokens.json'), {}), 'tokens.json');
   return Object.hasOwn(tokens, name) ? validToken(tokens[name]) : '';
 }
 
-export async function setToken(name, token) {
+export async function savedToken(name, config = null) {
+  config ??= await settings();
+  if (config.credentialBackends?.[name] !== 'keychain') return fileToken(name);
+  if (config.emptyCredentials?.[name] === true) return '';
+  return validToken(await readCredential(storage, name));
+}
+
+export async function tokenFor(name) {
+  if (process.env.XCODE_API_TOKEN !== undefined) return validToken(process.env.XCODE_API_TOKEN);
+  return savedToken(name);
+}
+
+async function setFileToken(name, token) {
   const path = join(storage, 'tokens.json');
   const tokens = objectValue(await readJson(path, {}), 'tokens.json');
   await saveJson(path, { ...tokens, [name]: validToken(token) });
+}
+
+export async function setToken(name, token, config) {
+  const value = validToken(token);
+  if (config?.credentialBackends?.[name] !== 'keychain') return setFileToken(name, value);
+  if (value) await writeCredential(storage, name, value, saveJson);
+  else await writeCredential(storage, name, '', saveJson).catch(() => {});
+  config.emptyCredentials = { ...config.emptyCredentials, [name]: !value };
+}
+
+export async function selectCredentialBackend(name, backend) {
+  if (!['file', 'keychain'].includes(backend)) throw new Error('Choose file or keychain token storage.');
+  await updateSettings(async config => {
+    const previous = config.credentialBackends?.[name] ?? 'file';
+    if (previous === backend) return;
+    const token = await savedToken(name, config);
+    config.credentialBackends = { ...config.credentialBackends, [name]: backend };
+    await setToken(name, token, config);
+  });
+  if (backend === 'keychain') {
+    await updateSettings(async config => {
+      if (config.credentialBackends?.[name] === 'keychain') await setFileToken(name, '');
+    });
+  }
 }
 
 export function sessionPath(id) {

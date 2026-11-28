@@ -54,7 +54,7 @@ export function checkKey(argv, timeout, directory) {
   return createHash('sha256').update(JSON.stringify([argv, timeout, ...(directory && directory !== '.' ? [directory] : [])])).digest('hex');
 }
 
-function scrub(value, secrets) {
+export function redactSecrets(value, secrets = []) {
   let safe = value;
   for (const secret of secrets) {
     if (typeof secret === 'string' && secret) safe = safe.replaceAll(secret, '[redacted]');
@@ -122,11 +122,11 @@ async function runRegisteredCheck(root, checks, name, signal, { secrets = [] } =
       cleanup();
       if (signal?.aborted) return reject(signal.reason);
       resolve({
-        name, command: argv.map(arg => scrub(arg, protectedValues)), commandKey: checkKey(argv, timeout, directory),
+        name, command: argv.map(arg => redactSecrets(arg, protectedValues)), commandKey: checkKey(argv, timeout, directory),
         timeout, ...(directory ? { directory } : {}), durationMs: Date.now() - started, exitCode, exitSignal,
         status: stopReason ?? (exitCode === 0 ? 'passed' : 'failed'),
-        stdout: scrub(output.stdout, protectedValues).slice(-outputLimit),
-        stderr: scrub(output.stderr, protectedValues).slice(-outputLimit),
+        stdout: redactSecrets(output.stdout, protectedValues).slice(-outputLimit),
+        stderr: redactSecrets(output.stderr, protectedValues).slice(-outputLimit),
         ...(cut.stdout || cut.stderr ? { truncated: cut } : {}),
       });
     });

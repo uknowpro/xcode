@@ -206,13 +206,16 @@ function excerpt(text, start, count) {
 }
 
 export class Workspace {
-  constructor(root) {
+  constructor(root, excludes = []) {
     this.root = root;
+    this.excludes = excludes;
     this.readCache = new Map();
   }
 
   async files(signal) {
-    this.cachedFiles ??= inventory(this.root, signal);
+    this.cachedFiles ??= inventory(this.root, signal).then(result => ({
+      ...result, files: result.files.filter(path => !this.excluded(resolve(this.root, path))),
+    }));
     try {
       return await this.cachedFiles;
     } catch (error) {
@@ -296,10 +299,16 @@ export class Workspace {
       references: matches.filter(item => !declaration.test(item.text)), truncated: search.truncated };
   }
 
+  excluded(path) {
+    const candidate = slash(relative(this.root, path));
+    return this.excludes.some(pattern => matchesGlob(candidate, pattern) ||
+      (pattern.endsWith('/**') && candidate === pattern.slice(0, -3)));
+  }
+
   scope(path = '.') {
     if (typeof path !== 'string' || path.includes('\0')) throw new Error('Invalid directory.');
     const scope = resolve(this.root, path);
-    if (!within(this.root, scope) || blocked(relative(this.root, scope)) || isStatePath(scope)) throw new Error('Scope is outside the workspace or excluded.');
+    if (!within(this.root, scope) || blocked(relative(this.root, scope)) || isStatePath(scope) || this.excluded(scope)) throw new Error('Scope is outside the workspace or excluded.');
     return scope;
   }
 
@@ -315,7 +324,7 @@ export class Workspace {
   }
 
   async read({ path, start, count }, signal) {
-    const file = await verifiedFile(this.root, path, signal);
+    const file = await verifiedFile(this.root, this.scope(path), signal);
     const { ino, size, mtimeMs, ctimeMs } = file.info;
     const revision = [ino, size, mtimeMs, ctimeMs, start, count].join(':');
     const saved = this.readCache.get(file.path);

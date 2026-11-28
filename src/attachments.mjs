@@ -42,7 +42,7 @@ function parseAttachment(input) {
   return { file: input.slice(0, marker.index), range: { first, last } };
 }
 
-async function attachmentFile(root, input, signal, { explicit = false, base = root } = {}) {
+async function attachmentFile(root, input, signal, { explicit = false, base = root, forbid } = {}) {
   const { file, range } = parseAttachment(input);
   let path;
   if (explicit) {
@@ -52,6 +52,7 @@ async function attachmentFile(root, input, signal, { explicit = false, base = ro
   } else {
     ({ path } = await verifiedFile(root, resolve(base, file), signal));
   }
+  if (forbid?.(path)) throw new Error('Attachment is excluded by a workspace transmission rule.');
   return { path, range };
 }
 
