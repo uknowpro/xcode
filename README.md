@@ -8,11 +8,11 @@ A terminal coding assistant for your local project. Connect an OpenAI-compatible
 
 Requires Node.js 22.5 or later on Linux, macOS, or Windows. Download the .tgz from [GitHub Releases](https://github.com/uknowpro/xcode/releases), then run
 
-    npm install -g ./uknowpro-xcode-0.1.6.tgz
+    npm install -g ./uknowpro-xcode-0.1.7.tgz
     xcode setup
     xcode profile test
 
-Use the same install command with a newer tarball to update. See the [installation guide](docs/install.md) for offline setup, checksums, and xcode completion. The default profile, token, and sessions stay in the existing data directory. Run npm install -g . to install from a checkout.
+Use the same install command with a newer tarball to update. See the [installation guide](docs/install.md) for offline setup, checksums, and xcode completion. The default profile, token, and sessions stay in the existing data directory. Use the [backup and recovery guide](docs/recovery.md) when downgrading. Run xcode doctor and xcode settings validate to check the local state. Run npm install -g . to install from a checkout.
 
 Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS address ending in /v1 or /chat/completions. The saved default profile applies to new sessions. Changing the URL keeps the token. The connection test reports plain chat, SSE, and tool calling separately. Use xcode profile models to check advertised model IDs and xcode profile capabilities to see saved probe results. Probe image or PDF input with --only image or --only pdf. Use xcode network to inspect NODE_EXTRA_CA_CERTS and the HTTP_PROXY / HTTPS_PROXY / NO_PROXY configuration. On Node versions that support it, start xcode with NODE_USE_ENV_PROXY=1 to use the environment proxy. Save a diagnostic report with xcode report > xcode-report.json. The report excludes endpoints, tokens, paths, and conversation content. Add --probe --only chat to test the configured connection.
 
@@ -45,7 +45,7 @@ Read-only mode is the default. /write on allows proposals, and /checks on allows
 - **Input** · /attach accepts text, images and PDFs. Use /inputs image on or /inputs pdf on for supported models. For a text-only PDF workflow, xcode can use the optional pdftotext tool.
 - **Harness** · xcode harness list shows presets for bug fixes, refactoring, API review, Terraform, Helm, and Kubernetes. Use /harness preview <name> to inspect steps or /harness <name> to switch. xcode harness import <name> <file> accepts custom JSON. Compatible SKILL.md files can be loaded from .claude/skills and .xcode/skills.
 
-File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.
+See [local integrations](docs/local-integrations.md) for skills, MCP, document extraction, SQLite and credential storage. File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.
 
 ## Automation
 

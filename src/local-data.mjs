@@ -2,7 +2,6 @@ import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { extname } from 'node:path';
 import { promisify } from 'node:util';
-import { attach } from './attachments.mjs';
 import { verifiedFile } from './workspace.mjs';
 
 const exec = promisify(execFile);
@@ -15,9 +14,24 @@ export async function extractDocument(root, path, options) {
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > 50000 || !Number.isInteger(count) || count < 1 || count > 60)
     throw new Error('Choose up to 60 rows or paragraphs and a valid offset.');
   if (kind === '.pdf') {
-    const part = (await attach(root, file.path, {})).parts[0].text;
-    const lines = part.split('\n');
-    return { rows: lines.slice(offset, offset + count), ...(offset + count < lines.length ? { nextOffset: offset + count } : {}) };
+    const requested = Number(options.page ?? 1);
+    if (!Number.isInteger(requested) || requested < 1 || requested > 10000) throw new Error('Choose a positive PDF page number.');
+    const end = options.page === undefined ? requested + 24 : requested;
+    let text;
+    try {
+      ({ stdout: text } = await exec('pdftotext', ['-layout', '-f', String(requested), '-l', String(end), file.path, '-'],
+        { encoding: 'utf8', timeout: 12000, maxBuffer: 1024 * 1024, windowsHide: true }));
+    } catch (error) {
+      if (error.code === 'ENOENT') throw new Error('Install pdftotext to extract PDF text.');
+      throw new Error('The PDF text is unavailable. Check the PDF or open it in an authorized application.');
+    }
+    let lines;
+    if (options.part === 'tables') {
+      lines = text.split('\n').map(row => row.trim().split(/[ \t]{2,}/)).filter(row => row.length > 1);
+    } else if (options.part === 'paragraphs') lines = text.split(/\n[ \t]*\n|\f/).map(row => row.trim()).filter(Boolean);
+    else lines = text.split('\n');
+    return { rows: lines.slice(offset, offset + count), page: requested,
+      ...(offset + count < lines.length ? { nextOffset: offset + count } : {}) };
   }
   if (!['.docx', '.xlsx', '.csv', '.tsv'].includes(kind)) throw new Error('Use DOCX, XLSX, CSV, TSV or PDF.');
   if (file.info.size > 64 * 1024 * 1024) throw new Error('Document exceeds the 64 MiB source limit.');

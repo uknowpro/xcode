@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "xcode local settings",
+  "type": "object",
+  "properties": {
+    "defaultProfile": { "type": "string" },
+    "profiles": { "type": "object" },
+    "harnesses": { "type": "object" },
+    "projectChecks": { "type": "object" },
+    "harnessChecks": { "type": "object" },
+    "terminal": { "type": "object" },
+    "execution": { "type": "object" },
+    "credentialBackends": { "type": "object" },
+    "emptyCredentials": { "type": "object" },
+    "transmitExclusions": { "type": "object" },
+    "skillPolicy": { "type": "object" },
+    "localMcp": { "type": "object" }
+  },
+  "additionalProperties": false
+}

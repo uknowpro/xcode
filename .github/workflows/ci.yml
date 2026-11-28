@@ -35,3 +35,37 @@ jobs:
       - name: Exercise the terminal with a PTY
         if: runner.os == 'Linux'
         run: python3 test/terminal.py
+
+  package:
+    name: Verified release assets
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - name: Package and verify the checksum
+        run: |
+          npm run package:release
+          (cd dist && sha256sum -c SHA256SUMS)
+          {
+            echo '## Release verification'
+            echo ''
+            echo '- Node.js 22 on Linux, macOS and Windows passed tests, docs, install and rollback.'
+            echo '- Linux passed the interactive PTY test.'
+            echo '- The packed archive passed SHA-256 verification.'
+            echo ''
+            echo 'Commit: `'${GITHUB_SHA}'`'
+            echo ''
+            cat dist/SHA256SUMS
+          } > dist/release-evidence.md
+          cat dist/release-evidence.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xcode-release
+          path: dist/
+          if-no-files-found: error

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,7 +17,7 @@ const workspace = join(scratch, 'workspace');
 const env = { ...process.env, npm_config_cache: join(scratch, 'cache'), XCODE_HOME: state };
 delete env.XCODE_API_TOKEN;
 // Verify installation over the preceding main version.
-const baselineCommit = 'eeb2b62e7b08465efd3220a51238399e8aa5d9e0';
+const baselineCommit = '1c60d9aaeb19730d2f5a3057b49eec29a8d07b5e';
 let worktreeAdded = false;
 let endpoint;
 
@@ -89,6 +89,25 @@ try {
   assert.equal(await readFile(sessionPath, 'utf8'), savedSession);
   assert.equal((await cli(['sessions', '--cwd', workspace])).stdout, oldSessions.stdout);
   console.log('Installed xcode ' + current.version + ' over ' + oldPackage.version + ' and preserved its profile, token and session.');
+  const legacy = JSON.parse(savedSession);
+  legacy.turns.push(...Array.from({ length: 15 }, (_, index) => ({
+    prompt: 'Recovery fixture ' + index, answer: 'Recovery answer ' + index,
+    status: 'complete', completed: [], changed: [], tools: [], checks: [], attachments: [],
+  })));
+  await writeFile(sessionPath, JSON.stringify(legacy));
+  await cli(['session', 'pin', 'latest', '--cwd', workspace]);
+  assert.ok(JSON.parse(await readFile(sessionPath, 'utf8')).olderTurns.length > 0);
+  const backup = join(scratch, 'portable-session.json');
+  await cli(['session', 'backup', 'latest', '--cwd', workspace, '--output', backup]);
+  const compatible = await readFile(backup, 'utf8');
+  assert.equal(JSON.parse(compatible).turns.length, legacy.turns.length);
+  assert.equal(JSON.parse(compatible).turns[0].prompt, legacy.turns[0].prompt);
+  await writeFile(sessionPath, compatible);
+  await install(oldPackage);
+  assert.match((await cli(['sessions', '--cwd', workspace])).stdout, /Retain this existing session/);
+  const downgraded = await cli(['profile', 'test', '--only', 'chat']);
+  assert.match(downgraded.stdout, /CHAT PASS/);
+  console.log('Downgraded to xcode ' + oldPackage.version + ' and restored its compatible session backup.');
 } finally {
   if (endpoint?.listening) {
     endpoint.closeAllConnections();

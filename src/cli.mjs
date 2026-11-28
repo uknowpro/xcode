@@ -30,6 +30,7 @@ import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntri
 import { copyClipboard, responseSelection } from './clipboard.mjs';
 import { openLocation } from './editor.mjs';
 import { shellCompletion } from './completion.mjs';
+import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
 
@@ -87,7 +88,9 @@ const help = [
   '  xcode changes [session]       List applied and undone changes',
   '  xcode undo [session] [change] [--preview]  Inspect or reverse applied changes',
   '  xcode review edit <session> <path> <replacement-file>',
-  '  xcode settings [export]        Show active defaults or export local settings',
+  '  xcode settings [validate|schema|export]  Inspect or export local configuration',
+  '  xcode doctor [--json]          Check the local runtime and data locations',
+  '  xcode session backup <id> --output <file>  Write a backward-compatible session',
   '  xcode exclusions list|add|remove [glob]  Control workspace transmission',
   '  xcode profile credentials [name] [--backend file|keychain]',
   '  xcode check sequence <name...> [--stop-on-failure]',
@@ -1882,7 +1885,7 @@ async function main() {
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
       clean: { type: 'string' }, session: { type: 'string' }, preview: { type: 'boolean' }, patch: { type: 'boolean' },
-      input: { type: 'string' }, rows: { type: 'string' }, part: { type: 'string' }, sheet: { type: 'string' },
+      input: { type: 'string' }, rows: { type: 'string' }, part: { type: 'string' }, sheet: { type: 'string' }, page: { type: 'string' },
       where: { type: 'string' }, in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
       'stop-on-failure': { type: 'boolean' }, 'include-tokens': { type: 'boolean' }, 'include-history': { type: 'boolean' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
@@ -1898,7 +1901,7 @@ async function main() {
   if (values.events && values.json) throw new Error('Choose either --events or --json.');
   if (values.version) return print(JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
   const initial = await settings().catch(() => null);
-  setLimits(initial?.execution);
+  if (!(command === 'doctor' || command === 'settings' || command === 'report' || command === 'limits')) setLimits(initial?.execution);
   if (command === 'network') return print(JSON.stringify(await networkSettings(), null, 2));
   if (command === 'limits') {
     if (values['model-jobs'] !== undefined || values['check-jobs'] !== undefined)
@@ -1921,7 +1924,24 @@ async function main() {
   if (command === 'review') return reviewCommand(root, rest[0], rest[1], rest.slice(2));
   if (command === 'changes' || command === 'undo') return historyCommand(root, command, rest[0], rest[1], values);
   if (command === 'harness') return harnessCommand(root, rest[0], rest[1], rest.slice(2), values);
-  if (command === 'settings') return rest[0] === 'export' ? exportSettings(root, values) : print(await describeSettings(root));
+  if (command === 'settings') {
+    if (rest[0] === 'export') return exportSettings(root, values);
+    if (rest[0] === 'schema') return print((await settingsSchema()).trimEnd());
+    if (rest[0] === 'validate') {
+      const issues = await validateSettings();
+      if (issues.length) process.exitCode = 1;
+      return print(values.json ? JSON.stringify({ issues }, null, 2) : issues.map(issue =>
+        issue.field + (issue.line ? ' · line ' + issue.line + (issue.column ? ':' + issue.column : '') : '') +
+        ' · ' + issue.issue).join('\n') || 'Configuration valid.');
+    }
+    return print(await describeSettings(root));
+  }
+  if (command === 'doctor') {
+    const report = await doctor(root);
+    if (report.results.some(item => item.status === 'fail')) process.exitCode = 1;
+    return print(values.json ? JSON.stringify(report, null, 2) : report.results.map(item =>
+      item.check + ' · ' + item.status + ' · ' + item.detail).join('\n'));
+  }
   if (command === 'skills') return print(await skillCommand(root, rest[0], rest[1]));
   if (command === 'mcp') return localMcpCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'extract') return print(JSON.stringify(await extractDocument(root, rest[0], values), null, 2));
@@ -1980,10 +2000,15 @@ async function main() {
   if (command === 'session') {
     const sessions = new Sessions(root);
     const [action, prefix = 'latest', turn, count] = rest;
-    if (action === 'export' || action === 'history') {
+    if (['export', 'history', 'backup'].includes(action)) {
+      if (action === 'backup' && !values.output) throw new Error('Choose --output <new-file> for a session backup.');
       const entry = await sessions.find(prefix);
-      const session = action === 'export' ? await readSession(entry.id) : await readSessionPage(entry.id, turn, count);
+      const session = action === 'history' ? await readSessionPage(entry.id, turn, count) : await readSession(entry.id);
       if (!session || session.root !== root) throw new Error('Session is no longer available in this project.');
+      if (action === 'backup') {
+        await writeFile(resolve(values.output), JSON.stringify(session, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+        return print('Wrote a backward-compatible session backup.');
+      }
       return print(action === 'export' ? sessionMarkdown(session) : formatHistoryPage(session, 'xcode session history ' + entry.id.slice(0, 8)));
     }
     try {

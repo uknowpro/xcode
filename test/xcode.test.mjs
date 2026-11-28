@@ -1390,7 +1390,12 @@ test('session listing and the recent page avoid loading a large archived transcr
     'assert.equal(main.turns.length, 12);',
     'assert.equal(main.olderTurns.length, 128);',
   ].join('\n');
-  await exec(process.execPath, ['--max-old-space-size=64', '--input-type=module', '-e', program], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+  const started = performance.now();
+  const measured = await exec(process.execPath, ['--max-old-space-size=64', '--input-type=module', '-e',
+    program + '\nconsole.log(process.resourceUsage().maxRSS);'], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+  const peak = Number(measured.stdout.trim());
+  assert.ok(peak > 0 && peak < 220 * 1024, 'Archived transcript workload peak RSS ' + peak + ' KiB');
+  t.diagnostic('Archive workload peak ' + peak + ' KiB in ' + Math.round(performance.now() - started) + ' ms');
 });
 
 test('long session history reads a bounded page without hydrating archived turns or model state', async t => {
@@ -1416,6 +1421,58 @@ test('long session history reads a bounded page without hydrating archived turns
     'assert.equal((await m.readSessionPage(id, undefined, 1)).entries[0].turn.answer, "Answer 14");',
   ].join('\n');
   await exec(process.execPath, ['--input-type=module', '-e', script], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+});
+
+test('doctor and settings validation identify malformed fields without echoing their values', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const cli = (...args) => exec(process.execPath, [cliPath, ...args], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
+  const file = join(state, 'settings.json');
+  await writeFile(file, '{\n  "private_unknown": "hidden"\n}');
+  await assert.rejects(cli('settings', 'validate', '--json'), error => {
+    const { issues } = JSON.parse(error.stdout);
+    assert.equal(issues[0].line, 2);
+    assert.doesNotMatch(error.stdout, /hidden/);
+    return error.code === 1;
+  });
+  await writeFile(file, '{\n "profiles": [INVALID]\n}');
+  await assert.rejects(cli('doctor', '--json'), error =>
+    error.code === 1 && JSON.parse(error.stdout).issues[0].line === 2 && !error.stdout.includes('INVALID'));
+});
+
+test('storage failure preserves the last session and concurrent writes remain parseable', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const module = new URL('../src/store.mjs', import.meta.url).href;
+  const program = [
+    'import assert from "node:assert/strict";',
+    'import { mkdir, readFile, writeFile } from "node:fs/promises";',
+    'import { join } from "node:path";',
+    'const store = await import(' + JSON.stringify(module) + ');',
+    'await mkdir(store.sessionsDir);',
+    'const id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";',
+    'const session = { id, root: process.cwd(), title: "Saved", updated: "2026-01-01", turns: [], queue: [] };',
+    'await store.writeSession(session);',
+    'await writeFile(join(store.sessionsDir, id + ".records"), "obstruct writes");',
+    'await assert.rejects(store.writeSession({ ...session, turns: Array.from({ length: 20 }, () => ({status:"complete"})) }));',
+    'const fs = (await import("node:fs/promises")).default;',
+    'const { syncBuiltinESMExports } = await import("node:module");',
+    'const open = fs.open;',
+    'try {',
+    '  fs.open = async () => { throw Object.assign(new Error("Storage full"), {code:"ENOSPC"}); };',
+    '  syncBuiltinESMExports();',
+    '  await assert.rejects(store.writeSession({ ...session, title: "Unsaved" }), {code:"ENOSPC"});',
+    '} finally { fs.open = open; syncBuiltinESMExports(); }',
+    'assert.equal((await store.readSession(id)).title, "Saved");',
+    'assert.deepEqual((await store.readSession(id)).turns, []);',
+    'const path = join(store.sessionsDir, "sample.json");',
+    'await Promise.all([store.saveJson(path, { a: 1 }), store.saveJson(path, { a: 2 })]);',
+    'assert.ok([1, 2].includes(JSON.parse(await readFile(path, "utf8")).a));',
+    'const unlock = await store.lock(store.sessionsDir, id);',
+    'await assert.rejects(store.lock(store.sessionsDir, id), /Already open/);',
+    'await unlock();',
+  ].join('\n');
+  await exec(process.execPath, ['--input-type=module', '-e', program], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
 });
 
 test('Git worktrees are listed separately and shell completions cover each supported shell', async t => {

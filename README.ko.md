@@ -8,11 +8,11 @@
 
 Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Releases](https://github.com/uknowpro/xcode/releases)에서 .tgz를 내려받아 실행하세요.
 
-    npm install -g ./uknowpro-xcode-0.1.6.tgz
+    npm install -g ./uknowpro-xcode-0.1.7.tgz
     xcode setup
     xcode profile test
 
-업데이트는 새 .tgz로 같은 설치 명령을 실행하면 됩니다. [설치 안내](docs/install.md)에서 운영체제별 명령, 오프라인 설치, 체크섬 및 xcode completion 사용법을 확인하세요. 기존 모델 프로필, 토큰, 세션을 이어서 사용합니다. 소스에서 설치할 때는 npm install -g .을 사용합니다.
+업데이트는 새 .tgz로 같은 설치 명령을 실행하면 됩니다. [설치 안내](docs/install.md)에서 운영체제별 명령, 오프라인 설치, 체크섬 및 xcode completion 사용법을 확인하세요. 기존 모델 프로필, 토큰, 세션을 이어서 사용합니다. 이전 버전으로 돌아갈 때는 [백업과 복구 안내](docs/recovery.md)를 참고하세요. xcode doctor와 xcode settings validate로 환경과 설정을 점검할 수 있습니다. 소스에서 설치할 때는 npm install -g .을 사용합니다.
 
 **API 주소, 모델 ID, 토큰**을 입력합니다. 로컬과 원격의 HTTP·HTTPS 주소를 쓸 수 있습니다. /v1 또는 /chat/completions 주소를 사용하세요. 기본 프로필은 새 세션에 적용되며 주소 변경 시 토큰은 유지됩니다. 연결 진단은 일반 채팅, SSE, 함수 호출을 구분해서 표시합니다. xcode report > xcode-report.json으로 API 주소·토큰·경로·대화 내용을 제외한 진단 리포트를 저장할 수 있습니다. --probe --only chat을 추가하면 실제 연결을 검사합니다.
 
@@ -45,7 +45,7 @@ Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Rele
 - **입력** · /attach로 텍스트·이미지·PDF를 첨부합니다. 지원 모델에서 /inputs image on과 /inputs pdf on을 사용하세요. PDF 텍스트는 pdftotext가 설치된 경우 로컬에서 추출할 수 있습니다.
 - **하네스** · xcode harness list에서 버그 수정, 리팩터링, API 리뷰, Terraform, Helm, Kubernetes 프리셋을 확인합니다. /harness preview <이름>은 미리보기, /harness <이름>은 전환입니다. 커스텀 JSON과 .claude/skills, .xcode/skills의 호환 스킬도 사용할 수 있습니다.
 
-파일 검색은 로컬에서 실행합니다. 선택된 파일 구간, 첨부, 허용된 테스트의 출력은 설정한 모델 주소로 전송됩니다. npm test와 npm run test:install로 검증합니다.
+스킬·MCP·문서 추출·SQLite·자격 증명은 [로컬 연동 안내](docs/local-integrations.md)를 참고하세요. 파일 검색은 로컬에서 실행합니다. 선택된 파일 구간, 첨부, 허용된 테스트의 출력은 설정한 모델 주소로 전송됩니다. npm test와 npm run test:install로 검증합니다.
 
 ## 모델 프로필
 
