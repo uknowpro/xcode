@@ -25,6 +25,7 @@ class Model(BaseHTTPRequestHandler):
             return
         last = data["messages"][-1]
         if last["role"] == "user":
+            time.sleep(0.2)
             assert "read this file" in last["content"][0]["text"]
             assert "fixture source" in last["content"][1]["text"]
             args = {"changes": [
@@ -128,7 +129,9 @@ def smoke(scratch, endpoint):
         chat.expect(b"Draft restored")
         chat.expect(b"create two files")
         chat.send(b"\r/send\r")
+        chat.expect(b"Generating")
         chat.expect(b"/diff to review")
+        chat.expect(b"Review pending \xc2\xb7 \xe2\x80\xba ")
         chat.send(b"/diff\r")
         chat.expect(b"Tab Files")
         chat.send(b"\t")

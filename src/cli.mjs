@@ -562,9 +562,24 @@ async function chat(root, base, defaults, options, prefix) {
       clearLine(stdout, 0);
     }
   }
+  function statusLabel() {
+    const active = selected?.active;
+    if (active?.controller.signal.aborted) return 'Stopping';
+    if (active?.tool === 'run_check') return 'Running check';
+    if (active?.tool) return 'Tool · ' + active.tool.replaceAll('_', ' ');
+    if (active) return active.stage ? 'Generating · ' + active.stage : 'Starting request';
+    const pending = selected?.session.queue[0];
+    if (pending?.review) return 'Review pending';
+    if (pending?.failure) return 'Request failed';
+    if (pending && selected.held) return 'Queue paused';
+    if (selected?.session.turns.at(-1)?.verificationFailed) return 'Verification failed';
+    return '';
+  }
   function prompt() {
     if (closed || streamOpen || rendering || pager) return;
-    rl.setPrompt(paste ? '│ ' : selected?.active ? '… › ' : '› ');
+    const width = Math.min(42, (stdout.columns || 80) - 12);
+    const status = terminalClip(statusLabel(), width);
+    rl.setPrompt((status ? status + ' · ' : '') + (paste ? '│ ' : '› '));
     rl.prompt(true);
     if (restoredLine) {
       const text = restoredLine;
@@ -723,8 +738,8 @@ async function chat(root, base, defaults, options, prefix) {
       clearPrompt();
       stdout.write(clean(event.text));
       streamOpen = true;
-    } else if (event.type === 'stage' && event.total > 1) {
-      show('[' + (event.index + 1) + '/' + event.total + '] ' + event.stage);
+    } else if (event.type === 'stage' || event.type === 'request' || event.type === 'tool-start') {
+      endStream();
     } else if (event.type === 'tool') {
       show('  · ' + event.name + (event.path ? ' ' + event.path : '') + (event.summary ? ' · ' + event.summary : '') +
         (event.error ? ' · ' + event.error : ''));

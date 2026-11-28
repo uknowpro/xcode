@@ -119,7 +119,15 @@ export class Sessions {
       const token = await tokenFor(session.profile);
       delete job.failure;
       const answer = await runJob({ session, job, config, profile, token, signal,
-        emit: event => this.notify(live, event), save: () => this.persist(live) });
+        emit: event => {
+          if (event.type === 'request' || event.type === 'stage') {
+            active.stage = event.stage;
+            active.tool = undefined;
+          } else if (event.type === 'tool-start') {
+            active.tool = event.name;
+          }
+          this.notify(live, event);
+        }, save: () => this.persist(live) });
       const failedChecks = latestChecks(job.checks).filter(check => check.status !== 'passed').map(check => check.name);
       await this.finish(live, job, answer, 'complete', failedChecks);
       this.notify(live, { type: 'complete', answer, failedChecks });

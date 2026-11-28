@@ -216,6 +216,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
     for (let round = (job.stageHistory?.filter(message => message.role === 'assistant').length ?? 0); round < 16; round++) {
       const wire = replay ? wireStage(session, job, policy, stage) : null;
       const messages = [...context(wire), ...(job.stageHistory ?? [])];
+      emit({ type: 'request', stage: stage.name });
       const message = await request(requestProfile, token, messages, tools, session, signal,
         event => emit({ ...event, intermediate: index < stagePlan(job).length - 1 }));
       if (!message.tool_calls?.length) {
@@ -237,6 +238,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         let result;
         try {
           signal.throwIfAborted();
+          if (allowed.includes(call.function.name)) emit({ type: 'tool-start', name: call.function.name });
           result = await execute(project, skills, job, call, allowed, checks, signal, index, token);
         } catch (error) {
           result = { error: signal.aborted ? 'Stopped before this tool finished.' : error.message };
