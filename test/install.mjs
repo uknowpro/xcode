@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { promisify } from 'node:util';
 
 const exec = promisify(execFile);
@@ -17,7 +18,7 @@ const workspace = join(scratch, 'workspace');
 const env = { ...process.env, npm_config_cache: join(scratch, 'cache'), XCODE_HOME: state };
 delete env.XCODE_API_TOKEN;
 // Verify installation over the preceding main version.
-const baselineCommit = '1c60d9aaeb19730d2f5a3057b49eec29a8d07b5e';
+const baselineCommit = '67679a1e6d038a3417587f1a6c1b1aedc5c8b391';
 let worktreeAdded = false;
 let endpoint;
 
@@ -50,7 +51,9 @@ try {
   await exec('git', ['worktree', 'add', '--detach', baseline, baselineCommit]);
   worktreeAdded = true;
   const oldPackage = await pack(baseline);
+  const starting = performance.now();
   await install(oldPackage);
+  const installMs = Math.round(performance.now() - starting);
 
   endpoint = createServer(async (req, res) => {
     for await (const _chunk of req) { /* drain the request */ }
@@ -81,7 +84,9 @@ try {
   assert.match(oldSessions.stdout, /Retain this existing session/);
 
   const current = await pack(process.cwd());
+  const upgrading = performance.now();
   await install(current);
+  const upgradeMs = Math.round(performance.now() - upgrading);
   const diagnostic = await cli(['profile', 'test', '--only', 'chat']);
   assert.match(diagnostic.stdout, /CHAT PASS/);
   assert.equal(await readFile(tokenFile, 'utf8'), savedTokens);
@@ -107,6 +112,9 @@ try {
   assert.match((await cli(['sessions', '--cwd', workspace])).stdout, /Retain this existing session/);
   const downgraded = await cli(['profile', 'test', '--only', 'chat']);
   assert.match(downgraded.stdout, /CHAT PASS/);
+  if (process.env.XCODE_INSTALL_REPORT) await writeFile(process.env.XCODE_INSTALL_REPORT, JSON.stringify({
+    installMs, upgradeMs, installPassed: true, upgradePassed: true, rollbackPassed: true,
+  }, null, 2) + '\n');
   console.log('Downgraded to xcode ' + oldPackage.version + ' and restored its compatible session backup.');
 } finally {
   if (endpoint?.listening) {

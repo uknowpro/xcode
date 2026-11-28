@@ -1,7 +1,7 @@
 import { realpathSync } from 'node:fs';
 import { readCredential, writeCredential } from './keychain.mjs';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 
@@ -22,7 +22,7 @@ const stateRoots = new Set([storage, canonicalStateRoot(storage)]);
 export function isStatePath(path) {
   for (const root of stateRoots) {
     const first = relative(root, path).split(sep)[0];
-    if (/^(?:sessions|keychain|indexes|check-plans|audit|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
+    if (/^(?:sessions|keychain|indexes|check-plans|audit|snapshots|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
   }
   return false;
 }
@@ -80,6 +80,30 @@ export async function lock(directory, name) {
   }
   await file.close();
   return () => rm(path, { force: true });
+}
+
+export async function recoverSessionLock(id, root) {
+  const record = await readSessionRecord(id);
+  if (!record || record.root !== root) throw new Error('Session is not in this workspace.');
+  const path = sessionPath(id).replace(/\.json$/, '.lock');
+  const unlock = await lock(sessionsDir, id + '-unlock');
+  try {
+    const old = await lstat(path).catch(missing);
+    if (!old) return { recovered: false, status: 'unlocked' };
+    if (!old.isFile() || old.size > 100) throw new Error('Unrecognized session lock.');
+    const owner = Number((await readFile(path, 'utf8')).trim());
+    if (!Number.isSafeInteger(owner) || owner < 1) throw new Error('Session lock has no verifiable owner.');
+    try {
+      process.kill(owner, 0);
+      throw new Error('The session lock owner is still alive.');
+    } catch (error) {
+      if (error.code !== 'ESRCH') throw error;
+    }
+    const latest = await lstat(path).catch(missing);
+    if (!latest || recordKey(old) !== recordKey(latest)) throw new Error('The lock changed during verification.');
+    await rm(path);
+    return { recovered: true, status: 'stale-lock-removed' };
+  } finally { await unlock(); }
 }
 
 function objectValue(value, label) {
@@ -256,6 +280,114 @@ export async function pruneUnusedSessionRecords(id) {
     count++;
   }
   return count;
+}
+
+export async function verifySessionRecords(id, root, repair) {
+  let record;
+  try { record = await readSessionRecord(id); }
+  catch { return { status: 'damaged-header', issues: ['Session metadata could not be read. Restore a snapshot.'] }; }
+  if (!record || record.root !== root) throw new Error('Session is not in this workspace.');
+  const unlock = repair ? await lock(sessionsDir, id) : async () => {};
+  try {
+    if (repair) record = await readSessionRecord(id);
+    const damaged = [], issues = [];
+    const inspect = async (ref, kind, index, valid, fix) => {
+      try {
+        if (valid(await readRecord(id, ref))) return;
+      } catch { /* The record is missing, unavailable or malformed. */ }
+      issues.push({ kind, turn: index + 1 });
+      if (repair) {
+        if (isReference(ref)) damaged.push(ref);
+        await fix();
+      }
+    };
+    for (const [index, ref] of (record.olderTurns ?? []).entries()) {
+      await inspect(ref, 'archived-turn', index, value => value && typeof value.prompt === 'string', async () => {
+        const placeholder = { status: 'stopped', prompt: 'Recovered archived turn', answer: 'The original archived turn is unavailable.',
+          tools: [], checks: [], changed: [], attachments: [] };
+        record.olderTurns[index] = await saveRecord(archivedRefs, id, placeholder, placeholder);
+      });
+    }
+    for (const [index, row] of record.turns.entries()) {
+      if (row?.wireRef !== undefined) await inspect(row.wireRef, 'replay', (record.olderTurns?.length ?? 0) + index,
+        value => value && typeof value.scope === 'string' && Array.isArray(value.messages), async () => { delete row.wireRef; });
+    }
+    if (repair && issues.length) {
+      await writeSession(record, { separated: true });
+      const retained = new Set([...(record.olderTurns ?? []), ...record.turns.map(row => row?.wireRef)]);
+      for (const ref of new Set(damaged)) if (!retained.has(ref)) {
+        const path = join(recordsDir(id), ref + '.json');
+        await rename(path, path + '.damaged').catch(error => { if (error.code !== 'ENOENT') throw error; });
+      }
+    }
+    return { status: issues.length ? repair ? 'repaired' : 'damaged-records' : 'valid', issues };
+  } finally { await unlock(); }
+}
+
+const snapshotFolder = id => {
+  if (!isReference(id)) throw new Error('Invalid snapshot session ID.');
+  return join(storage, 'snapshots', id);
+};
+const snapshotNames = async id => (await readdir(snapshotFolder(id)).catch(error => {
+  if (error.code === 'ENOENT') return [];
+  throw error;
+})).filter(name => /^\d{13}$/.test(name)).sort();
+
+export async function storeSnapshot(id, config) {
+  if (!Number.isInteger(config?.minutes) || config.minutes < 1 || !Number.isInteger(config.count) || config.count < 1) return;
+  const existing = await snapshotNames(id);
+  const now = Date.now();
+  if (existing.length && now - Number(existing.at(-1)) < config.minutes * 60000) return;
+  const record = await readSessionRecord(id);
+  if (!record) return;
+  const parent = snapshotFolder(id);
+  const label = String(now);
+  const pending = join(parent, label + '.' + randomUUID() + '.tmp');
+  await mkdir(pending, { recursive: true, mode: 0o700 });
+  try {
+    await copyFile(sessionPath(id), join(pending, 'session.json'));
+    for (const ref of new Set([...(record.olderTurns ?? []), ...record.turns.map(row => row?.wireRef).filter(isReference)]))
+      await copyFile(join(recordsDir(id), ref + '.json'), join(pending, ref + '.json'));
+    for (const [from, to] of [[join(storage, 'settings.json'), 'settings.json'],
+      [sessionPath(id).replace(/\.json$/, '.draft.json'), 'draft.json']]) {
+      await copyFile(from, join(pending, to)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    }
+    await rename(pending, join(parent, label));
+    const snapshots = await snapshotNames(id);
+    for (const stale of snapshots.slice(0, Math.max(0, snapshots.length - Math.min(20, config.count))))
+      await rm(join(parent, stale), { force: true, recursive: true });
+  } finally { await rm(pending, { force: true, recursive: true }); }
+}
+
+export async function snapshotsFor(id, root) {
+  const record = await readSessionRecord(id).catch(() => null);
+  const entries = await snapshotNames(id);
+  if (record?.root === root) return entries;
+  const latest = entries.at(-1);
+  if (!latest || (await readJson(join(snapshotFolder(id), latest, 'session.json'), null))?.root !== root)
+    throw new Error('Session snapshots are not in this workspace.');
+  return entries;
+}
+
+export async function readSnapshot(id, root, label) {
+  if (!(await snapshotsFor(id, root)).includes(label)) throw new Error('Snapshot is unavailable.');
+  const folder = join(snapshotFolder(id), label);
+  const saved = await readJson(join(folder, 'session.json'), null);
+  if (!saved || saved.root !== root) throw new Error('Snapshot belongs to another workspace.');
+  const { olderTurns = [], ...record } = saved;
+  const turns = [];
+  const read = ref => {
+    if (!isReference(ref)) throw new Error('Invalid snapshot record reference.');
+    return readJson(join(folder, ref + '.json'), null);
+  };
+  for (const ref of olderTurns) turns.push(await read(ref));
+  for (const { wireRef, ...row } of record.turns) {
+    if (wireRef) row.wire = await read(wireRef);
+    turns.push(row);
+  }
+  const draft = await readJson(join(folder, 'draft.json'), null);
+  const configuration = await readJson(join(folder, 'settings.json'), null);
+  return { session: { ...record, turns }, draft, configuration };
 }
 
 export async function readSessionPage(id, before, count = 8) {

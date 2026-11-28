@@ -37,6 +37,10 @@ export function failed(status, detail = '', phase) {
   if (status === 401 || status === 403) phase = 'auth';
   if (status === 429 || status === 402 || /quota|insufficient.{0,20}(?:credit|balance)|resource.exhausted|rate.limit|usage.{0,20}(?:limit|exceed)|billing/i.test(detail))
     return new ModelError('Model rate or usage limit reached' + (status ? ' (HTTP ' + status + ')' : '') + '.', { status, phase });
+  if ((status === 400 || status === 413 || status === 422) &&
+    /context_length_exceeded|context.{0,30}(?:length|window|limit).{0,35}(?:exceed|too (?:long|large))|maximum context length|too many (?:input )?tokens/i.test(detail))
+    return new ModelError('The request exceeded the model context limit. Use xcode session fit to start a smaller draft.',
+      { status, phase, code: 'CONTEXT_LIMIT' });
   const explanation = {
     400: /reasoning_content|(?:thinking|reasoning).{0,50}(?:unsupported|required|invalid|not supported)/i.test(detail)
       ? 'The server rejected reasoning settings or conversation state. Run the profile tool probe and check the serving backend.'
@@ -92,7 +96,7 @@ async function responseText(response, limit, truncate = false) {
 }
 
 
-export async function fetchModel(url, headers, payload, signal, headerTimeout) {
+export async function fetchModel(url, headers, payload, signal, headerTimeout, onResponse = () => {}) {
   const body = JSON.stringify(payload);
   if (Buffer.byteLength(body) > 24 * 1024 * 1024) throw new ModelError('Model request exceeds 24 MiB.', { phase: 'request' });
   const controller = headerTimeout ? new AbortController() : null;
@@ -103,6 +107,7 @@ export async function fetchModel(url, headers, payload, signal, headerTimeout) {
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream, application/json', ...headers },
     body,
   }).catch(error => { throw networkError(error, attempt); }).finally(() => clearTimeout(clock));
+  onResponse(response);
   if (!response.ok) {
     const detail = await responseText(response, 4096, true).catch(() => '');
     if (signal?.aborted) throw networkError(signal.reason, signal, 'http');

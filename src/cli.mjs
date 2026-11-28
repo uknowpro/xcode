@@ -18,7 +18,7 @@ import { appliedReviewFiles, asGitPatch, chooseHunks, conflictSummary, fileOpera
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { isStatePath, pruneUnusedSessionRecords, readSession, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
+import { isStatePath, pruneUnusedSessionRecords, readSession, readSnapshot, recoverSessionLock, snapshotsFor, verifySessionRecords, readSessionPage, savedToken, selectCredentialBackend, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { loadBytes, projectRoot, worktrees, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
@@ -31,6 +31,7 @@ import { copyClipboard, responseSelection } from './clipboard.mjs';
 import { openLocation } from './editor.mjs';
 import { shellCompletion } from './completion.mjs';
 import { answerRows, matchingAnswers } from './answer-view.mjs';
+import { answerViewport, sessionViewport } from './terminal-render.mjs';
 import { DraftEdits, keyBindings } from './draft-edits.mjs';
 import { randomUUID } from 'node:crypto';
 import { note, portableTurn, retentionCandidates, retentionPolicy } from './session-organize.mjs';
@@ -136,7 +137,9 @@ const help = [
   '  xcode report [session] [--probe] Export a private-data-free diagnostic report',
   '  xcode policy list|allow-profile|deny-profile|rule|offline|preview|audit [arguments]',
   '  xcode profile rotate <name> --token-stdin  Test a replacement token before saving',
-  '  xcode session scrub-replay|check-allow <id> [checks...]',
+  '  xcode session scrub-replay|check-allow|unlock|integrity <id> [--repair]',
+  '  xcode snapshots configure --minutes n --count n | list <id> | restore <id> <stamp>',
+  '  xcode logs [generation]       Read a bounded view of rotated operational logs',
   '  xcode session backup <id> --output file [--encrypted --password-stdin]',
   '',
   '  --cwd <directory>   --profile <name>   --harness <name>   --write   --checks',
@@ -941,7 +944,7 @@ async function collectAttachments(root, base, profile, prompt, paths, excludes =
 function streamSession(root, options) {
   return new Sessions(root, (live, event) => {
     if (options.events) {
-      if (!['text', 'stage', 'tool', 'queue', 'review', 'note', 'error'].includes(event.type)) return;
+      if (!['text', 'stage', 'tool', 'queue', 'review', 'note', 'error', 'footprint'].includes(event.type)) return;
       const data = event.type === 'error' ? { type: 'error', ...modelFailure(event.error) } : event;
       print(JSON.stringify({ schemaVersion: 1, sessionId: live.session.id, ...data }));
       return;
@@ -1139,42 +1142,18 @@ async function chat(root, base, defaults, options, prefix) {
   function drawSessions() {
     const rowCount = Math.max(1, (stdout.rows || 24) - 5);
     const width = Math.max(1, (stdout.columns || 80) - 1);
-    pager.offset = Math.max(0, Math.min(pager.offset, pager.focus));
-    if (pager.focus >= pager.offset + rowCount) pager.offset = pager.focus - rowCount + 1;
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
-    print(terminalClip('Sessions · ' + pager.rows.length + (pager.query ? ' · ' + pager.query : '') +
-      (pager.unreadable ? ' · ' + pager.unreadable + ' unreadable' : ''), width));
-    for (const [index, row] of pager.rows.slice(pager.offset, pager.offset + rowCount).entries()) {
-      const pointer = index + pager.offset === pager.focus ? '› ' : '  ';
-      const line = pointer + (row.id === selected.session.id ? '* ' : '  ') + row.text;
-      print(terminalClip(line, width));
-    }
-    print(terminalClip('↑/↓ Select session · Enter Switch · Esc Close', width));
+    for (const row of sessionViewport(pager, selected.session.id, width, rowCount)) print(row);
   }
-
   function answerPage(move = 0) {
     clearTimeout(redraw);
     redraw = undefined;
     const width = Math.max(6, (stdout.columns || 80) - 1);
     const height = Math.max(1, (stdout.rows || 24) - 4);
-    const text = pager.live ? liveAnswer : pager.answer;
-    const { rows, outline } = answerRows(text, width, pager.numbered);
-    pager.outline = outline;
-    pager.rowCount = rows.length;
-    const last = Math.max(0, rows.length - height);
-    if (pager.target !== undefined) {
-      pager.offset = Math.max(0, rows.findIndex(row => row.source >= pager.target));
-      pager.target = undefined;
-    }
-    pager.offset = pager.follow ? last : Math.max(0, Math.min(last, pager.offset + move));
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
-    print(terminalClip((pager.live ? 'Live response' : 'Response · turn ' + pager.turn) +
-      (pager.live && !pager.follow ? ' · ' + Math.max(0, rows.length - (pager.seen ?? rows.length)) + ' new lines' : '') +
-      (pager.hits ? ' · match ' + (pager.hit + 1) + '/' + pager.hits.length : ''), width));
-    for (const row of rows.slice(pager.offset, pager.offset + height)) print(row.text);
-    print(terminalClip('↑/↓ Scroll · Tab Outline · n/p Match · l Numbers · End Follow · Esc Close', width));
+    for (const row of answerViewport(pager, pager.live ? liveAnswer : pager.answer, width, height, move)) print(row);
   }
 
   function drawReview(move = 0) {
@@ -2353,6 +2332,7 @@ async function main() {
       heading: { type: 'string' }, table: { type: 'string' }, range: { type: 'string' }, outline: { type: 'boolean' },
       columns: { type: 'string' }, order: { type: 'string' }, csv: { type: 'boolean' },
       input: { type: 'string' }, rows: { type: 'string' }, part: { type: 'string' }, sheet: { type: 'string' }, page: { type: 'string' },
+      repair: { type: 'boolean' }, minutes: { type: 'string' },
       encrypted: { type: 'boolean' }, 'password-stdin': { type: 'boolean' },
       where: { type: 'string' }, in: { type: 'string' }, events: { type: 'boolean' }, backend: { type: 'string' }, output: { type: 'string' },
       'stop-on-failure': { type: 'boolean' }, 'include-tokens': { type: 'boolean' }, 'include-history': { type: 'boolean' },
@@ -2422,6 +2402,42 @@ async function main() {
       item.check + ' · ' + item.status + ' · ' + item.detail).join('\n'));
   }
   if (command === 'skills') return print(await skillCommand(root, rest[0], rest[1]));
+  if (command === 'logs') return print(JSON.stringify(await recentAudit(root, Number(rest[0] ?? 0)), null, 2));
+  if (command === 'snapshots') {
+    const [action, id, label] = rest;
+    if (action === 'configure') {
+      const minutes = Number(values.minutes), count = Number(values.count);
+      if (!Number.isSafeInteger(minutes) || minutes < 0 || minutes > 10080 || !Number.isSafeInteger(count) || count < 1 || count > 20)
+        throw new Error('Choose 0–10,080 minutes and 1–20 snapshots.');
+      await updateSettings(config => {
+        config.snapshots = { ...config.snapshots, [root]: { minutes, count } };
+      });
+      return print(minutes ? 'Automatic snapshots enabled for this workspace.' : 'Automatic snapshots disabled.');
+    }
+    const manager = new Sessions(root);
+    const resolved = /^[0-9a-f-]{36}$/.test(id ?? '') ? id : (await manager.find(id ?? 'latest')).id;
+    if (action === 'list') return print(JSON.stringify(await snapshotsFor(resolved, root), null, 2));
+    if (action === 'config') {
+      const { configuration } = await readSnapshot(resolved, root, label);
+      return print(JSON.stringify(configuration ?? null, null, 2));
+    }
+    if (action !== 'restore') throw new Error('Use configure, list or restore.');
+    const { session, draft } = await readSnapshot(resolved, root, label);
+    const newId = randomUUID();
+    const portable = session.turns.flatMap((turn, index) => {
+      const item = portableTurn(turn, { id: resolved, turn: index + 1 });
+      return item ? [item] : [];
+    });
+    try {
+      const queue = session.queue.filter(item => typeof item.prompt === 'string').map(item => ({
+        prompt: item.prompt, attachments: item.attachments ?? [], completed: [], changed: [], tools: [], manual: true,
+      }));
+      await manager.openSession({ id: newId, root, title: ('Restored · ' + session.title).slice(0, 120), customTitle: true,
+        profile: session.profile, harness: session.harness, turns: portable, queue, write: false, checks: false, retrySeconds: 0 });
+      if (draft) await writeDraft(newId, draft);
+      return print(newId);
+    } finally { await manager.close(); }
+  }
   if (command === 'policy') return workspacePolicy(root, rest[0], rest.slice(1), values);
   if (command === 'mcp') return localMcpCommand(root, rest[0], rest[1], rest.slice(2), values);
   if (command === 'extract') return print(JSON.stringify(await extractDocument(root, rest[0], values), null, 2));
@@ -2602,6 +2618,12 @@ async function main() {
   if (command === 'session') {
     const sessions = new Sessions(root);
     const [action, prefix = 'latest', turn, count] = rest;
+    if (action === 'unlock' || action === 'integrity') {
+      const id = /^[0-9a-f-]{36}$/.test(prefix) ? prefix : (await sessions.find(prefix)).id;
+      const result = action === 'unlock' ? await recoverSessionLock(id, root) : await verifySessionRecords(id, root, values.repair);
+      if (result.status?.startsWith('damaged')) process.exitCode = 1;
+      return print(JSON.stringify(result, null, 2));
+    }
     if (action === 'combine' || action === 'import') {
       const turns = [];
       let title = 'Combined conversation';
@@ -2672,14 +2694,17 @@ async function main() {
         await sessions.decideStage(live, turn);
         print('Stage decision saved. Run xcode continue to proceed.');
       } else if (action === 'replay') {
-        const last = live.session.turns.at(-1);
-        const harness = last?.harness;
+        const pending = live.session.queue[0];
+        const source = pending?.harness ? pending : live.session.turns.at(-1);
+        const harness = source?.harness;
         const at = harness?.stages.findIndex(stage => stage.name === turn) ?? -1;
-        if (at < 0) throw new Error('Select a stage from the latest completed workflow.');
-        const fork = await sessions.fork(live, live.session.turns.length - 1, { visibleOnly: true });
+        if (at < 0 || at > (source.completed?.length ?? 0)) throw new Error('Select a reached stage from the latest workflow.');
+        const count = source === pending ? live.session.turns.length : live.session.turns.length - 1;
+        const fork = await sessions.fork(live, count, { visibleOnly: true });
         const artifacts = Object.fromEntries(harness.stages.slice(0, at).flatMap(stage =>
-          stage.artifact && Object.hasOwn(last.artifacts ?? {}, stage.artifact.name) ? [[stage.artifact.name, last.artifacts[stage.artifact.name]]] : []));
-        fork.session.queue.push({ prompt: last.prompt, attachments: [], completed: last.completed.slice(0, at), changed: [],
+          stage.artifact && Object.hasOwn(source.artifacts ?? {}, stage.artifact.name) ? [[stage.artifact.name, source.artifacts[stage.artifact.name]]] : []));
+        fork.session.queue.push({ prompt: source.prompt, attachments: source === pending ? source.attachments : [],
+          completed: source.completed.slice(0, at), changed: [],
           tools: [], checks: [], artifacts, harness, stageRoutes: {} });
         fork.held = true;
         await sessions.persist(fork);

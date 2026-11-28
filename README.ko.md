@@ -8,7 +8,7 @@
 
 Linux, macOS, Windows에서 Node.js 22.5 이상이 필요합니다. [GitHub Releases](https://github.com/uknowpro/xcode/releases)에서 .tgz를 내려받아 실행하세요.
 
-    npm install -g ./uknowpro-xcode-0.1.7.tgz
+    npm install -g ./uknowpro-xcode-0.1.8.tgz
     xcode setup
     xcode profile test
 
@@ -70,3 +70,5 @@ Qwen3.6·Kimi K3는 xcode profile tune <이름> --preset coding으로 모델별 
 동일한 모델과 주소를 쓰는 두 설정을 임시 프로젝트로 평가합니다. 파일 탐색, 도구 호출, 재개, 테스트, 경로·줄 번호 인용, 소요 시간을 확인합니다. profile eval과 profile test에 --json을 붙이면 결과를 JSON으로 받을 수 있습니다.
 
 검토 화면에서 Tab으로 Diff·Files·Tests를 전환합니다. Files에서 방향키와 Space로 적용할 파일을 고르세요. 선택은 검토에 저장됩니다. 화면을 닫은 뒤 /apply를 실행하세요. implement와 bug-fix 하네스에서 실패한 등록 테스트는 수정안을 최대 두 번 제안합니다. 수정안을 승인하면 같은 테스트를 다시 실행하고 /verification에서 이전 결과와 함께 확인합니다.
+
+[고급 사용법](docs/advanced-workflows.md)

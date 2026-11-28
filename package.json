@@ -1,6 +1,6 @@
 {
   "name": "@uknowpro/xcode",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "A terminal coding assistant for your own model endpoint",
   "type": "module",
   "bin": {
@@ -19,6 +19,8 @@
     "test": "node test/xcode.test.mjs",
     "test:install": "node test/install.mjs",
     "test:docs": "node scripts/check-docs.mjs",
-    "package:release": "node scripts/package-release.mjs"
+    "package:release": "node scripts/package-release.mjs",
+    "benchmark:workspace": "node scripts/bench-workspace.mjs",
+    "compare:release": "node scripts/compare-release.mjs"
   }
 }

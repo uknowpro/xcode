@@ -57,9 +57,10 @@ async function completeRequest(profile, token, messages, { tools = [], stream = 
     headers: token ? { Authorization: 'Bearer ' + token } : {},
     payload: { model: profile.model, messages, stream, ...(stream && profile.usageReporting === 'on' ? { stream_options: { include_usage: true } } : {}), ...(tools.length ? { tools } : {}), ...requestOptions(policy) },
   };
-  const response = await fetchModel(url, request.headers, request.payload, signal, policy.headerTimeout);
-  const requestId = response.headers.get('x-request-id') ?? response.headers.get('request-id');
-  if (requestId && /^[A-Za-z0-9_.:-]{1,100}$/.test(requestId) && !(token && requestId.includes(token))) onMeta({ requestId });
+  const response = await fetchModel(url, request.headers, request.payload, signal, policy.headerTimeout, ({ headers }) => {
+    const requestId = headers.get('x-request-id') ?? headers.get('request-id');
+    if (requestId && /^[A-Za-z0-9_.:-]{1,100}$/.test(requestId) && !(token && requestId.includes(token))) onMeta({ requestId });
+  });
   const sse = response.headers.get('content-type')?.includes('text/event-stream');
   onFormat(sse ? 'sse' : 'json');
   const onFrame = part => {

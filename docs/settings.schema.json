@@ -22,7 +22,8 @@
     "readRoots": { "type": "object" },
     "glossary": { "type": "object" },
     "mcpHealth": { "type": "object" },
-    "dataPolicy": { "type": "object" }
+    "dataPolicy": { "type": "object" },
+    "snapshots": { "type": "object" }
   },
   "additionalProperties": false
 }

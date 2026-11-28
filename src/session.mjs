@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
-import { lock, sessionsDir, listSessions, readSession, settings, tokenFor, writeSession } from './store.mjs';
+import { lock, sessionsDir, listSessions, readSession, settings, storeSnapshot, tokenFor, writeSession } from './store.mjs';
 import { runJob } from './agent.mjs';
 import { appliedReviewFiles, applyReview, inverseReview, ReviewRequired } from './changes.mjs';
 import { Workspace } from './workspace.mjs';
@@ -64,7 +64,7 @@ export class Sessions {
         if (!session || session.root !== this.root) throw new Error('Session is no longer available in this project.');
       }
       session.memory = refreshMemory(session);
-      const live = { session, unlock, active: null, held: Boolean(session.queue.length), writes: Promise.resolve() };
+      const live = { session, unlock, snapshotPolicy: (await settings()).snapshots?.[this.root], active: null, held: Boolean(session.queue.length), writes: Promise.resolve() };
       this.open.set(session.id, live);
       await this.persist(live);
       return live;
@@ -97,7 +97,11 @@ export class Sessions {
     // Finished turns are replaced as a list. Queue, review and check state remain mutable.
     const { turns, ...mutable } = live.session;
     const value = { ...structuredClone(mutable), turns };
-    live.writes = live.writes.catch(() => {}).then(() => writeSession(value));
+    live.writes = live.writes.catch(() => {}).then(async () => {
+      await writeSession(value);
+      if (live.snapshotPolicy && (value.turns.length || value.queue.length))
+        await storeSnapshot(value.id, live.snapshotPolicy).catch(() => {});
+    });
     return live.writes;
   }
 

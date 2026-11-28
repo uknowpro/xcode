@@ -67,6 +67,7 @@ export async function treeChanges(root, base) {
 }
 
 export async function verifyAnchor(root, path, line, revision, text) {
+  if (!Number.isSafeInteger(line) || line < 1) throw new Error('Choose a positive source line.');
   const file = await verifiedFile(root, path);
   const current = (await readText(root, path)).split(/\r?\n/);
   if (!text && revision) {

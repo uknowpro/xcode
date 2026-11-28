@@ -213,7 +213,7 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
   }
 }
 
-async function request(profile, token, messages, tools, session, signal, emit, job, budget, footprint) {
+async function request(profile, token, messages, tools, session, signal, emit, job, budget, footprint, execution) {
   const policy = modelPolicy(profile);
   const timeout = policy.requestTimeout * 1000;
   let fallbackUsed = false;
@@ -223,7 +223,9 @@ async function request(profile, token, messages, tools, session, signal, emit, j
     const run = async stream => {
       if (budget.requests && (job.usage?.requests ?? 0) >= budget.requests) throw new Error('Request budget exhausted.');
       const spent = Object.values(job.usage?.models ?? {}).reduce((sum, item) => sum + item.input + item.output + item.estimated, 0);
-      if (budget.tokens && spent + footprint.tokens > budget.tokens) throw new Error('Token budget exhausted before the next request.');
+      if (budget.tokens && spent + execution.inFlightTokens + footprint.tokens > budget.tokens)
+        throw new Error('Token budget exhausted before the next request.');
+      execution.inFlightTokens += footprint.tokens;
       const finish = traceAttempt(job, profile.model, footprint.tokens);
       const meta = {};
       emit({ type: 'attempt' });
@@ -239,6 +241,8 @@ async function request(profile, token, messages, tools, session, signal, emit, j
       } catch (error) {
         finish(meta, error);
         throw error;
+      } finally {
+        execution.inFlightTokens -= footprint.tokens;
       }
     };
     try {
@@ -264,7 +268,7 @@ async function request(profile, token, messages, tools, session, signal, emit, j
   }
 }
 
-export async function runJob({ session, job, config, profile, token, signal, emit, save, isolated = false }) {
+export async function runJob({ session, job, config, profile, token, signal, emit, save, isolated = false, execution = { toolCount: job.tools.length, inFlightTokens: 0 } }) {
   job.harnessName ??= session.harness;
   if (!job.harness) job.harness = revisionOf(config, job.harnessName, harnessFor(config, job.harnessName), session.harnessRevision);
   const harness = job.harness;
@@ -307,6 +311,8 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       await save();
       continue;
     }
+    const missingArtifact = stage.consumes?.find(name => !Object.hasOwn(job.artifacts ?? {}, name));
+    if (missingArtifact) throw new Error('Required upstream artifact is unavailable: ' + missingArtifact);
     if (stage.parallel) {
       const steps = [];
       for (let at = index; stagePlan(job)[at]?.parallel === stage.parallel; at++) {
@@ -320,7 +326,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
           const branch = { ...job, harness: { ...harness, stages: [{ ...step, parallel: undefined }] }, completed: [],
             plan: undefined, wire: undefined, stageHistory: [], responseSchema: undefined, readPaths: [], mcpBindings: [] };
           return runJob({ session: { ...session, write: false, checks: false }, job: branch, config, profile, token, signal,
-            emit: event => { if (event.type !== 'text') emit(event); }, save: async () => {}, isolated });
+            emit: event => { if (event.type !== 'text') emit(event); }, save: async () => {}, isolated, execution });
         }));
         const failed = batch.find(item => item.status === 'rejected');
         if (failed) throw failed.reason;
@@ -371,7 +377,7 @@ export async function runJob({ session, job, config, profile, token, signal, emi
       if (isolated) emit({ type: 'request-size', bytes: footprint.bytes });
       emit({ type: 'footprint', ...footprint });
       const message = await request(currentProfile, currentToken, messages, tools, session, stageSignal,
-        event => emit({ ...event, intermediate: index < stagePlan(job).length - 1 }), job, budget, footprint);
+        event => emit({ ...event, intermediate: index < stagePlan(job).length - 1 }), job, budget, footprint, execution);
       if (!message.tool_calls?.length) {
         if (job.responseSchema !== undefined && index === stagePlan(job).length - 1) validateAnswer(job.responseSchema, message.content);
         const artifact = resolveArtifact(stage, message.content);
@@ -385,11 +391,12 @@ export async function runJob({ session, job, config, profile, token, signal, emi
         else if (repair) emit({ type: 'note', text: 'Preparing repair ' + repair.attempt + ' for ' + repair.names.join(', ') + '.' });
         break;
       }
-      if (budget.tools && job.tools.length + message.tool_calls.length > budget.tools) throw new Error('Tool call budget exhausted.');
+      if (budget.tools && execution.toolCount + message.tool_calls.length > budget.tools) throw new Error('Tool call budget exhausted.');
       if (stage.maxTools && job.tools.filter(item => item.stage === stage.name).length + message.tool_calls.length > stage.maxTools)
         throw new Error('Tool call limit exhausted in ' + stage.name + '.');
       if (message.tool_calls.length > 12) throw new Error('Model issued too many tools in one request.');
       if (round === 15) throw new Error('Tool round limit reached. Narrow the request or start a new message.');
+      execution.toolCount += message.tool_calls.length;
       job.stageHistory ??= [];
       const results = [];
       for (const call of message.tool_calls) {

@@ -108,9 +108,8 @@ async function runRegisteredCheck(root, checks, name, signal, { secrets = [], lo
         if (written + length > 20 * 1024 * 1024) { logTruncated = true; return; }
         written += length;
         if (!log.write(rendered)) {
+          paused.add(key);
           child[key].pause();
-          log.once('drain', () => child[key].resume());
-          log.once('error', () => child[key].resume());
         }
       }
       if (collected[key].length > 65536) {
@@ -118,7 +117,13 @@ async function runRegisteredCheck(root, checks, name, signal, { secrets = [], lo
         collected[key] = '';
       }
     }
-    log?.on('error', () => { logFailed = true; });
+    const paused = new Set();
+    const resume = () => {
+      for (const key of paused) child[key].resume();
+      paused.clear();
+    };
+    log?.on('drain', resume);
+    log?.on('error', () => { logFailed = true; resume(); });
     let stopReason, force;
     const idle = idleSeconds ? setTimeout(() => stop('idle timeout'), idleSeconds * 1000) : undefined;
     function stop(reason) {

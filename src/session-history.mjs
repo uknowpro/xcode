@@ -12,9 +12,17 @@ export function historyText(turns, before, count) {
   return formatHistoryPage(historyPage(turns, before, count));
 }
 
+function originLine(turn) {
+  const id = turn.source?.id;
+  const number = turn.source?.turn;
+  return typeof id === 'string' && /^[0-9a-f-]{36}$/i.test(id) && Number.isSafeInteger(number) && number > 0
+    ? 'Source: xcode session history ' + id + ' ' + (number + 1) + ' 1'
+    : '';
+}
+
 export function formatHistoryPage(page, prefix = '/history') {
   const entries = page.entries.map(({ turn, number }) => '#' + number + ' · ' + turn.status +
-    '\n> ' + turn.prompt + '\n' + (turn.answer || turn.partial?.text || '[' + turn.status + ']'));
+    (originLine(turn) ? '\n' + originLine(turn) : '') + '\n> ' + turn.prompt + '\n' + (turn.answer || turn.partial?.text || '[' + turn.status + ']'));
   if (page.nextBefore) entries.push('Earlier turns · ' + prefix + ' ' + page.nextBefore);
   return entries.join('\n\n') || 'No earlier responses.';
 }
@@ -24,6 +32,7 @@ export function sessionMarkdown(session) {
   for (const [index, turn] of session.turns.entries()) {
     lines.push('## Turn ' + (index + 1), '### Request', turn.prompt ?? '',
       '### Response', turn.answer || turn.partial?.text || '[' + turn.status + ']');
+    if (originLine(turn)) lines.push(originLine(turn));
     if (turn.changed?.length) lines.push('### Changed files', ...turn.changed.map(path => '- ' + path));
     if (turn.checks?.length) lines.push('### Checks', ...turn.checks.map(check => '- ' + check.name + ' · ' + check.status));
   }

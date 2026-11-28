@@ -248,7 +248,7 @@ export class Workspace {
     }
   }
 
-  async search({ query, pattern = '**', path = '.', offset = 0, start = 1 }, signal) {
+  async search({ query, pattern = '**', path = '.', offset = 0, start = 1, onMatch }, signal) {
     if (typeof query !== 'string' || !query.trim() || query.length > 300) throw new Error('Enter a search string up to 300 characters.');
     if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(start) || start < 1)
       throw new Error('Search offsets must be nonnegative with a positive starting line.');
@@ -272,7 +272,9 @@ export class Workspace {
         const entry = lines[line - 1];
         const column = entry.toLowerCase().indexOf(needle);
         if (column < 0) continue;
-        matches.push({ path: file, line, text: entry.trimEnd().slice(Math.max(0, column - 80), column + 240) });
+        const match = { path: file, line, text: entry.trimEnd().slice(Math.max(0, column - 80), column + 240) };
+        matches.push(match);
+        onMatch?.(match);
         if (matches.length === 60) {
           next = line < lines.length ? { offset: index, start: line + 1 } :
             index + 1 < selected.length ? { offset: index + 1, start: 1 } : undefined;

@@ -1,10 +1,10 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes, scrypt } from 'node:crypto';
-import { appendFile, mkdir, open } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, open, rename, rm } from 'node:fs/promises';
 import { dirname, join, matchesGlob, relative } from 'node:path';
 import { promisify } from 'node:util';
 import { modelEndpoint, modelPolicy } from './model-profile.mjs';
 import { redactSecrets } from './checks.mjs';
-import { storage } from './store.mjs';
+import { lock, storage } from './store.mjs';
 
 const derive = promisify(scrypt);
 const auditPath = root => join(storage, 'audit', createHash('sha256').update(root).digest('hex') + '.jsonl');
@@ -42,11 +42,22 @@ export function inspectTransfer(policy, root, path, content, token) {
 export async function audit(root, event) {
   const path = auditPath(root);
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  await appendFile(path, JSON.stringify({ time: new Date().toISOString(), ...event }) + '\n', { mode: 0o600 });
+  let release;
+  try { release = await lock(dirname(path), createHash('sha256').update(root).digest('hex')); }
+  catch { return; }
+  try {
+    if ((await lstat(path).catch(() => null))?.size > 1024 * 1024) {
+      await rm(path + '.2', { force: true });
+      await rename(path + '.1', path + '.2').catch(error => { if (error.code !== 'ENOENT') throw error; });
+      await rename(path, path + '.1');
+    }
+    await appendFile(path, JSON.stringify({ time: new Date().toISOString(), ...event }) + '\n', { mode: 0o600 });
+  } finally { await release(); }
 }
 
-export async function recentAudit(root) {
-  const file = await open(auditPath(root), 'r').catch(error => {
+export async function recentAudit(root, generation = 0) {
+  if (!Number.isInteger(generation) || generation < 0 || generation > 2) throw new Error('Log generation must be 0, 1 or 2.');
+  const file = await open(auditPath(root) + (generation ? '.' + generation : ''), 'r').catch(error => {
     if (error.code === 'ENOENT') return null;
     throw error;
   });

@@ -8,7 +8,7 @@ A terminal coding assistant for your local project. Connect an OpenAI-compatible
 
 Requires Node.js 22.5 or later on Linux, macOS, or Windows. Download the .tgz from [GitHub Releases](https://github.com/uknowpro/xcode/releases), then run
 
-    npm install -g ./uknowpro-xcode-0.1.7.tgz
+    npm install -g ./uknowpro-xcode-0.1.8.tgz
     xcode setup
     xcode profile test
 
@@ -46,6 +46,8 @@ Read-only mode is the default. /write on allows proposals, and /checks on allows
 - **Harness** · xcode harness list shows presets for bug fixes, refactoring, API review, Terraform, Helm, and Kubernetes. Use /harness preview <name> to inspect steps or /harness <name> to switch. xcode harness import <name> <file> accepts custom JSON. Compatible SKILL.md files can be loaded from .claude/skills and .xcode/skills.
 
 See [local integrations](docs/local-integrations.md) for skills, MCP, document extraction, SQLite and credential storage. File search runs locally. Selected file excerpts, attachments, and outputs from enabled project checks are sent to the configured model endpoint. Run npm test and npm run test:install for verification.
+
+[advanced workflows](docs/advanced-workflows.md)
 
 ## Automation
 

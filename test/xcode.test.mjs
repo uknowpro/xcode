@@ -1603,7 +1603,9 @@ test('session organization saves tag filters, turn links and recoverable trash',
   const link = (await cli('session', 'link', 'latest', '1')).stdout.trim();
   const id = link.split(' ')[3];
   const combined = (await cli('session', 'combine', id + ':1')).stdout.trim();
-  assert.match((await cli('session', 'export', combined)).stdout, /First issue/);
+  const exported = (await cli('session', 'export', combined)).stdout;
+  assert.match(exported, /First issue/);
+  assert.ok(exported.includes('Source: ' + link));
   await cli('session', 'trash', id);
   assert.match((await cli('sessions', '--status', 'trash')).stdout, /First issue/);
   assert.doesNotMatch((await cli('sessions', '@work')).stdout, /First issue/);
@@ -1623,20 +1625,31 @@ test('explicit queue holds do not start model work while state is paused', async
 });
 
 test('provider usage distinguishes cached input, traces requests and validates answer contracts', async t => {
-  const api = await server(t, (_body, res) => {
+  const api = await server(t, (_body, res, request) => {
+    if (request > 1) {
+      res.setHeader('x-request-id', 'rejected-2');
+      res.writeHead(400).end(JSON.stringify({ error: { code: 'context_length_exceeded' } }));
+      return;
+    }
     res.setHeader('x-request-id', 'usage-1');
     res.end(JSON.stringify({ choices: [{ message: { content: '{"answer":1}' } }],
       usage: { prompt_tokens: 120, completion_tokens: 8, prompt_tokens_details: { cached_tokens: 70 } } }));
   });
   const { cli, work } = await profile(t, api);
   await writeFile(join(work, 'answer.json'), JSON.stringify({ type: 'object', required: ['answer'], properties: { answer: { type: 'integer' } } }));
-  await cli('ask', 'Output JSON', '--response-schema', 'answer.json');
+  const result = await cli('ask', 'Output JSON', '--response-schema', 'answer.json', '--events');
+  const footprint = result.stdout.trim().split('\n').map(line => JSON.parse(line)).find(event => event.type === 'footprint');
+  assert.ok(footprint.bytes > 0 && footprint.tokens > 0);
   const usage = JSON.parse((await cli('usage', 'latest', '--input-price', '2')).stdout);
   assert.equal(usage.fixture.input, 120);
   assert.equal(usage.fixture.uncached, 50);
   assert.equal(usage.fixture.output, 8);
   const [attempt] = JSON.parse((await cli('attempts')).stdout);
   assert.equal(attempt.requestId, 'usage-1');
+  await assert.rejects(cli('ask', 'Larger prompt'), /session fit/);
+  const [rejected] = JSON.parse((await cli('attempts')).stdout);
+  assert.equal(rejected.requestId, 'rejected-2');
+  assert.equal(rejected.status, 'failed');
 });
 
 test('request budgets stop additional model calls before sending', async t => {
@@ -1664,8 +1677,14 @@ test('workflow stages gate execution, pass validated artifacts and preserve revi
   await assert.rejects(cli('ask', 'Check the flow', '--harness', 'gate-flow', '--json'), error =>
     error.code === 3 && JSON.parse(error.stdout).status === 'awaiting-stage');
   assert.equal(api.requests.length, 1);
-  await cli('session', 'gate', 'latest', 'approve');
-  assert.match((await cli('continue')).stdout, /Reviewed artifact/);
+  const original = (await cli('session', 'link', 'latest', '1')).stdout.trim().split(' ')[3];
+  const replay = (await cli('session', 'replay', original, 'Report')).stdout.trim();
+  await assert.rejects(cli('continue', replay, '--json'), error =>
+    error.code === 3 && JSON.parse(error.stdout).status === 'awaiting-stage');
+  await cli('session', 'gate', replay, 'approve');
+  assert.match((await cli('continue', replay)).stdout, /Reviewed artifact/);
+  await cli('session', 'gate', original, 'approve');
+  assert.match((await cli('continue', original)).stdout, /Reviewed artifact/);
   harness.stages[1].instruction = 'Include one detail';
   await writeFile(join(work, 'workflow.json'), JSON.stringify(harness));
   await cli('harness', 'import', 'gate-flow', 'workflow.json');
@@ -1828,4 +1847,58 @@ test('encrypted session backups authenticate both the passphrase and the content
   const tag = Buffer.from(envelope.tag, 'base64');
   tag[0] ^= 1;
   await assert.rejects(decryptBackup({ ...envelope, tag: tag.toString('base64') }, 'fixture passphrase'), /backup is damaged/);
+});
+
+test('session integrity repairs only damaged replay and can recover an inactive lock', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Saved response'));
+  const { cli, state } = await profile(t, api);
+  await cli('snapshots', 'configure', '--minutes', '1', '--count', '3');
+  await cli('ask', 'Snapshot input');
+  const directory = join(state, 'sessions');
+  const [name] = (await readdir(directory)).filter(file => /^[0-9a-f-]{36}\.json$/.test(file));
+  const id = name.slice(0, -5);
+  const file = join(directory, name);
+  const record = JSON.parse(await readFile(file, 'utf8'));
+  record.turns[0].wireRef = '01234567-0123-0123-0123-012345678901';
+  await mkdir(join(directory, id + '.records'), { recursive: true });
+  const broken = join(directory, id + '.records', record.turns[0].wireRef + '.json');
+  await writeFile(broken, 'invalid fixture');
+  await writeFile(file, JSON.stringify(record));
+  await assert.rejects(cli('session', 'integrity', id), error => error.code === 1 &&
+    JSON.parse(error.stdout).issues[0].kind === 'replay');
+  assert.equal(JSON.parse((await cli('session', 'integrity', id, '--repair')).stdout).status, 'repaired');
+  assert.match((await cli('session', 'history', id)).stdout, /Saved response/);
+  assert.equal(await readFile(broken + '.damaged', 'utf8'), 'invalid fixture');
+  const child = spawn(process.execPath, ['-e', '']);
+  await new Promise(resolve => child.on('exit', resolve));
+  await writeFile(join(directory, id + '.lock'), String(child.pid));
+  assert.equal(JSON.parse((await cli('session', 'unlock', id)).stdout).recovered, true);
+  const [stamp] = JSON.parse((await cli('snapshots', 'list', id)).stdout);
+  const restored = (await cli('snapshots', 'restore', id, stamp)).stdout.trim();
+  assert.match((await cli('sessions', 'Restored')).stdout, new RegExp(restored.slice(0, 8)));
+});
+
+test('aborting model streams and registered checks terminates the connection and process tree', async t => {
+  const controller = new AbortController();
+  let closed;
+  const connection = new Promise(resolve => { closed = resolve; });
+  const api = await server(t, (_body, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' });
+    res.on('close', closed);
+    res.write('data: {"choices":[{"delta":{"content":"first"}}]}\n\n');
+  });
+  await assert.rejects(complete({ endpoint: api.url, model: 'fixture' }, '', [{ role: 'user', content: 'Stop' }], {
+    signal: controller.signal, onText: () => controller.abort(),
+  }), { name: 'AbortError' });
+  await Promise.race([connection, delay(3000).then(() => assert.fail('Model transport remained open'))]);
+  const { defineCheck, runCheck } = await import('../src/checks.mjs');
+  const root = await temp(t);
+  const command = 'const {spawn}=require("node:child_process"); spawn(process.execPath,["-e",\'setTimeout(()=>require("fs").writeFileSync("late","bad"),2500)\'],{stdio:"inherit"}); console.log("ready"); setInterval(()=>{},1000);';
+  const stop = new AbortController();
+  const result = runCheck(root, { process: defineCheck(['node', '-e', command], 10) }, 'process', stop.signal, {
+    onProgress: () => stop.abort(),
+  });
+  await assert.rejects(result, { name: 'AbortError' });
+  await delay(2600);
+  await assert.rejects(readFile(join(root, 'late'), 'utf8'), { code: 'ENOENT' });
 });
