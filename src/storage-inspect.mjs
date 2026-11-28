@@ -17,6 +17,11 @@ async function size(path) {
   }
 }
 
+export async function sessionStoredBytes(id) {
+  const base = sessionPath(id).slice(0, -5);
+  return await size(base + '.json') + await size(base + '.records') + await size(base + '.draft.json');
+}
+
 export async function storageUsage(root) {
   const usage = { sessions: 0, archived: 0, conversationBytes: 0, pendingAttachmentBytes: 0, draftBytes: 0, cacheBytes: 0 };
   for (const item of await listSessions(root)) {
@@ -51,8 +56,8 @@ export async function cleanStorage(root, type, id) {
       }
       if (removed) await writeSession(session, { separated: true });
       return removed;
-    } else if (type === 'archive') {
-      if (!session.archived || session.queue.length || session.undoInProgress)
+    } else if (type === 'archive' || type === 'trash') {
+      if (!(type === 'trash' ? session.trashed : session.archived) || session.queue.length || session.undoInProgress)
         throw new Error('Archive the completed session before removing it.');
       await rm(base + '.json');
       for (const suffix of ['.summary', '.draft.json', '.project', '.records'])

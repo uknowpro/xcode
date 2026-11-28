@@ -32,6 +32,8 @@ import { openLocation } from './editor.mjs';
 import { shellCompletion } from './completion.mjs';
 import { answerRows, matchingAnswers } from './answer-view.mjs';
 import { DraftEdits, keyBindings } from './draft-edits.mjs';
+import { randomUUID } from 'node:crypto';
+import { note, portableTurn, retentionCandidates, retentionPolicy } from './session-organize.mjs';
 import { doctor, settingsSchema, validateSettings } from './config-doctor.mjs';
 import { mcpCommand, mcpTools, withMcp } from './local-mcp.mjs';
 import { extractDocument, queryLocalDatabase } from './local-data.mjs';
@@ -63,7 +65,11 @@ const help = [
   '  xcode ask "prompt" [--json|--events]  Run one request or read from standard input',
   '  xcode sessions [search] [--status <filter>]',
   '  xcode session rename|pin|unpin|archive|restore <id|latest> [title]',
-  '  xcode session history|fork|export <id|latest> [turn] [count]',
+  '  xcode session history|fork|export|link <id|latest> [turn] [count]',
+  '  xcode session tag|untag|goal|done|trash|restore-trash <id> [value]',
+  '  xcode session combine <id:turn...> | import <backup.json>',
+  '  xcode session-filter list|save|remove [name] [query]',
+  '  xcode retention [--days n] [--count n] [--mib n] [--trash-days n] [--apply]',
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode draft [id|latest]        Read an unsent draft without opening the session',
   '  xcode continue [id|latest]    Run the pending message once',
@@ -486,30 +492,40 @@ function sessionStatus(session, live) {
 
 function sessionSearch(query, explicitStatus) {
   const words = query.trim().split(/\s+/).filter(Boolean);
+  const tags = words.filter(word => word.startsWith('tag:')).map(word => word.slice(4).toLowerCase());
+  for (let index = words.length - 1; index >= 0; index--) if (words[index].startsWith('tag:')) words.splice(index, 1);
   const flag = words.findIndex(word => word.startsWith('status:'));
   const status = explicitStatus ?? (flag >= 0 ? words.splice(flag, 1)[0].slice(7) : 'visible');
-  if (!['visible', 'active', 'review', 'failed', 'archived', 'all'].includes(status))
+  if (!['visible', 'active', 'review', 'failed', 'archived', 'trash', 'all'].includes(status))
     throw new Error('Use status active, review, failed, archived or all.');
-  return { query: words.join(' ').toLowerCase(), status };
+  return { query: words.join(' ').toLowerCase(), status, tags };
 }
 
 async function sessionRows(manager, query = '', status, updates) {
   let unreadable = 0;
   const entries = await manager.list(() => { unreadable++; });
+  if (query.startsWith('@')) {
+    const filters = (await settings()).sessionFilters?.[manager.root] ?? {};
+    const value = own(filters, query.slice(1));
+    if (typeof value !== 'string') throw new Error('Unknown saved session filter.');
+    query = value;
+  }
   const search = sessionSearch(query, status);
   const rows = entries.map(entry => {
     const live = manager.open.get(entry.id);
     const session = live?.session ?? entry;
     const pending = session.pendingCount ?? session.queue.length;
     const state = sessionStatus(session, live);
-    const include = search.status === 'all' || (search.status === 'archived' ? session.archived : !session.archived &&
+    const hasTags = search.tags.every(tag => session.tags?.includes(tag));
+    const shown = search.status === 'trash' ? Boolean(session.trashed) : !session.trashed;
+    const include = hasTags && shown && (search.status === 'trash' || search.status === 'all' || (search.status === 'archived' ? session.archived : !session.archived &&
       (search.status === 'visible' || (search.status === 'active' && ['running', 'paused'].includes(state)) ||
         (search.status === 'review' && ['review needed', 'apply interrupted', 'undo interrupted'].includes(state)) ||
-        (search.status === 'failed' && ['failed', 'check failed'].includes(state))));
+        (search.status === 'failed' && ['failed', 'check failed'].includes(state)))));
     return { id: session.id, pinned: Boolean(session.pinned), include,
-      text: session.id.slice(0, 8) + ' · ' + (session.archived ? 'archived' : state) + ' · ' +
+      text: session.id.slice(0, 8) + ' · ' + (session.trashed ? 'trash' : session.archived ? 'archived' : state) + ' · ' +
         (pending ? pending + ' pending · ' : '') + (updates?.has(session.id) ? 'unread · ' : '') +
-        (session.pinned ? 'pinned · ' : '') + session.title };
+        (session.pinned ? 'pinned · ' : '') + session.title + (session.tags?.length ? ' · #' + session.tags.join(' #') : '') };
   }).filter(row => row.include && row.text.toLowerCase().includes(search.query)).sort((a, b) => Number(b.pinned) - Number(a.pinned));
   return { rows, unreadable };
 }
@@ -680,7 +696,7 @@ async function reviewCommand(root, action, prefix, paths) {
       return print(hunkList(review, paths[0]));
     }
     if (action === 'show' || action === 'check') {
-      if (action === 'show') print(reviewDiff(review, paths[0]).join('\n'));
+      if (action === 'show') print([review.label, review.description, reviewDiff(review, paths[0]).join('\n')].filter(Boolean).join('\n'));
       const chosen = paths.length || review.state === 'applying' ? paths : review.markedPaths ?? paths;
       if (action === 'check' && review.markedPaths && !chosen.length && review.state !== 'applying')
         throw new Error('Select at least one file in /diff or pass paths to check.');
@@ -851,6 +867,7 @@ async function continueMessage(root, prefix, options) {
     const live = await sessions.select(prefix || 'latest', {});
     if (live.session.undoInProgress) throw new Error('Run xcode undo to finish the interrupted undo first.');
     if (!live.session.queue.length) throw new Error('Queue is empty.');
+    if (live.session.queue[0].manual) throw new Error('This message is held for manual release. Use /queue release 1 in the session.');
     if (live.session.queue[0].review) throw new Error('Show and decide the pending change set first with xcode review.');
     live.held = false;
     await oneMessage(sessions, live, () => ({ run: sessions.pump(live) }), options);
@@ -1003,7 +1020,7 @@ async function chat(root, base, defaults, options, prefix) {
     cursorTo(stdout, 0, 0);
     clearScreenDown(stdout);
     const width = Math.max(1, (stdout.columns || 80) - 1);
-    print(terminalClip('Review ' + review.id + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
+    print(terminalClip('Review ' + (review.label ?? review.id) + ' · ' + mode + ' · ' + picked.size + '/' + review.files.length + ' selected' +
       (conflicts.size ? ' · ' + conflicts.size + ' conflicts' : '') + (mode === 'diff' && pager.file ? ' · ' + pager.file : ''), width));
     for (const line of lines.slice(pager.offset, pager.offset + rows))
       print(terminalClip(line, width, mode === 'files' ? 0 : pager.column));
@@ -1571,6 +1588,7 @@ async function chat(root, base, defaults, options, prefix) {
       }
       case '/exit': rl.close(); break;
       case '/session':
+        if (arg === 'objective') return show([session.objective || 'No goal set.', session.completionCondition || 'No completion condition set.'].join('\n'));
         await sessions.updateMetadata(selected, arg, args.slice(1).join(' '));
         show('Session updated · ' + session.title);
         break;
@@ -1593,12 +1611,18 @@ async function chat(root, base, defaults, options, prefix) {
         break;
       }
       case '/queue':
+        if (arg === 'add' && value === 'manual') {
+          const message = args.slice(2).join(' ');
+          if (!message || message.length > maxPrompt) throw new Error('Provide a message to hold.');
+          await sessions.enqueue(selected, message, [], true);
+          return show('Queued for manual release.');
+        }
         if (arg) {
           await sessions.updateQueue(selected, arg, value, args.slice(2).join(' '));
           show('Queue updated.');
         } else {
           show(session.queue.length ? session.queue.map((item, index) =>
-            (index + 1) + ' · ' + (index === 0 && selected.active ? '[running] ' : '') + item.prompt.slice(0, 100)).join('\n') : 'Queue is empty.');
+            (index + 1) + ' · ' + (index === 0 && selected.active ? '[running] ' : '') + (item.manual ? '[held] ' : '') + item.prompt.slice(0, 100)).join('\n') : 'Queue is empty.');
         }
         break;
       case '/stop': if (!sessions.stop(selected)) show('No request is running.'); break;
@@ -1973,6 +1997,8 @@ async function main() {
       attach: { type: 'string', multiple: true }, endpoint: { type: 'string' }, model: { type: 'string' },
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
+      days: { type: 'string' }, count: { type: 'string' }, mib: { type: 'string' }, 'trash-days': { type: 'string' },
+      apply: { type: 'boolean' },
       'model-jobs': { type: 'string' }, 'check-jobs': { type: 'string' },
       'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
@@ -2099,9 +2125,77 @@ async function main() {
     const sessions = new Sessions(root);
     return describeSessions(sessions, undefined, rest.join(' '), values.status);
   }
+  if (command === 'session-filter') {
+    const [action = 'list', name, ...query] = rest;
+    if (action !== 'list') {
+      validName(name);
+      if (!['save', 'remove'].includes(action)) throw new Error('Use list, save or remove.');
+      if (action === 'save') sessionSearch(query.join(' '));
+      await updateSettings(config => {
+        const project = { ...config.sessionFilters?.[root] };
+        if (action === 'save') project[name] = note(query.join(' '), 250);
+        else delete project[name];
+        config.sessionFilters = { ...config.sessionFilters, [root]: project };
+      });
+    }
+    return print(JSON.stringify((await settings()).sessionFilters?.[root] ?? {}, null, 2));
+  }
+  if (command === 'retention') {
+    const sessions = new Sessions(root);
+    const policy = retentionPolicy(values, (await settings()).retention?.[root]);
+    if (['days', 'count', 'mib', 'trash-days'].some(key => values[key] !== undefined))
+      await updateSettings(config => { config.retention = { ...config.retention, [root]: policy }; });
+    const candidates = await retentionCandidates(await sessions.list(), policy);
+    if (values.apply) {
+      try {
+        for (const item of candidates) {
+          if (item.action === 'purge') await cleanStorage(root, 'trash', item.id);
+          else await sessions.updateMetadata(await sessions.select(item.id, defaults), 'trash', '');
+        }
+      } finally { await sessions.close(); }
+    }
+    return print(JSON.stringify({ policy, applied: Boolean(values.apply), candidates }, null, 2));
+  }
   if (command === 'session') {
     const sessions = new Sessions(root);
     const [action, prefix = 'latest', turn, count] = rest;
+    if (action === 'combine' || action === 'import') {
+      const turns = [];
+      let title = 'Combined conversation';
+      if (action === 'import') {
+        const backup = JSON.parse((await loadBytes(resolve(rest[1] ?? ''), 16 * 1024 * 1024)).toString('utf8'));
+        if (!Array.isArray(backup?.turns)) throw new Error('Provide a session backup file.');
+        title = ('Imported · ' + String(backup.title ?? 'Session')).replace(/[\r\n]/g, ' ').slice(0, 120);
+        for (const [index, turn] of backup.turns.entries()) {
+          const portable = portableTurn(turn, { turn: index + 1 }, root, backup.root);
+          if (portable) turns.push(portable);
+        }
+      } else {
+        if (rest.length < 2 || rest.length > 31) throw new Error('Provide up to 30 session:turn references.');
+        for (const reference of rest.slice(1)) {
+          const match = /^([^:]+):([1-9]\d*)$/.exec(reference);
+          if (!match) throw new Error('Use session:turn references.');
+          const entry = await sessions.find(match[1]);
+          const page = await readSessionPage(entry.id, Number(match[2]) + 1, 1);
+          const portable = portableTurn(page?.entries[0]?.turn, { id: entry.id, turn: Number(match[2]) });
+          if (!portable) throw new Error('The selected turn is unavailable.');
+          turns.push(portable);
+        }
+      }
+      const config = await settings();
+      try {
+        const live = await sessions.openSession({ id: randomUUID(), root, title, customTitle: true,
+          profile: defaults.profile || config.defaultProfile || 'default', harness: defaults.harness || 'default',
+          write: false, checks: false, retrySeconds: 0, queue: [], turns });
+        return print(live.session.id);
+      } finally { await sessions.close(); }
+    }
+    if (action === 'link') {
+      const entry = await sessions.find(prefix);
+      const number = Number(turn);
+      if (!Number.isSafeInteger(number) || number < 1) throw new Error('Choose a positive turn number.');
+      return print('xcode session history ' + entry.id + ' ' + (number + 1) + ' 1');
+    }
     if (['export', 'history', 'backup'].includes(action)) {
       if (action === 'backup' && !values.output) throw new Error('Choose --output <new-file> for a session backup.');
       const entry = await sessions.find(prefix);

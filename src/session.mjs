@@ -10,6 +10,7 @@ import { completedWire, pruneWire } from './wire-history.mjs';
 import { latestChecks } from './repair.mjs';
 import { modelFailure } from './model-transport.mjs';
 import { maxDraftLength } from './draft.mjs';
+import { note, sessionTag } from './session-organize.mjs';
 
 export class Sessions {
   constructor(root, onEvent = () => {}) {
@@ -24,7 +25,7 @@ export class Sessions {
 
   async find(prefix) {
     const previous = await this.list();
-    const matches = prefix === 'latest' ? previous.filter(session => !session.archived).slice(0, 1) :
+    const matches = prefix === 'latest' ? previous.filter(session => !session.archived && !session.trashed).slice(0, 1) :
       previous.filter(session => session.id.startsWith(prefix));
     if (matches.length !== 1) throw new Error(matches.length ? 'Session prefix is ambiguous.' : 'Session not found in this project.');
     return matches[0];
@@ -100,12 +101,12 @@ export class Sessions {
     this.onEvent(live, event);
   }
 
-  async enqueue(live, prompt, attachments = []) {
+  async enqueue(live, prompt, attachments = [], manual = false) {
     if (live.session.queue.length >= 12) throw new Error('The session queue already has 12 messages.');
     if (attachments.length > maxAttachments ||
       1 + attachments.reduce((bytes, item) => bytes + attachmentSize(item), 0) > maxAttachmentBytes)
       throw new Error('Maximum 8 attachments and 12 MiB of encoded attachment data per message.');
-    const job = { prompt, attachments, completed: [], changed: [], tools: [] };
+    const job = { prompt, attachments, completed: [], changed: [], tools: [], ...(manual ? { manual: true } : {}) };
     if (!live.session.customTitle && live.session.title === 'New session') live.session.title = prompt.replace(/\s+/g, ' ').slice(0, 72);
     live.session.queue.push(job);
     try {
@@ -121,7 +122,7 @@ export class Sessions {
   }
 
   pump(live) {
-    if (this.closing || live.active || live.held || live.reviewing || live.session.queue[0]?.review || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
+    if (this.closing || live.active || live.held || live.reviewing || (live.session.queue[0]?.review || live.session.queue[0]?.manual) || live.session.undoInProgress?.state === 'applying' || !live.session.queue.length) return live.active?.promise;
     const controller = new AbortController();
     const active = { controller, advance: false };
     live.active = active;
@@ -329,6 +330,27 @@ export class Sessions {
         throw new Error('Enter a single-line session title up to 120 characters.');
       session.title = name;
       session.customTitle = true;
+    } else if (action === 'tag' || action === 'untag') {
+      const tag = sessionTag(title);
+      const tags = new Set(session.tags ?? []);
+      if (action === 'tag') tags.add(tag);
+      else tags.delete(tag);
+      if (tags.size > 20) throw new Error('A session may have up to 20 tags.');
+      session.tags = [...tags];
+    } else if (action === 'goal' || action === 'done') {
+      session[action === 'goal' ? 'objective' : 'completionCondition'] = note(title);
+    } else if (action === 'review-note') {
+      const review = session.queue[0]?.review;
+      if (!review || review.state === 'applying') throw new Error('No editable pending review.');
+      const [name, ...rest] = title.split(/\s+/);
+      if (!name) throw new Error('Provide a label and optional note.');
+      review.label = note(name, 80);
+      review.description = note(rest.join(' '));
+    } else if (action === 'trash' || action === 'restore-trash') {
+      if (action === 'trash' && (live.active || session.queue.length || session.undoInProgress))
+        throw new Error('Finish pending work before moving this session to trash.');
+      if (action === 'trash') session.trashed = new Date().toISOString();
+      else delete session.trashed;
     } else if (action === 'pin' || action === 'unpin') {
       session.pinned = action === 'pin';
     } else if (action === 'archive' || action === 'restore') {
@@ -351,12 +373,14 @@ export class Sessions {
     const locked = item => (active && item === queue[0]) || item?.harness || item?.review;
     if (locked(job)) throw new Error('This message has started. Use /stop, /continue or /skip.');
     const previous = queue.slice();
-    const oldPrompt = job.prompt;
+    const oldPrompt = job.prompt, oldManual = job.manual;
     const sendNow = action === 'send';
 
     if (action === 'edit') {
       if (!value.trim() || value.length > maxDraftLength) throw new Error('Enter a prompt up to 32,000 characters.');
       job.prompt = value;
+    } else if (action === 'hold' || action === 'release') {
+      job.manual = action === 'hold';
     } else if (action === 'drop') {
       queue.splice(index, 1);
     } else if (action === 'move' || sendNow) {
@@ -367,6 +391,7 @@ export class Sessions {
         throw new Error('Finish the pending review or undo before sending a different message.');
       queue.splice(index, 1);
       queue.splice(target, 0, job);
+      if (sendNow) delete job.manual;
     } else {
       throw new Error('Use /queue edit, move, drop or send.');
     }
@@ -376,11 +401,12 @@ export class Sessions {
     } catch (error) {
       if (live.active === active) {
         job.prompt = oldPrompt;
+        job.manual = oldManual;
         queue.splice(0, queue.length, ...previous);
       }
       throw error;
     }
-    if (sendNow && live.active === active) {
+    if ((sendNow || action === 'release' && index === 0) && live.active === active) {
       live.held = false;
       if (active) this.stop(live, true);
       else this.pump(live)?.catch(error => this.notify(live, { type: 'error', error }));

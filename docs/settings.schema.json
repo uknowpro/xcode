@@ -14,7 +14,9 @@
     "emptyCredentials": { "type": "object" },
     "transmitExclusions": { "type": "object" },
     "skillPolicy": { "type": "object" },
-    "localMcp": { "type": "object" }
+    "localMcp": { "type": "object" },
+    "sessionFilters": { "type": "object" },
+    "retention": { "type": "object" }
   },
   "additionalProperties": false
 }

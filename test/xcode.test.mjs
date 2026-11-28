@@ -1592,3 +1592,32 @@ test('draft editing supports inserting, dedenting, undo and redo and validates k
   assert.deepEqual(keyBindings({ 'alt+p': '/answer outline' }), { 'alt+p': '/answer outline' });
   assert.throws(() => keyBindings({ 'ctrl+c': '/answer' }), /available Alt keys/);
 });
+
+test('session organization saves tag filters, turn links and recoverable trash', async t => {
+  const api = await server(t, (_body, res) => reply(res, 'Ready'));
+  const { cli } = await profile(t, api);
+  await cli('ask', 'First issue');
+  await cli('session', 'tag', 'latest', 'backend');
+  await cli('session-filter', 'save', 'work', 'tag:backend');
+  assert.match((await cli('sessions', '@work')).stdout, /#backend/);
+  const link = (await cli('session', 'link', 'latest', '1')).stdout.trim();
+  const id = link.split(' ')[3];
+  const combined = (await cli('session', 'combine', id + ':1')).stdout.trim();
+  assert.match((await cli('session', 'export', combined)).stdout, /First issue/);
+  await cli('session', 'trash', id);
+  assert.match((await cli('sessions', '--status', 'trash')).stdout, /First issue/);
+  assert.doesNotMatch((await cli('sessions', '@work')).stdout, /First issue/);
+  await cli('session', 'restore-trash', id);
+  assert.match((await cli('sessions', '@work')).stdout, /First issue/);
+});
+
+test('explicit queue holds do not start model work while state is paused', async () => {
+  const { Sessions } = await import('../src/session.mjs');
+  const manager = new Sessions('.');
+  manager.persist = async () => {};
+  let started = 0;
+  manager.execute = async (_live, active) => { started++; active.controller.abort(); };
+  const live = { session: { queue: [{ prompt: 'Wait', manual: true }], turns: [] }, active: null };
+  assert.equal(manager.pump(live), undefined);
+  assert.equal(started, 0);
+});
