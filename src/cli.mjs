@@ -24,6 +24,7 @@ import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
 import { executionLimits, setLimits } from './limits.mjs';
 import { cleanStorage, storageUsage } from './storage-inspect.mjs';
+import { cacheCapabilities, diagnosticKey, modelDirectory, networkSettings, savedCapabilities } from './model-discovery.mjs';
 import { formatHistoryPage, historyText, sessionMarkdown } from './session-history.mjs';
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
@@ -59,7 +60,7 @@ const help = [
   '  xcode resume <id|latest>       Resume a project session',
   '  xcode draft [id|latest]        Read an unsent draft without opening the session',
   '  xcode continue [id|latest]    Run the pending message once',
-  '  xcode profile list|show|use|set|tune|test|eval [name]',
+  '  xcode profile list|show|use|set|tune|test|models|capabilities|eval [name]',
   '  xcode profile tune [name] --adapter <adapter> --protocol <protocol>',
   '  xcode profile eval [name] [--against <profile>] [--timeout <seconds>] [--json]',
   '  xcode harness list|show|import [name] [file]',
@@ -72,6 +73,7 @@ const help = [
   '  xcode undo [session] [change] Undo a change if its files still match',
   '  xcode settings                 Show active defaults and project checks',
   '  xcode limits [--model-jobs <n>] [--check-jobs <n>]',
+  '  xcode network                 Check local proxy and certificate settings',
   '  xcode storage [--json] [--clean cache|draft|attachments|archive --session <id>]',
   '  xcode terminal [--send-key ctrl+g|ctrl+x] [--newline-key enter|ctrl+o]',
   '                 [--theme auto|light|dark|plain] [--accessible|--no-accessible]',
@@ -139,7 +141,10 @@ async function saveProfile(name, endpoint, model, token, use, options = {}) {
     const modelId = model ?? existing?.model;
     if (!modelId?.trim() || modelId.length > 256) throw new Error('Enter a model ID up to 256 characters.');
     config.profiles[name] = configureModel({ ...existing, endpoint: url, model: modelId.trim() }, options);
-    if (token !== undefined) await setToken(name, token);
+    if (token !== undefined) {
+      await setToken(name, token);
+      await cacheCapabilities(name).catch(() => {});
+    }
     if (use || !config.defaultProfile) config.defaultProfile = name;
   });
 }
@@ -212,6 +217,18 @@ async function profileCommand(action, name, options) {
   if (action === 'use') {
     await updateSettings(value => { value.defaultProfile = name; });
     print('Default profile: ' + name);
+  } else if (action === 'models') {
+    const result = await modelDirectory(profile, await tokenFor(name), AbortSignal.timeout(15000));
+    if (options.json) print(JSON.stringify(result, null, 2));
+    else print(result.ids.map(id => (id === profile.model ? '* ' : '  ') + id).join('\n') +
+      '\nConfigured model · ' + (result.verified ? 'found' : result.more ? 'not on this page' : 'not listed'));
+  } else if (action === 'capabilities') {
+    const cache = await savedCapabilities(name);
+    const current = cache?.key === diagnosticKey(profile);
+    const result = { current, ...(current ? { tests: cache.tests } : {}) };
+    if (options.json) print(JSON.stringify(result, null, 2));
+    else print(current ? Object.entries(cache.tests).map(([stage, test]) => stage + ' · ' + test.status + ' · ' + test.time).join('\n') :
+      'No current probe results. Run xcode profile test.');
   } else if (action === 'eval') {
     const comparison = options.against ? profileFor(config, options.against) : null;
     if (comparison && (comparison.model !== profile.model ||
@@ -249,6 +266,8 @@ async function profileCommand(action, name, options) {
       only: options.only, timeout: timeout * 1000,
       onResult: options.json ? undefined : item => print(item.name.toUpperCase() + ' ' + item.status.toUpperCase() + ' · ' + item.detail),
     });
+    if (diagnosticKey(profileFor(await settings(), name)) === diagnosticKey(profile))
+      await cacheCapabilities(name, diagnosticKey(profile), results).catch(() => {});
     if (options.json) print(JSON.stringify({ profile: name, endpoint: address, results }, null, 2));
     if (results.some(item => item.status === 'fail')) process.exitCode = 1;
   } else {
@@ -1376,6 +1395,7 @@ async function main() {
       write: { type: 'boolean' }, checks: { type: 'boolean' }, only: { type: 'string' }, timeout: { type: 'string' }, help: { type: 'boolean', short: 'h' }, version: { type: 'boolean', short: 'v' },
       'token-stdin': { type: 'boolean' }, clear: { type: 'boolean' }, json: { type: 'boolean' }, probe: { type: 'boolean' },
       'model-jobs': { type: 'string' }, 'check-jobs': { type: 'string' },
+      'stream-fallback': { type: 'string' }, 'retry-limited': { type: 'string' },
       'header-timeout': { type: 'string' }, 'first-event-timeout': { type: 'string' }, 'idle-timeout': { type: 'string' },
       clean: { type: 'string' }, session: { type: 'string' },
       status: { type: 'string' }, 'send-key': { type: 'string' }, 'newline-key': { type: 'string' }, theme: { type: 'string' },
@@ -1390,6 +1410,7 @@ async function main() {
   if (values.version) return print(JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version);
   const initial = await settings().catch(() => null);
   setLimits(initial?.execution);
+  if (command === 'network') return print(JSON.stringify(await networkSettings(), null, 2));
   if (command === 'limits') {
     if (values['model-jobs'] !== undefined || values['check-jobs'] !== undefined)
       await updateSettings(config => { config.execution = executionLimits(config.execution, values); });

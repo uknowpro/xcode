@@ -24,6 +24,35 @@ export async function diagnose(profile, token, { timeout = 15000, only, onResult
       if (format !== 'sse') throw new Error('The endpoint replied with JSON to a streaming request.');
       return 'SSE stream completed.';
     }],
+    ['image', async signal => {
+      if (profile.imageInput !== true) return null;
+      const image = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2V8AAAAASUVORK5CYII=';
+      await complete(profile, token, [{ role: 'user', content: [{ type: 'text', text: 'Reply OK for this test image.' },
+        { type: 'image_url', image_url: { url: image } }] }], { stream: false, signal });
+      return 'Image input accepted by this endpoint.';
+    }],
+    ['pdf', async signal => {
+      if (profile.pdfInput !== true) return null;
+      const objects = [
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+        '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>',
+      ];
+      let pdf = '%PDF-1.4\n';
+      const positions = [];
+      for (const [index, object] of objects.entries()) {
+        positions.push(pdf.length);
+        pdf += (index + 1) + ' 0 obj\n' + object + '\nendobj\n';
+      }
+      const xref = pdf.length;
+      pdf += 'xref\n0 4\n0000000000 65535 f \n' +
+        positions.map(pos => String(pos).padStart(10, '0') + ' 00000 n \n').join('') +
+        'trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF\n';
+      const data = 'data:application/pdf;base64,' + Buffer.from(pdf).toString('base64');
+      await complete(profile, token, [{ role: 'user', content: [{ type: 'text', text: 'Reply OK for this test PDF.' },
+        { type: 'file', file: { filename: 'fixture.pdf', file_data: data } }] }], { stream: false, signal });
+      return 'PDF input accepted by this endpoint.';
+    }],
     ['tools', async signal => {
       if (profile.tools === false) return null;
       const input = [{ role: 'user', content: 'Call xcode_probe once with empty arguments. After its result, reply with OK.' }];
@@ -53,15 +82,15 @@ export async function diagnose(profile, token, { timeout = 15000, only, onResult
       return 'Function call and follow-up passed. The server did not send reasoning content.';
     }],
   ];
-  if (only && !tests.some(([name]) => name === only)) throw new Error('Use --only chat, sse or tools.');
+  if (only && !tests.some(([name]) => name === only)) throw new Error('Use --only chat, sse, tools, image or pdf.');
   const results = [];
   for (const [name, test] of tests) {
-    if (only && name !== only) continue;
+    if (only ? name !== only : name === 'image' || name === 'pdf') continue;
     let result;
     try {
       const detail = await test(AbortSignal.timeout(timeout));
       result = detail ? { name, status: 'pass', detail } :
-        { name, status: 'skip', detail: 'Tools are disabled in this profile.' };
+              { name, status: 'skip', detail: 'This capability is disabled in the profile.' };
     } catch (error) {
       result = { name, status: 'fail', ...modelFailure(error) };
     }

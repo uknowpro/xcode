@@ -70,8 +70,10 @@ export function modelPolicy(profile) {
   const headerTimeout = integer(profile.headerTimeout, 'Connection timeout seconds', 1, 600);
   const firstEventTimeout = integer(profile.firstEventTimeout, 'First event timeout seconds', 1, 600);
   const idleTimeout = integer(profile.idleTimeout, 'Stream idle timeout seconds', 1, 600);
+  const streamFallback = option(profile.streamFallback, ['off', 'on'], 'Stream fallback', 'off') === 'on';
+  const retryLimited = option(profile.retryLimited, ['off', 'on'], 'Rate limit retry', 'off') === 'on';
   const replay = protocol !== 'chat-completions' || ['deepseek-flash', 'qwen', 'kimi', 'gemini'].includes(adapter);
-  return { adapter, selected, protocol, selection, preset, thinking, effort, contextWindow, maxTokens, requestTimeout, headerTimeout, firstEventTimeout, idleTimeout, replay };
+  return { adapter, selected, protocol, selection, preset, thinking, effort, contextWindow, maxTokens, requestTimeout, headerTimeout, firstEventTimeout, idleTimeout, streamFallback, retryLimited, replay };
 }
 
 export function modelEndpoint(profile, policy, stream = false) {
@@ -96,6 +98,7 @@ export function configureModel(profile, options) {
   for (const [flag, key] of [
     ['adapter', 'adapter'], ['protocol', 'protocol'], ['preset', 'modelPreset'],
     ['thinking', 'thinking'], ['effort', 'reasoningEffort'],
+    ['stream-fallback', 'streamFallback'], ['retry-limited', 'retryLimited'],
   ]) {
     if (options[flag] !== undefined) value[key] = options[flag];
   }
@@ -143,6 +146,8 @@ export function modelTuning(profile) {
     'Protocol · ' + policy.protocol + (policy.selection === 'auto' ? ' (auto)' : ''),
     'Adapter · ' + policy.adapter + (policy.selected === 'auto' ? ' (auto)' : ''),
     'Request timeout · ' + policy.requestTimeout + 's',
+    'JSON fallback · ' + (policy.streamFallback ? 'on' : 'off'),
+    'Rate limit retry · ' + (policy.retryLimited ? 'on' : 'off'),
     ...(policy.headerTimeout ? ['Connection timeout · ' + policy.headerTimeout + 's'] : []),
     ...(policy.firstEventTimeout ? ['First event timeout · ' + policy.firstEventTimeout + 's'] : []),
     ...(policy.idleTimeout ? ['Stream idle timeout · ' + policy.idleTimeout + 's'] : []),

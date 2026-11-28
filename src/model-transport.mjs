@@ -7,6 +7,7 @@ export class ModelError extends Error {
     this.status = options.status;
     this.phase = options.phase;
     this.code = options.code;
+    this.retryAfter = options.retryAfter;
   }
 }
 
@@ -105,7 +106,13 @@ export async function fetchModel(url, headers, payload, signal, headerTimeout) {
   if (!response.ok) {
     const detail = await responseText(response, 4096, true).catch(() => '');
     if (signal?.aborted) throw networkError(signal.reason, signal, 'http');
-    throw failed(response.status, detail, 'http');
+    const failure = failed(response.status, detail, 'http');
+    const header = response.headers.get('retry-after');
+    if (header) {
+      const seconds = /^\d+$/.test(header) ? Number(header) : Math.ceil((Date.parse(header) - Date.now()) / 1000);
+      if (Number.isFinite(seconds)) failure.retryAfter = Math.max(0, Math.min(3600, seconds));
+    }
+    throw failure;
   }
   return response;
 }

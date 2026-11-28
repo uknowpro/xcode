@@ -21,7 +21,7 @@ const stateRoots = new Set([storage, canonicalStateRoot(storage)]);
 export function isStatePath(path) {
   for (const root of stateRoots) {
     const first = relative(root, path).split(sep)[0];
-    if (/^(?:sessions|(?:settings|tokens)\.json(?:\..*)?|settings\.lock(?:\..*)?)$/i.test(first)) return true;
+    if (/^(?:sessions|(?:settings|tokens|capabilities)\.json(?:\..*)?|(?:settings|capabilities)\.lock(?:\..*)?)$/i.test(first)) return true;
   }
   return false;
 }

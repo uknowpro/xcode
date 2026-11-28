@@ -158,23 +158,39 @@ async function execute(project, skills, job, call, allowed, checks, signal, stag
 }
 
 async function request(profile, token, messages, tools, session, signal, emit) {
-  const timeout = modelPolicy(profile).requestTimeout * 1000;
+  const policy = modelPolicy(profile);
+  const timeout = policy.requestTimeout * 1000;
+  let fallbackUsed = false;
   for (;;) {
     signal.throwIfAborted();
     let visible = false;
-    emit({ type: 'attempt' });
-    try {
-      return await complete(profile, token, messages, {
-        tools,
+    const run = stream => {
+      emit({ type: 'attempt' });
+      return complete(profile, token, messages, {
+        tools, stream,
         signal: AbortSignal.any([signal, AbortSignal.timeout(timeout)]),
         onText: text => { visible ||= Boolean(text); emit({ type: 'text', text }); },
       });
+    };
+    try {
+      try {
+        return await run(true);
+      } catch (error) {
+        signal.throwIfAborted();
+        if (!policy.streamFallback || fallbackUsed || error.phase !== 'stream' || error.status === 429) throw error;
+        fallbackUsed = true;
+        emit({ type: 'note', text: 'Stream interrupted. Re-requesting one regular JSON response.' });
+        return await run(false);
+      }
     } catch (error) {
       signal.throwIfAborted();
-      if (!session.retrySeconds || !(error.retryable || error.name === 'TimeoutError')) throw error;
+      const limited = error.status === 429;
+      const retry = limited ? policy.retryLimited : error.retryable || error.name === 'TimeoutError';
+      if (!session.retrySeconds || !retry) throw error;
+      const seconds = Math.max(session.retrySeconds, error.retryAfter ?? 0);
       emit({ type: 'note', text: (visible ? 'Response interrupted. ' : 'Temporary connection failure. ') +
-        'Retrying the request in ' + session.retrySeconds + 's.' });
-      await wait(session.retrySeconds * 1000, undefined, { signal });
+        'Retrying the request in ' + seconds + 's.' });
+      await wait(seconds * 1000, undefined, { signal });
     }
   }
 }

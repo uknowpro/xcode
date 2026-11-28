@@ -29,7 +29,7 @@ async function server(t, handle) {
     try {
       let text = '';
       for await (const part of req) text += part;
-      const body = JSON.parse(text);
+      const body = text ? JSON.parse(text) : null;
       requests.push({ url: req.url, headers: req.headers, body });
       await handle(body, res, requests.length);
     } catch (error) {
@@ -1103,6 +1103,32 @@ test('stream first-event and idle limits are independent', async () => {
   const events = readEvents(stream, undefined, { firstEventTimeout: 0.03, idleTimeout: 0.03 });
   assert.deepEqual((await events.next()).value, { ready: true });
   await assert.rejects(events.next(), /idle/);
+});
+
+test('model discovery, cached capabilities and streaming fallback use the configured endpoint', async t => {
+  const api = await server(t, (body, res) => {
+    if (!body) { res.end(JSON.stringify({ data: [{ id: 'fixture' }, { id: 'alternative' }] })); return; }
+    if (body.stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' }).end('data: invalid\n\n');
+      return;
+    }
+    return reply(res, 'Regular reply');
+  });
+  const { cli } = await profile(t, api);
+  const directory = JSON.parse((await cli('profile', 'models', 'work', '--json')).stdout);
+  assert.equal(directory.verified, true);
+  assert.deepEqual(directory.ids, ['fixture', 'alternative']);
+  await cli('profile', 'test', 'work', '--only', 'chat');
+  const { tests } = JSON.parse((await cli('profile', 'capabilities', 'work', '--json')).stdout);
+  assert.equal(tests.chat.status, 'pass');
+  await cli('profile', 'tune', 'work', '--stream-fallback', 'on');
+  const recovered = await cli('ask', 'Recover stream');
+  assert.match(recovered.stdout, /Regular reply/);
+  assert.match(recovered.stderr, /regular JSON response/);
+  const { networkSettings } = await import('../src/model-discovery.mjs');
+  const network = await networkSettings({ HTTPS_PROXY: 'http://private-proxy.local', NODE_USE_ENV_PROXY: '1' });
+  assert.equal(network.environmentProxy.https, true);
+  assert.ok(!JSON.stringify(network).includes('private-proxy.local'));
 });
 
 test('connection diagnostics separate HTTP authentication and malformed model streams', async t => {

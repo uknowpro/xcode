@@ -14,7 +14,7 @@ Requires Node.js 22.5 or later on Linux, macOS, or Windows. Download the .tgz fr
 
 Use the same install command with a newer tarball to update. The default profile, token, and sessions stay in the existing data directory. Run npm install -g . to install from a checkout.
 
-Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS address ending in /v1 or /chat/completions. The saved default profile applies to new sessions. Changing the URL keeps the token. The connection test reports plain chat, SSE, and tool calling separately. Save a diagnostic report with xcode report > xcode-report.json. The report excludes endpoints, tokens, paths, and conversation content. Add --probe --only chat to test the configured connection.
+Enter the **API URL, model ID, and token**. Use a local or remote HTTP or HTTPS address ending in /v1 or /chat/completions. The saved default profile applies to new sessions. Changing the URL keeps the token. The connection test reports plain chat, SSE, and tool calling separately. Use xcode profile models to check advertised model IDs and xcode profile capabilities to see saved probe results. Probe image or PDF input with --only image or --only pdf. Use xcode network to inspect NODE_EXTRA_CA_CERTS and the HTTP_PROXY / HTTPS_PROXY / NO_PROXY configuration. On Node versions that support it, start xcode with NODE_USE_ENV_PROXY=1 to use the environment proxy. Save a diagnostic report with xcode report > xcode-report.json. The report excludes endpoints, tokens, paths, and conversation content. Add --probe --only chat to test the configured connection.
 
 ## Work in a project
 
