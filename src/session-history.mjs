@@ -9,10 +9,13 @@ export function historyPage(turns, before, count = '8') {
 }
 
 export function historyText(turns, before, count) {
-  const page = historyPage(turns, before, count);
+  return formatHistoryPage(historyPage(turns, before, count));
+}
+
+export function formatHistoryPage(page, prefix = '/history') {
   const entries = page.entries.map(({ turn, number }) => '#' + number + ' · ' + turn.status +
     '\n> ' + turn.prompt + '\n' + (turn.answer || turn.partial?.text || '[' + turn.status + ']'));
-  if (page.nextBefore) entries.push('Earlier turns · /history ' + page.nextBefore);
+  if (page.nextBefore) entries.push('Earlier turns · ' + prefix + ' ' + page.nextBefore);
   return entries.join('\n\n') || 'No earlier responses.';
 }
 

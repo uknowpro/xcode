@@ -1019,6 +1019,20 @@ test('session listing rebuilds a missing or invalid summary without changing the
   assert.equal(JSON.parse(await readFile(session, 'utf8')).turns[0].answer, 'Keep this reply.');
 });
 
+test('search resumes at the next line and attachments load only selected text ranges', async t => {
+  const root = await temp(t);
+  await writeFile(join(root, 'notes.txt'), Array.from({ length: 70000 }, (_, index) => 'needle ' + (index + 1)).join('\n'));
+  const workspace = new Workspace(root);
+  const first = await workspace.search({ query: 'needle' });
+  assert.equal(first.scanned, 1);
+  assert.equal(first.matches.length, 60);
+  assert.deepEqual(first.next, { offset: 0, start: 61 });
+  assert.equal((await workspace.search({ query: 'needle', ...first.next })).matches[0].line, 61);
+  const file = await attach(root, 'notes.txt#L2-L3', {});
+  assert.match(file.parts[0].text, /needle 2\nneedle 3\n/);
+  assert.doesNotMatch(file.parts[0].text, /needle 4/);
+});
+
 test('workspace pages glob results and reads from the requested line or EOF', async t => {
   const root = await temp(t);
   for (const name of ['a.txt', 'b.txt', 'c.txt']) await writeFile(join(root, name), 'first\nsecond');
@@ -1144,6 +1158,31 @@ test('terminal views clip Korean and emoji on display columns without breaking g
   assert.equal(terminalClip('가🙂e\u0301', 3), '가…');
   assert.equal(terminalClip('가🙂e\u0301', 4, 2), '…🙂e\u0301');
   assert.equal(terminalWidth('a\t가'), 6);
+});
+
+test('long session history reads a bounded page without hydrating archived turns or model state', async t => {
+  const root = await temp(t);
+  const state = await temp(t);
+  const file = new URL('../src/store.mjs', import.meta.url).href;
+  const script = [
+    'import assert from "node:assert/strict";',
+    'import { mkdir, readFile, rm } from "node:fs/promises";',
+    'import { join } from "node:path";',
+    'const m = await import(' + JSON.stringify(file) + ');',
+    'await mkdir(m.sessionsDir, { recursive: true });',
+    'const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";',
+    'const turns = Array.from({ length: 15 }, (_, i) => ({ status: "complete", prompt: String(i), answer: "Answer " + i }));',
+    'turns[14].wire = { messages: [{ private: "model-only state" }] };',
+    'await m.writeSession({ id, root: process.cwd(), title: "Long", updated: "2026-01-01", turns, queue: [] });',
+    'const record = JSON.parse(await readFile(m.sessionPath(id), "utf8"));',
+    'assert.equal(record.turns.length, 12);',
+    'assert.equal(record.olderTurns.length, 3);',
+    'assert.equal(record.turns.at(-1).wire, undefined);',
+    'assert.deepEqual((await m.readSession(id)).turns, turns);',
+    'await rm(join(m.sessionsDir, id + ".records", record.olderTurns[0] + ".json"));',
+    'assert.equal((await m.readSessionPage(id, undefined, 1)).entries[0].turn.answer, "Answer 14");',
+  ].join('\n');
+  await exec(process.execPath, ['--input-type=module', '-e', script], { cwd: root, env: { ...process.env, XCODE_HOME: state } });
 });
 
 test('session history pages by turn and forks or exports a saved conversation', async t => {

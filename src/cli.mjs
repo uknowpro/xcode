@@ -6,7 +6,7 @@ import { createInterface as questions } from 'node:readline/promises';
 import { resolve } from 'node:path';
 import { Writable } from 'node:stream';
 import { parseArgs } from 'node:util';
-import { attach, attachmentSize, explicitReferences, maxAttachmentBytes, maxAttachments, splitArgs } from './attachments.mjs';
+import { attach, attachmentSize, explicitReferences, inspectAttachment, maxAttachmentBytes, maxAttachments, splitArgs } from './attachments.mjs';
 import { checksForHarness, harnessFor, presets, roles, skillsAt } from './harness.mjs';
 import { configureModel, endpointUrl, modelEndpoint, modelPolicy, modelTuning } from './model-profile.mjs';
 import { diagnose } from './diagnostic.mjs';
@@ -18,11 +18,11 @@ import { conflictSummary, reviewConflicts, reviewDiff, selectedFiles } from './c
 import { remember } from './memory.mjs';
 import { completeReference, pageKey, terminalClip, terminalWidth } from './terminal.mjs';
 import { Sessions } from './session.mjs';
-import { readSession, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
+import { readSession, readSessionPage, settings, setToken, storage, tokenFor, updateSettings } from './store.mjs';
 import { projectRoot, Workspace } from './workspace.mjs';
 import { maxDraftLength, readDraft, writeDraft } from './draft.mjs';
 import { buildReport } from './report.mjs';
-import { historyText, sessionMarkdown } from './session-history.mjs';
+import { formatHistoryPage, historyText, sessionMarkdown } from './session-history.mjs';
 import { completeCommand, configureEditor, editorKeys, previewDraft, recallEntries, terminalStyle } from './chat-input.mjs';
 import { copyClipboard, responseSelection } from './clipboard.mjs';
 
@@ -88,7 +88,7 @@ const chatHelp = [
   '/model [name]                  View or select a model profile',
   '/harness [name]                View or select a staged workflow',
   '/skills                        List discovered local skills',
-  '/attach <path>, /clear         Add or clear attachments for the next message',
+  '/attach <path[#L10-L20]>, /clear   Add files or text ranges for the next message',
   '/inputs image|pdf|tools on|off Change these capabilities in the current model profile',
   '/queue [edit|move|drop|send <number> …]   Manage pending messages',
   '/stop, /next                   Pause or stop and send the next message',
@@ -699,7 +699,7 @@ async function chat(root, base, defaults, options, prefix) {
       print(terminalClip(line, width, mode === 'files' ? 0 : pager.column));
     print(terminalClip(mode === 'files'
       ? '↑/↓ Select file · Space Toggle · Enter Diff · Tab Tests · Esc Close'
-      : '↑/↓ Scroll · PgUp/PgDn Page · ←/→ Columns · Tab ' + (mode === 'diff' ? 'Files' : 'Diff') + ' · Esc/q Close', width));
+      : '↑/↓ Scroll · [/] Files · ←/→ Columns · Tab ' + (mode === 'diff' ? 'Files' : 'Diff') + ' · Esc/q Close', width));
   }
 
   function closeReview() {
@@ -710,7 +710,16 @@ async function chat(root, base, defaults, options, prefix) {
     prompt();
   }
 
-  function reviewKey(_text, key) {
+  function viewFile(path) {
+    pager.mode = 'diff';
+    pager.file = path;
+    pager.lines = reviewDiff(pager.review, path);
+    pager.lineWidth = undefined;
+    pager.offset = 0;
+    pager.column = 0;
+  }
+
+  function reviewKey(text, key) {
     if (!pager || !key) return;
     const clearInput = () => rl.write(null, { ctrl: true, name: 'u' });
     if (key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c')) {
@@ -744,6 +753,14 @@ async function chat(root, base, defaults, options, prefix) {
       drawReview();
       return;
     }
+    if (pager.mode === 'diff' && (text === '[' || text === ']')) {
+      clearInput();
+      const files = pager.review.files;
+      const index = Math.max(0, files.findIndex(file => file.path === pager.file));
+      viewFile(files[(index + (text === '[' ? files.length - 1 : 1)) % files.length].path);
+      drawReview();
+      return;
+    }
     if (pager.mode === 'files') {
       const file = pager.review.files[pager.focus];
       if (key.name === 'space' && pager.review.state !== 'applying') {
@@ -757,12 +774,7 @@ async function chat(root, base, defaults, options, prefix) {
         sessions.persist(selected).catch(error => show('Could not save review selection: ' + error.message));
         clearInput();
       } else if (key.name === 'return' || key.name === 'enter') {
-        pager.mode = 'diff';
-        pager.file = file.path;
-        pager.lines = reviewDiff(pager.review, file.path);
-        pager.lineWidth = undefined;
-        pager.offset = 0;
-        pager.column = 0;
+        viewFile(file.path);
       } else {
         const move = pageKey(key.name, Math.max(1, (stdout.rows || 24) - 4), pager.review.files.length);
         if (move === undefined) return;
@@ -1041,17 +1053,18 @@ async function chat(root, base, defaults, options, prefix) {
       case '/diff': {
         const review = session.queue[0]?.review;
         if (!review) throw new Error('There is no pending change set.');
-        const lines = reviewDiff(review, arg);
         const conflicts = await reviewConflicts(new Workspace(root), review);
         if (style.plain) {
-          show([conflictSummary(conflicts), lines.join('\n')].filter(Boolean).join('\n\n'));
+          show([conflictSummary(conflicts), reviewDiff(review, arg).join('\n')].filter(Boolean).join('\n\n'));
           break;
         }
         endStream();
         const picked = new Set(review.state !== 'applying' && review.markedPaths ? review.markedPaths :
           selectedFiles(review).map(file => file.path));
+        const file = arg ?? review.files[0]?.path;
+        const lines = reviewDiff(review, file);
         pager = { review, picked, conflicts: new Map(conflicts.map(({ path, reason }) => [path, reason])),
-          file: arg, mode: 'diff', lines, focus: 0, offset: 0, column: 0 };
+          file, mode: 'diff', lines, focus: Math.max(0, review.files.findIndex(item => item.path === file)), offset: 0, column: 0 };
         stdout.write('\x1b[?1049h');
         drawReview();
         break;
@@ -1138,11 +1151,19 @@ async function chat(root, base, defaults, options, prefix) {
         sessions.pump(selected)?.catch(error => show(error.message));
         break;
       case '/skip': await sessions.skip(selected); break;
-      case '/attach':
-        if (!args.length) return show(attachments.length ? attachments.join('\n') : 'Use /attach <path>.');
-        attachments = [...new Set([...attachments, ...args.map(path => resolve(base, path))])];
-        show('For the next message: ' + attachments.join(', '));
+      case '/attach': {
+        const next = [...new Set([...attachments, ...args.map(path => resolve(base, path))])];
+        if (!next.length) return show('Use /attach <path> or /attach <path#L10-L20>.');
+        if (next.length > maxAttachments) throw new Error('Maximum ' + maxAttachments + ' attachments per message.');
+        const items = [];
+        for (const path of next) items.push(await inspectAttachment(root, path, terminalSignal.signal));
+        attachments = next;
+        const bytes = items.reduce((total, item) => total + (item.bytes ?? 0), 0);
+        show('For the next message: ' + items.length + '/' + maxAttachments + ' attachments · ' + (bytes / 1024).toFixed(1) +
+          ' KiB of source files' + (items.some(item => item.range) ? ' plus selected lines' : '') + '.\n' +
+          items.map(item => item.name + (item.range ? ' · lines ' + item.range.first + '–' + item.range.last : '')).join('\n'));
         break;
+      }
       case '/clear': attachments = []; show('Attachments cleared.'); break;
       case '/model':
         if (!arg) return showProfiles(await settings());
@@ -1397,9 +1418,9 @@ async function main() {
     const [action, prefix = 'latest', turn, count] = rest;
     if (action === 'export' || action === 'history') {
       const entry = await sessions.find(prefix);
-      const session = await readSession(entry.id);
+      const session = action === 'export' ? await readSession(entry.id) : await readSessionPage(entry.id, turn, count);
       if (!session || session.root !== root) throw new Error('Session is no longer available in this project.');
-      return print(action === 'export' ? sessionMarkdown(session) : historyText(session.turns, turn, count));
+      return print(action === 'export' ? sessionMarkdown(session) : formatHistoryPage(session, 'xcode session history ' + entry.id.slice(0, 8)));
     }
     try {
       const live = await sessions.select(prefix, defaults);

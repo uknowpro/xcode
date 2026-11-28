@@ -196,29 +196,40 @@ export class Workspace {
     }
   }
 
-  async search({ query, pattern = '**', path = '.' }, signal) {
+  async search({ query, pattern = '**', path = '.', offset = 0, start = 1 }, signal) {
     if (typeof query !== 'string' || !query.trim() || query.length > 300) throw new Error('Enter a search string up to 300 characters.');
+    if (!Number.isSafeInteger(offset) || offset < 0 || !Number.isSafeInteger(start) || start < 1)
+      throw new Error('Search offsets must be nonnegative with a positive starting line.');
     const { files, truncated } = await this.files(signal);
     const scope = this.scope(path);
     const selected = files.filter(file => within(scope, resolve(this.root, file)) && matchesGlob(file, pattern));
     const needle = query.toLowerCase();
     const matches = [];
     let scanned = 0;
-    for (const file of selected) {
+    let next;
+    for (let index = offset; index < selected.length; index++) {
       signal?.throwIfAborted();
-      if (scanned++ >= 2500 || matches.length >= 60) break;
+      if (scanned >= 2500) { next = { offset: index, start: 1 }; break; }
+      scanned++;
+      const file = selected[index];
       const text = await readText(this.root, file, signal).catch(() => null);
+      signal?.throwIfAborted();
       if (!text) continue;
-      let line = 0;
-      for (const entry of text.split('\n')) {
-        line++;
-        const offset = entry.toLowerCase().indexOf(needle);
-        if (offset < 0) continue;
-        matches.push({ path: file, line, text: entry.trimEnd().slice(Math.max(0, offset - 80), offset + 240) });
-        if (matches.length >= 60) break;
+      const lines = text.split('\n');
+      for (let line = index === offset ? start : 1; line <= lines.length; line++) {
+        const entry = lines[line - 1];
+        const column = entry.toLowerCase().indexOf(needle);
+        if (column < 0) continue;
+        matches.push({ path: file, line, text: entry.trimEnd().slice(Math.max(0, column - 80), column + 240) });
+        if (matches.length === 60) {
+          next = line < lines.length ? { offset: index, start: line + 1 } :
+            index + 1 < selected.length ? { offset: index + 1, start: 1 } : undefined;
+          break;
+        }
       }
+      if (matches.length === 60) break;
     }
-    return { matches, truncated: truncated || matches.length >= 60 || selected.length > 2500 };
+    return { matches, scanned, truncated: truncated || Boolean(next), ...(next ? { next } : {}) };
   }
 
   scope(path = '.') {

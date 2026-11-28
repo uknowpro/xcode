@@ -26,7 +26,9 @@ const definitions = {
   glob: schema('Find paths by workspace-relative glob. Use nextOffset to request another page.', {
     pattern: string, path: string, offset: integer, count: integer,
   }),
-  grep: schema('Search UTF-8 source for literal text, returning paths and line numbers.', { query: string, pattern: string, path: string }, ['query']),
+  grep: schema('Search UTF-8 source for literal text. Pass next.offset and next.start to continue a bounded scan.', {
+    query: string, pattern: string, path: string, offset: integer, start: integer,
+  }, ['query']),
   read: schema('Read a bounded range of numbered UTF-8 lines. Use nextStart to continue.', { path: string, start: integer, count: integer }, ['path']),
   project_guides: schema('Read AGENTS.md files for a workspace file or directory, root first.', { path: string }),
   repo_map: schema('Summarize source declarations and resolvable relative JavaScript and TypeScript imports.', { query: string }),

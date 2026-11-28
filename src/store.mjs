@@ -141,7 +141,13 @@ function missing(error) {
   throw error;
 }
 
-export async function readSession(id) {
+const recentTurnCount = 12;
+const archivedRefs = new WeakMap();
+const wireRefs = new WeakMap();
+const isReference = ref => typeof ref === 'string' && /^[0-9a-f-]{36}$/.test(ref);
+const recordsDir = id => sessionPath(id).replace(/\.json$/, '.records');
+
+async function readSessionRecord(id) {
   const path = sessionPath(id);
   const info = await lstat(path).catch(missing);
   if (!info) return null;
@@ -149,9 +155,87 @@ export async function readSession(id) {
   const session = await readJson(path, null);
   if (!session || session.id !== id || typeof session.root !== 'string' ||
     typeof session.title !== 'string' || typeof session.updated !== 'string' ||
-    !Array.isArray(session.queue) || !Array.isArray(session.turns))
+    !Array.isArray(session.queue) || !Array.isArray(session.turns) ||
+    (session.olderTurns !== undefined && (!Array.isArray(session.olderTurns) || !session.olderTurns.every(isReference))))
     throw new Error('Session file has an invalid structure.');
   return session;
+}
+
+async function readRecord(id, ref) {
+  if (!isReference(ref)) throw new Error('Invalid conversation record reference.');
+  const path = join(recordsDir(id), ref + '.json');
+  const info = await lstat(path);
+  if (!info.isFile()) throw new Error('Conversation record is not a regular file.');
+  return readJson(path, null);
+}
+
+async function saveRecord(map, id, key, value) {
+  const cached = map.get(key);
+  if (cached?.id === id) return cached.ref;
+  const ref = randomUUID();
+  await mkdir(recordsDir(id), { recursive: true, mode: 0o700 });
+  await saveJson(join(recordsDir(id), ref + '.json'), value);
+  map.set(key, { id, ref });
+  return ref;
+}
+
+async function readOlderTurn(id, ref) {
+  const turn = await readRecord(id, ref);
+  if (!turn || typeof turn !== 'object') throw new Error('Invalid saved turn.');
+  archivedRefs.set(turn, { id, ref });
+  return turn;
+}
+
+export async function readSession(id) {
+  const record = await readSessionRecord(id);
+  if (!record) return null;
+  const { olderTurns = [], ...session } = record;
+  const turns = [];
+  for (const ref of olderTurns) turns.push(await readOlderTurn(id, ref));
+  for (const entry of session.turns) {
+    if (!entry?.wireRef) { turns.push(entry); continue; }
+    const { wireRef, ...turn } = entry;
+    turn.wire = await readRecord(id, wireRef);
+    wireRefs.set(turn, { id, ref: wireRef });
+    turns.push(turn);
+  }
+  return { ...session, turns };
+}
+
+export async function readSessionPage(id, before, count = 8) {
+  const record = await readSessionRecord(id);
+  if (!record) return null;
+  const older = record.olderTurns ?? [];
+  const total = older.length + record.turns.length;
+  const end = before === undefined ? total : Number(before) - 1;
+  const size = Number(count);
+  if (!Number.isInteger(end) || end < 0 || end > total || !Number.isInteger(size) || size < 1 || size > 20)
+    throw new Error('Provide a turn number and a page size from 1 to 20.');
+  const start = Math.max(0, end - size);
+  const entries = [];
+  for (let index = start; index < end; index++) {
+    const turn = index < older.length ? await readOlderTurn(id, older[index]) : record.turns[index - older.length];
+    entries.push({ number: index + 1, turn });
+  }
+  return { root: record.root, entries, ...(start ? { nextBefore: start + 1 } : {}) };
+}
+
+async function separateTurnRecords(session) {
+  const boundary = Math.max(0, session.turns.length - recentTurnCount);
+  const olderTurns = [];
+  const turns = [];
+  for (let index = 0; index < session.turns.length; index++) {
+    const entry = session.turns[index];
+    if (index < boundary) {
+      olderTurns.push(await saveRecord(archivedRefs, session.id, entry, entry));
+    } else if (entry?.wire) {
+      const { wire, ...turn } = entry;
+      turns.push({ ...turn, wireRef: await saveRecord(wireRefs, session.id, entry, wire) });
+    } else {
+      turns.push(entry);
+    }
+  }
+  return { ...session, turns, ...(olderTurns.length ? { olderTurns } : {}) };
 }
 
 function summarizeSession(session) {
@@ -193,7 +277,7 @@ async function indexProject(session) {
 
 export async function writeSession(session) {
   const path = sessionPath(session.id);
-  await saveJson(path, session);
+  await saveJson(path, await separateTurnRecords(session));
   const info = await lstat(path).catch(() => null);
   if (info) await writeSummary(session.id, info, summarizeSession(session));
   await indexProject(session).catch(() => {});
@@ -213,7 +297,7 @@ async function sessionSummary(id) {
       Number.isSafeInteger(entry.pendingCount) && Array.isArray(entry.queue) && Array.isArray(entry.turns))
       return entry;
   }
-  const session = await readSession(id);
+  const session = await readSessionRecord(id);
   if (!session) return null;
   const summary = summarizeSession(session);
   const current = await lstat(path).catch(missing);

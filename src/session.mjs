@@ -84,7 +84,9 @@ export class Sessions {
 
   persist(live) {
     live.session.updated = new Date().toISOString();
-    const value = structuredClone(live.session);
+    // Finished turns are replaced as a list. Queue, review and check state remain mutable.
+    const { turns, ...mutable } = live.session;
+    const value = { ...structuredClone(mutable), turns };
     live.writes = live.writes.catch(() => {}).then(() => writeSession(value));
     return live.writes;
   }

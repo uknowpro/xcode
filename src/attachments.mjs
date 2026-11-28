@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createReadStream } from 'node:fs';
 import { lstat, realpath } from 'node:fs/promises';
 import { basename, extname, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -32,17 +33,66 @@ export function explicitReferences(prompt) {
     .filter(path => path !== '' && !path.includes('@'));
 }
 
-export async function attach(root, input, profile, signal, { explicit = false, base = root } = {}) {
+function parseAttachment(input) {
+  const marker = /#L([1-9]\d*)(?:-L?([1-9]\d*))?$/.exec(input);
+  if (!marker) return { file: input };
+  const first = Number(marker[1]), last = Number(marker[2] ?? marker[1]);
+  if (!Number.isSafeInteger(first) || !Number.isSafeInteger(last) || last < first || last - first >= 1000)
+    throw new Error('Select up to 1,000 text lines with #Lstart-Lend.');
+  return { file: input.slice(0, marker.index), range: { first, last } };
+}
+
+async function attachmentFile(root, input, signal, { explicit = false, base = root } = {}) {
+  const { file, range } = parseAttachment(input);
   let path;
   if (explicit) {
-    const absolute = resolve(base, input);
+    const absolute = resolve(base, file);
     path = await realpath(absolute);
     if (blocked(absolute) || blocked(path) || isStatePath(absolute) || isStatePath(path) || !(await lstat(path)).isFile()) throw new Error('File excluded or unsupported.');
   } else {
-    ({ path } = await verifiedFile(root, resolve(base, input), signal));
+    ({ path } = await verifiedFile(root, resolve(base, file), signal));
   }
+  return { path, range };
+}
+
+export async function inspectAttachment(root, input, signal) {
+  const { path, range } = await attachmentFile(root, input, signal, { explicit: true });
+  return { name: basename(path), bytes: range ? null : (await lstat(path)).size, range };
+}
+
+async function attachmentLines(path, range, signal) {
+  const limit = 16 * 1024 * 1024;
+  const stream = createReadStream(path, { end: limit - 1, signal });
+  let line = 1, size = 0;
+  const chunks = [];
+  for await (const data of stream) {
+    let start = 0;
+    while (start < data.length) {
+      const boundary = data.indexOf(10, start);
+      const end = boundary < 0 ? data.length : boundary + 1;
+      if (line >= range.first) {
+        size += end - start;
+        if (size > 512 * 1024) throw new Error('Selected text exceeds 512 KiB. Attach a smaller line range.');
+        chunks.push(data.subarray(start, end));
+      }
+      if (boundary >= 0 && ++line > range.last) return decodeText(Buffer.concat(chunks, size));
+      start = end;
+    }
+  }
+  if (stream.bytesRead >= limit) throw new Error('The selected lines extend beyond the 16 MiB scan limit.');
+  if (!size) throw new Error('The selected lines are outside the file.');
+  return decodeText(Buffer.concat(chunks, size));
+}
+
+export async function attach(root, input, profile, signal, options) {
+  const { path, range } = await attachmentFile(root, input, signal, options);
   const name = basename(path);
   const type = extname(path).toLowerCase();
+  if (range) {
+    if (Object.hasOwn(images, type) || type === '.pdf') throw new Error('Line ranges apply to UTF-8 text files.');
+    const text = await attachmentLines(path, range, signal);
+    return { name, parts: [textPart(name, text, 'UTF-8 lines ' + range.first + '–' + range.last)] };
+  }
   if (Object.hasOwn(images, type)) {
     if (!profile.imageInput) throw new Error('This profile has image input disabled. Use /inputs image on if your model supports it.');
     const bytes = await loadBytes(path, 5 * 1024 * 1024, signal);
